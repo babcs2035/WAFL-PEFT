@@ -1,0 +1,29 @@
+[project]
+name = "wafl-peft"
+version = "0.1.0"
+description = "WAFL-PEFT: Federated PEFT experiment framework with time-varying P2P topology"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "transformers",
+    "accelerate",
+    "huggingface_hub",
+    "datasets",
+    "peft",
+    "torchinfo",
+    "tensorboard",
+    "matplotlib",
+    "numpy",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }

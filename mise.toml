@@ -1,0 +1,119 @@
+[tasks]
+
+# ============================================================
+# setup: ローカル環境での事前準備
+# ============================================================
+
+[tasks."setup:model"]
+description = "Hugging Faceベースモデルをローカルキャッシュへダウンロード"
+run = "hf download {{vars.model_id}} --local-dir ./cache/models/{{vars.model_id}}"
+
+[tasks."setup:data"]
+description = "GSM8Kデータセットを読み込みNon-IIDシャードとしてdata/gsm8k_sharded.jsonに出力"
+run = "uv run python src/setup_data.py"
+
+[tasks."setup:build"]
+description = "Dockerイメージwafl-peft:latestをビルド"
+depends = ["setup:model", "setup:data"]
+run = """\
+docker build --cache-from wafl-peft:latest -t wafl-peft:latest .
+"""
+
+[tasks.setup]
+description = "モデル・データ・イメージのすべてを準備"
+depends = ["setup:build"]
+
+# ============================================================
+# deploy: 階層的物理デプロイ
+# ============================================================
+
+[tasks."deploy:sync-local"]
+description = "ローカルから管理サーバーへモデル・データ・設定ファイルを転送"
+run = """\
+rsync -avz --exclude='.venv' --exclude='.git' --exclude='cache' --exclude='__pycache__' --exclude='.gitignore' --exclude='Dockerfile' --exclude='mise.toml' \
+  ./ {{vars.ssh_user}}@{{vars.server_host}}:{{vars.deploy_dir}}/ \
+  --rsync-path="mkdir -p {{vars.deploy_dir}} && rsync"
+"""
+
+[tasks."deploy:registry"]
+description = "管理サーバー上のregistryにDockerイメージをpush"
+depends = ["deploy:sync-local"]
+run = """\
+ssh -o StrictHostKeyChecking=no {{vars.ssh_user}}@{{vars.server_host}} \
+  'export LC_ALL=C; \
+   if docker ps --filter name=registry --filter status=running 2>/dev/null | grep -q registry; then \
+     echo "Registry already running"; \
+   else \
+     docker start registry 2>/dev/null || docker run -d -p 127.0.0.1:5000:5000 --name registry registry:2; \
+   fi' && \
+ssh -f -N -L 5000:127.0.0.1:5000 {{vars.ssh_user}}@{{vars.server_host}} \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null && \
+sleep 2 && \
+DOCKER_MAX_CONCURRENT_UPLOADED_LAYERS=5 docker tag wafl-peft:latest localhost:5000/wafl-peft:latest && \
+DOCKER_MAX_CONCURRENT_UPLOADED_LAYERS=5 docker push localhost:5000/wafl-peft:latest && \
+ssh -O exit {{vars.ssh_user}}@{{vars.server_host}} -L 5000:127.0.0.1:5000 2>/dev/null || true
+"""
+
+[tasks."deploy:distribute"]
+description = "管理サーバーから各学習デバイスへDockerイメージを転送しコンテナを起動"
+depends = ["deploy:registry"]
+run = """\
+ssh {{vars.ssh_user}}@{{vars.server_host}} \
+  'export LC_ALL=C PATH="$HOME/.local/bin:$PATH" && (command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh) && cd {{vars.deploy_dir}} && (test -d .venv || uv venv .venv) && uv run python src/deploy_distribute.py'
+"""
+
+[tasks.deploy]
+description = "ローカル->管理サーバー->各学習デバイスへの階層的デプロイ"
+depends = ["deploy:distribute"]
+
+[tasks.clean]
+description = "ローカル(cache,.venv,data)+全ノードのDockerコンテナ・イメージ・デプロイディレクトリを削除"
+run = "uv run python src/clean.py"
+
+# ============================================================
+# start: 実験の一斉実行
+# ============================================================
+
+[tasks."start:server"]
+description = "管理サーバー上でserver.pyをコンテナ起動"
+run = """\
+ssh {{vars.ssh_user}}@{{vars.server_host}} \
+  'export LC_ALL=C && docker rm -f wafl-peft-server 2>/dev/null || true; docker run -d --name wafl-peft-server --net=host -v {{vars.deploy_dir}}/src:/app/src -v {{vars.deploy_dir}}/config:/app/config -v {{vars.deploy_dir}}/data:/app/data -v {{vars.deploy_dir}}/logs:/app/logs localhost:5000/wafl-peft:latest uv run python src/server.py'
+"""
+
+[tasks."start:clients"]
+description = "管理サーバーから全デバイスへ並列SSHでコンテナ起動"
+run = """\
+ssh {{vars.ssh_user}}@{{vars.server_host}} \
+  'export LC_ALL=C PATH="$HOME/.local/bin:$PATH" && (command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh) && cd {{vars.deploy_dir}} && (test -d .venv || uv venv .venv) && uv run python src/start_clients.py'
+"""
+
+[tasks.start]
+description = "管理サーバーと全学習デバイスを起動し、実験を開始"
+depends = ["start:server", "start:clients"]
+
+# ============================================================
+# analyze: データ回収と評価
+# ============================================================
+
+[tasks."analyze:collect"]
+description = "各学習デバイスからメトリクスログとLoRA重みチェックポイントを回収"
+run = """\
+ssh {{vars.ssh_user}}@{{vars.server_host}} \
+  'export LC_ALL=C PATH="$HOME/.local/bin:$PATH" && (command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh) && cd {{vars.deploy_dir}} && (test -d .venv || uv venv .venv) && uv run python src/collect_logs.py'
+"""
+
+[tasks."analyze:evaluate"]
+description = "回収した全データをマージし、評価グラフを自動レンダリング"
+run = "uv run python src/analyze.py"
+
+[tasks.analyze]
+description = "ログ回収と自動評価"
+depends = ["analyze:collect", "analyze:evaluate"]
+
+# ============================================================
+# vars: settings.json からの変数読み込み
+# ============================================================
+
+[vars]
+_.file = "config/settings.json"

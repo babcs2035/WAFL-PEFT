@@ -1,0 +1,21 @@
+{
+  "model_id": "google/gemma-4-E2B",
+  "dataset_path": "data/gsm8k_sharded.json",
+  "learning_rate": 5e-5,
+  "batch_size": 1,
+  "max_seq_len": 512,
+  "lora_rank": 16,
+  "lora_alpha": 32,
+  "weight_dump_frequency_steps": 10,
+  "ssh_user": "denjo",
+  "server_host": "wafl-ctrl1",
+  "server_port": 9999,
+  "client_p2p_port": 8888,
+  "experiment_duration_seconds": 300,
+  "max_clients": 64,
+  "deploy_dir": "/home/denjo/workspace/ktakahashi/WAFL-PEFT",
+  "p2p_batch_size": 1,
+  "num_training_steps": 10000,
+  "validation_split": 0.1,
+  "seed": 42
+}
