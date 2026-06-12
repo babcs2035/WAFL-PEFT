@@ -85,6 +85,7 @@ def clean_node(user: str, target: str, deploy_dir: str, peer_id: int | None = No
 
     # Step 2: Docker イメージを削除（本アプリケーション関連のみ）
     run_fn("docker rmi -f localhost:5000/wafl-peft:latest 2>/dev/null || true", timeout=30)
+    run_fn("docker rmi -f 127.0.0.1:5000/wafl-peft:latest 2>/dev/null || true", timeout=30)
     run_fn("docker rmi -f wafl-peft:latest 2>/dev/null || true", timeout=30)
     run_fn("docker rmi -f registry:2 2>/dev/null || true", timeout=30)
 

@@ -24,7 +24,7 @@ SSH_USER = CONFIG["ssh_user"]
 DEPLOY_DIR = os.path.expanduser(CONFIG["deploy_dir"])
 SERVER_HOST = CONFIG.get("server_host", "wafl-ctrl1")
 REGISTRY_PORT = 5000
-IMAGE_NAME = f"localhost:{REGISTRY_PORT}/wafl-peft:latest"
+IMAGE_NAME = f"127.0.0.1:{REGISTRY_PORT}/wafl-peft:latest"
 
 # 管理サーバーのLAN IP（学習デバイスからアクセス可能）
 try:
@@ -126,44 +126,85 @@ def pull_docker_image(ip: str, peer_id: int) -> str:
         shell=True, capture_output=True, text=True, timeout=15,
     )
 
-    # Docker insecure-registries設定（再起動は初回のみで十分）
-    subprocess.run(
+   # Docker insecure-registries設定 + daemon再起動 + 有効化検証
+    # insecure-registries は daemon.json に書いても再起動しないと効かない
+    ensure_cmd = (
         f"ssh {SSH_USER}@{ip} "
-        f'''bash -s <<'PYEOF'
+        f'''bash -s <<'DEOF'
 export LC_ALL=C
 mkdir -p /etc/docker
 python3 -c 'import json; d=json.load(open("/etc/docker/daemon.json","r")) if __import__("os").path.exists("/etc/docker/daemon.json") else {{}}; d["insecure-registries"]=list(set(d.get("insecure-registries",[])+["127.0.0.1:5000"])); json.dump(d,open("/etc/docker/daemon.json","w"))'
-PYEOF
-''',
-        shell=True, capture_output=True, text=True, timeout=30,
+# 設定が既に有効か確認
+if docker info 2>/dev/null | grep -q "127.0.0.1:5000"; then
+    echo "insecure-registries already active"
+else
+    echo "Restarting Docker daemon to apply insecure-registries..."
+    if systemctl restart docker 2>/dev/null; then
+        echo "restart:systemd"
+    else
+        echo "restart:direct"
+        # 既存の dockerd を確実に停止してから再起動
+        pkill -9 dockerd 2>/dev/null || true
+        # 既存プロセスの完全終了を確認
+        for _wait in $(seq 1 10); do
+            if ! pgrep -x dockerd >/dev/null 2>&1; then
+                echo "old_dockerd_gone"
+                break
+            fi
+            sleep 1
+        done
+        # dockerd が設定ファイルを正しく読み込むよう明示
+        nohup dockerd --config-file /etc/docker/daemon.json &>/var/log/dockerd-restart.log &
+        echo "dockerd_started"
+    fi
+    # Docker 復帰 + 設定反映を待機（最大60秒）— insecure-registries は 127.0.0.1:5000 のみ
+    for i in $(seq 1 60); do
+        INFO=$(docker info 2>/dev/null)
+        if [ -n "$INFO" ] && echo "$INFO" | grep -q "127.0.0.1:5000"; then
+            echo "docker_ready_and_configured:${{i}}s"
+            echo "insecure-registries verified"
+            exit 0
+        fi
+        if [ -n "$INFO" ]; then
+            echo "docker_ready_but_checking:${{i}}s"
+        fi
+        sleep 1
+    done
+    echo "ERROR: insecure-registries not active after 60s"
+    exit 1
+fi
+DEOF'''
     )
+    ensure_result = subprocess.run(
+        ensure_cmd, shell=True, capture_output=True, text=True, timeout=90,
+    )
+    if ensure_result.returncode != 0 or "ERROR:" in ensure_result.stdout:
+        return f"FAILED docker config (peer={peer_id}, ip={ip}): {ensure_result.stdout.strip()[-300:]}"
 
-    # 各デバイス上でトンネルを張る（-f でバックグラウンド、nohup は不要）
-    tunnel_script = (
-        f"mkdir -p ~/.ssh; "
-        f"ssh -S {control_path} -O exit {SSH_USER}@{SERVER_HOST} 2>/dev/null; "
-        f"ssh -N -L 5000:127.0.0.1:{REGISTRY_PORT} "
+    # 各デバイス上でトンネルを張り，127.0.0.1:5000 がリスンするまで待つ
+    tunnel_cmd = (
+        f"ssh {SSH_USER}@{ip} "
+        f"'mkdir -p ~/.ssh; "
+        f"(ssh -S {control_path} -O exit {SSH_USER}@{SERVER_HOST} 2>/dev/null) || true; "
+        f"sleep 1; "
+        f"ssh -N -L 127.0.0.1:5000:127.0.0.1:{REGISTRY_PORT} "
         f"-S {control_path} "
         f"-o StrictHostKeyChecking=no "
         f"-o UserKnownHostsFile=/dev/null "
         f"-o ServerAliveInterval=60 "
         f"-o ServerAliveCountMax=3 "
-        f"-f {SSH_USER}@{SERVER_HOST}; "
-        f"sleep 2; "
-        f"ssh -S {control_path} -O check {SSH_USER}@{SERVER_HOST} 2>/dev/null"
+        f"-f {SSH_USER}@{SERVER_HOST}'"
     )
     tunnel_result = subprocess.run(
-        f"ssh {SSH_USER}@{ip} '{tunnel_script}'",
-        shell=True, capture_output=True, text=True, timeout=30,
+        tunnel_cmd, shell=True, capture_output=True, text=True, timeout=30,
     )
     if tunnel_result.returncode != 0:
-        stderr = tunnel_result.stderr.strip()
-        return f"FAILED tunnel (peer={peer_id}, ip={ip}): {stderr[:200]}"
+        return f"FAILED tunnel (peer={peer_id}, ip={ip}): {tunnel_result.stderr[:200]}"
 
-    # トンネルが立つまで待つ（最大30秒）
+    # 127.0.0.1:5000 がリスンするまで待つ（最大30秒）
     for _ in range(30):
         check = subprocess.run(
-            f"ssh {SSH_USER}@{ip} 'ss -tln 2>/dev/null | grep -q 5000 && echo ok'",
+            f"ssh {SSH_USER}@{ip} 'ss -tln 2>/dev/null | grep -q 127.0.0.1:5000 && echo ok'",
             shell=True, capture_output=True, text=True, timeout=5,
         )
         if check.stdout.strip() == "ok":
@@ -176,12 +217,20 @@ PYEOF
             f"ssh {SSH_USER}@{ip} "
             f"'DOCKER_MAX_CONCURRENT_DOWNLOADS=5 DOCKER_MAX_CONCURRENT_PULLS=5 docker pull {IMAGE_NAME}'"
         )
-        pull_result = subprocess.run(
-            pull_cmd, shell=True, capture_output=True, text=True, timeout=600,
-        )
-        if pull_result.returncode == 0:
-            return f"Docker pulled (peer={peer_id}, ip={ip})"
-        return f"FAILED (peer={peer_id}, ip={ip}): {pull_result.stderr[:500]}"
+        pull_failed = None
+        for attempt in range(3):
+            pull_result = subprocess.run(
+                pull_cmd, shell=True, capture_output=True, text=True, timeout=600,
+            )
+            if pull_result.returncode == 0:
+                if attempt > 0:
+                    return f"Docker pulled after {attempt+1} retries (peer={peer_id}, ip={ip})"
+                return f"Docker pulled (peer={peer_id}, ip={ip})"
+            pull_failed = pull_result
+            # Docker再起動直後は不安定な可能性があるためリトライ
+            if attempt < 2:
+                time.sleep(5)
+        return f"FAILED (peer={peer_id}, ip={ip}): {pull_failed.stderr[:500]}"
     finally:
         # トンネルを閉じる
         subprocess.run(

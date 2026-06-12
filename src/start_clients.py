@@ -21,7 +21,7 @@ SSH_USER = CONFIG["ssh_user"]
 DEPLOY_DIR = os.path.expanduser(CONFIG["deploy_dir"])
 SERVER_HOST = CONFIG.get("server_host", "wafl-ctrl1")
 REGISTRY_PORT = 5000
-IMAGE_NAME = f"localhost:{REGISTRY_PORT}/wafl-peft:latest"
+IMAGE_NAME = f"127.0.0.1:{REGISTRY_PORT}/wafl-peft:latest"
 
 
 def load_hosts() -> list[str]:

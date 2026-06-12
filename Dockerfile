@@ -15,7 +15,7 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 # 4. Pythonパッケージインストール（requirementsが変わった時のみ再ビルド）
 RUN uv pip install --extra-index-url https://download.pytorch.org/whl/cpu \
-    torch torchvision torchaudio transformers accelerate huggingface_hub datasets peft torchinfo tensorboard
+    torch torchvision torchaudio transformers accelerate huggingface_hub datasets peft torchinfo tensorboard 'pyarrow<15' 'numpy<2'
 
 # 5. 変更頻度が高いソースコード（ここから下のみ再ビルドされる）
 COPY src/ /app/src/
