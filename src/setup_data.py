@@ -10,11 +10,12 @@ import json
 import random
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import datasets
 
-from utils import get_base_dir, get_hosts_path, load_config
+from utils import get_base_dir, get_experiment_dir, get_hosts_path, _get, _get_int, _get_str
 
 # GSM8K問題のカテゴリ分類用キーワード
 CATEGORY_KEYWORDS = {
@@ -102,8 +103,21 @@ def save_peer_files(
 
 def main() -> None:
     """メインエントリポイント。"""
-    config = load_config()
     base_dir = get_base_dir()
+    experiment_dir = get_experiment_dir()
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+
+    # 実験ディレクトリメタ情報を保存（deploy_distribute.py などが参照する）
+    exp_name = _get("experiment", "experiment_name", "default")
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    meta = {
+        "experiment_name": exp_name,
+        "timestamp": timestamp,
+        "dir_name": f"{exp_name}_{timestamp}",
+    }
+    (experiment_dir / ".experiment_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2)
+    )
 
     # hosts.txtの読み込み
     hosts = []
@@ -116,7 +130,7 @@ def main() -> None:
 
     # GSM8Kデータセットの読み込み
     print("Loading GSM8K dataset...")
-    cache_dir = get_base_dir() / "cache" / "datasets" / "gsm8k"
+    cache_dir = experiment_dir / "cache" / "datasets" / "gsm8k"
     cache_dir.mkdir(parents=True, exist_ok=True)
     train_path = cache_dir / "main" / "train-00000-of-00001.parquet"
     if not train_path.exists():
@@ -136,8 +150,8 @@ def main() -> None:
     print(f"Loaded {len(raw_data)} total examples")
 
     # train/test 分割（設定からデフォルト90/10）
-    validation_split = config.get("validation_split", 0.1)
-    rng = random.Random(config.get("seed", 42))
+    validation_split = _get("data", "validation_split", 0.1)
+    rng = random.Random(_get_int("data", "seed", 42))
     rng.shuffle(raw_data)
     split_idx = int(len(raw_data) * (1.0 - validation_split))
     train_data = raw_data[:split_idx]
@@ -210,7 +224,7 @@ def main() -> None:
     for peer_id in test_sharded:
         rng.shuffle(test_sharded[peer_id])
 
-    # peerごとのファイルとして保存
+    # peerごとのファイルとして保存（プロジェクトルート直下の data/ へ）
     print("\nSaving peer files...")
     save_peer_files(
         sharded, test_sharded, base_dir,

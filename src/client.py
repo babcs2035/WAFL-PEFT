@@ -6,6 +6,9 @@
   Thread 2: P2P生TCP交換・マージ層（データプレーン）
   Thread 3: LoRA訓練ループ（計算プレーン）
   Thread 4: 非同期ディスク書き出し層（ロギングプレーン）
+
+メトリクスは訓練ループ内でキューへputし、ロガスレッドが非同期にファイルへ書き出す。
+各ステップで loss, throughput, train/test スコアをログ出力。
 """
 
 import json
@@ -22,19 +25,19 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model
 from torch.optim import AdamW
-from transformers import LlamaForCausalLM, LlamaTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from utils import get_base_dir, get_log_dir, get_hosts_path, load_config
+from utils import get_base_dir, get_hosts_path, get_log_dir, _get, _get_float, _get_int, _get_str
 
 # ============================================================
 # グローバル設定
 # ============================================================
 
-CONFIG = load_config()
-BASE_DIR = get_base_dir()
-SERVER_HOST = "0.0.0.0"  # コンテナ内ではlocalhostと同じ
-SERVER_PORT = CONFIG["server_port"]
-P2P_PORT = CONFIG["client_p2p_port"]
+# コンテナ内では /app がプロジェクトルート（ホストの DEPLOY_DIR にマッピング）
+BASE_DIR = Path("/app")
+SERVER_HOST = _get_str("server", "server_host")  # 管理サーバーのホスト名（wafl-ctrl1等）
+SERVER_PORT = _get_int("server", "server_port")
+P2P_PORT = _get_int("communication", "client_p2p_port")
 PEER_ID = int(os.environ.get("PEER_ID", "0"))
 
 LOG_DIR = get_log_dir()
@@ -42,6 +45,15 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 WEIGHT_DIR = LOG_DIR / "weights"
 WEIGHT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _eta_str(seconds: float) -> str:
+    """秒数を人間 readable な文字列へ変換（例: 3700s → 1.0h）."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds/60:.0f}m{int(seconds%60):02d}s"
+    return f"{seconds/3600:.1f}h"
 
 
 def resolve_hosts() -> dict[int, str]:
@@ -66,7 +78,7 @@ class SharedState:
     - peer_whitelist: Thread 1が更新、Thread 2が参照
     - shadow_weights: Thread 3が更新、Thread 2が読み取り
     - merge_queue: Thread 2が書き込み、Thread 3が消費
-    - metrics_queue: Thread 3が書き込み、Thread 4が消費
+    - metrics_queue: Thread 3が書き込み、Thread 4が消費（キュー満杯時はブロック）
     """
 
     def __init__(self) -> None:
@@ -80,7 +92,7 @@ class SharedState:
             maxsize=32
         )
 
-        self.metrics_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=256)
+        self.metrics_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8192)
 
         self.step_lock = threading.Lock()
         self.current_step: int = 0
@@ -100,31 +112,59 @@ class SharedState:
 # ============================================================
 
 
-def initialize_model(config: dict[str, Any]) -> tuple[LlamaForCausalLM, LlamaTokenizer]:
-    """LoRA付きLlamaモデルを初期化。"""
-    model = LlamaForCausalLM.from_pretrained(
-        config["model_id"],
+def initialize_model() -> tuple[Any, Any]:
+    """LoRA付きモデルを初期化（AutoModelで自動判定）。
+
+    ローカルの cache/models/ にモデルがあればそちらを優先し、
+    なければ HuggingFace Hub からダウンロードする。
+    """
+    import sys
+
+    model_id = _get("model", "model_id")
+    model_path_parts = model_id.split("/")
+    local_model_path = BASE_DIR / "cache" / "models" / model_path_parts[0] / model_path_parts[1]
+
+    if local_model_path.exists() and (local_model_path / "config.json").exists():
+        print(f"[Peer {PEER_ID}]   Using local model from {local_model_path}", flush=True)
+    else:
+        print(f"[Peer {PEER_ID}]   Local model not found, downloading from {model_id}...", flush=True)
+        sys.stdout.flush()
+
+    model = AutoModelForCausalLM.from_pretrained(
+        str(local_model_path) if local_model_path.exists() else model_id,
         torch_dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True,
     )
+    print(f"[Peer {PEER_ID}]   Model weights loaded, device={next(model.parameters()).device}", flush=True)
+    sys.stdout.flush()
 
     lora_config = LoraConfig(
-        r=config["lora_rank"],
-        lora_alpha=config["lora_alpha"],
-        target_modules=["q_proj", "v_proj"],
+        r=_get_int("training", "lora_rank"),
+        lora_alpha=_get_int("training", "lora_alpha"),
+        target_modules=r"model\.language_model.*(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|mlp\.(?:gate_proj|up_proj|down_proj))",
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
     )
 
+    print(f"[Peer {PEER_ID}]   Applying LoRA (rank={_get_int('training', 'lora_rank')}, alpha={_get_int('training', 'lora_alpha')})...", flush=True)
+    sys.stdout.flush()
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    return model, LlamaTokenizer.from_pretrained(config["model_id"])
+    print(f"[Peer {PEER_ID}]   Loading tokenizer...", flush=True)
+    sys.stdout.flush()
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(local_model_path) if local_model_path.exists() else model_id,
+    )
+    print(f"[Peer {PEER_ID}]   Tokenizer loaded", flush=True)
+    sys.stdout.flush()
+
+    return model, tokenizer
 
 
-def load_sharded_dataset(config: dict[str, Any], peer_id: int) -> Dataset:
+def load_sharded_dataset(peer_id: int) -> Dataset:
     """peer固有の訓練ファイルを読み込み。"""
     train_file = BASE_DIR / "data" / "train" / f"peer_{peer_id}.json"
     with open(train_file) as f:
@@ -136,7 +176,7 @@ def load_sharded_dataset(config: dict[str, Any], peer_id: int) -> Dataset:
 
 def tokenize_dataset(
     dataset: Dataset,
-    tokenizer: LlamaTokenizer,
+    tokenizer: Any,
     max_seq_len: int,
 ) -> list[dict[str, torch.Tensor]]:
     """データセットをトークン化し、入力・ラベルペアに変換。"""
@@ -165,8 +205,9 @@ def _send_json(sock: socket.socket, data: dict[str, Any]) -> bool:
     """ソケットへJSONデータを送信。"""
     try:
         payload = json.dumps(data).encode("utf-8")
-        sock.send(len(payload).to_bytes(4, "big"))
-        sock.send(payload)
+        header = len(payload).to_bytes(4, "big")
+        sock.sendall(header)
+        sock.sendall(payload)
         return True
     except OSError:
         return False
@@ -196,28 +237,34 @@ def _recv_json(sock: socket.socket, timeout: float = 2.0) -> dict[str, Any] | No
         return None
 
 
-def server_listener_thread(state: SharedState, model: LlamaForCausalLM) -> None:
+def server_listener_thread(state: SharedState, model: Any) -> None:
     """管理サーバーと永続TCP接続を維持し、シグナルを受信。
 
     接続時にpeer_idを登録し、以降は1秒周期のシグナルを待受。
     切断された場合は自動再接続する。
     """
-    print(f"[Peer {PEER_ID}] Thread 1 (Server Listener) started")
+    print(f"[Peer {PEER_ID}] Thread 1 (Server Listener) started. Connecting to {SERVER_HOST}:{SERVER_PORT}...", flush=True)
 
     while state.running:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(2.0)
-                s.connect(("localhost", SERVER_PORT))
+                print(f"[Peer {PEER_ID}]   Connecting to server...", flush=True)
+                s.connect((SERVER_HOST, SERVER_PORT))
+                print(f"[Peer {PEER_ID}]   Connected to server", flush=True)
 
                 # ペアID登録
                 if not _send_json(s, {"type": "register", "peer_id": PEER_ID}):
+                    print(f"[Peer {PEER_ID}]   Failed to send registration, retrying...", flush=True)
                     time.sleep(1.0)
                     continue
+                print(f"[Peer {PEER_ID}]   Registration sent (peer_id={PEER_ID})", flush=True)
 
                 # モデルロード完了を待ってReadyを送信
+                print(f"[Peer {PEER_ID}]   Waiting for model load to complete (timeout=60s)...", flush=True)
                 state.ready_to_send.wait(timeout=60.0)
                 _send_json(s, {"type": "ready", "peer_id": PEER_ID})
+                print(f"[Peer {PEER_ID}]   Ready signal sent. Waiting for signals...", flush=True)
 
                 while state.running:
                     data = _recv_json(s, timeout=2.0)
@@ -244,17 +291,18 @@ def server_listener_thread(state: SharedState, model: LlamaForCausalLM) -> None:
                         state.experiment_running.set()
                         print(
                             f"[Peer {PEER_ID}] Experiment STARTED. "
-                            f"Duration: {data.get('duration')}s"
+                            f"Duration: {data.get('duration')}s",
+                            flush=True
                         )
 
                     elif msg_type == "experiment_stop":
-                        print(f"[Peer {PEER_ID}] Experiment STOPPED.")
+                        print(f"[Peer {PEER_ID}] Experiment STOPPED.", flush=True)
                         state.running = False
                         break
 
-        except (OSError, ConnectionError):
+        except (OSError, ConnectionError) as e:
             if state.running:
-                print(f"[Peer {PEER_ID}] Server connection lost. Reconnecting...")
+                print(f"[Peer {PEER_ID}] Server connection lost ({e}). Reconnecting in 1s...", flush=True)
                 time.sleep(1.0)
 
     print(f"[Peer {PEER_ID}] Thread 1 (Server Listener) stopped")
@@ -284,7 +332,7 @@ def _deserialize_weights(data: bytes) -> dict[str, torch.Tensor]:
     return torch.load(buf, weights_only=True, map_location="cpu")
 
 
-def p2p_exchange_thread(state: SharedState, model: LlamaForCausalLM) -> None:
+def p2p_exchange_thread(state: SharedState, model: Any) -> None:
     """P2P重み交換スレッド。
 
     - ホワイトリストを監視し、接続可能なpeerへ積極的に接続
@@ -473,47 +521,95 @@ def p2p_exchange_thread(state: SharedState, model: LlamaForCausalLM) -> None:
 
 
 # ============================================================
+# 簡易評価（train/test スコア）
+# ============================================================
+
+
+def evaluate_batch(
+    model: Any,
+    tokenizer: Any,
+    samples: list[dict[str, str]],
+    max_seq_len: int,
+    max_eval_samples: int = 50,
+) -> float:
+    """簡易accuracy評価（GSM8K形式のquestion/answer）。
+
+    返値: accuracy（%）
+    """
+    correct = 0
+    total = min(len(samples), max_eval_samples)
+    for item in samples[:total]:
+        text = f"Question: {item['question']}\nAnswer:"
+        tokens = tokenizer(text, return_tensors="pt").to(model.device)
+
+        with torch.no_grad():
+            generated = model.generate(
+                **tokens,
+                max_new_tokens=64,
+                do_sample=False,
+                temperature=1.0,
+            )
+
+        generated_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+        expected_answer = item["answer"].split("#### ")[-1].strip()
+        if expected_answer in generated_text:
+            correct += 1
+
+    return (correct / total * 100) if total > 0 else 0.0
+
+
+# ============================================================
 # Thread 3: LoRA訓練ループ（計算プレーン）
 # ============================================================
 
 
 def training_loop_thread(
     state: SharedState,
-    model: LlamaForCausalLM,
-    tokenizer: LlamaTokenizer,
+    model: Any,
+    tokenizer: Any,
     train_data: list[dict[str, torch.Tensor]],
+    train_samples: list[dict[str, str]],
+    test_samples: list[dict[str, str]],
 ) -> None:
     """LoRA訓練ループ。
 
     1バッチごとに順伝播・逆伝播・.optimizer.step()を実行。
     通信スレッドによるマージはイテレーションの境界で受け入れる。
+    各ステップでメトリクスをキュー経由でロガスレッドへ送信。
     """
-    print(f"[Peer {PEER_ID}] Thread 3 (Training Loop) started")
+    print(f"[Peer {PEER_ID}] Thread 3 (Training Loop) started", flush=True)
+
+    # シャドウコピーを初期化（LoRAパラメータのみ＝メモリ節約）
+    lora_keys = [k for k in model.state_dict().keys() if "lora" in k.lower()]
+    print(f"[Peer {PEER_ID}]   Cloning {len(lora_keys)} LoRA weight tensors to CPU...", flush=True)
+    with state.weights_lock:
+        state.shadow_weights = {
+            k: model.state_dict()[k].detach().cpu().clone() for k in lora_keys
+        }
+    print(f"[Peer {PEER_ID}] Model loaded, shadow weights ready (LoRA keys: {len(lora_keys)})")
+    state.ready_to_send.set()
 
     optimizer = AdamW(
         model.parameters(),
-        lr=CONFIG["learning_rate"],
+        lr=_get_float("training", "learning_rate"),
         weight_decay=0.01,
     )
 
-    log_freq = CONFIG.get("weight_dump_frequency_steps", 10)
+    # 全ステップをログ出力（チェックポイントは最終ステップのみ）
+    log_freq = 1
+    eval_freq = max(1, _get_int("training", "num_training_steps") // 10)
     step = 0
     total_tokens = 0
     start_wait = time.time()
 
     while state.running:
         if not state.experiment_running.is_set():
-            # Ready待ち（モデルロード完了まで）
-            if state.shadow_weights is None and step == 0:
-                # シャドウコピーを初期化
-                with state.weights_lock:
-                    state.shadow_weights = {
-                        k: v.detach().clone() for k, v in model.state_dict().items()
-                    }
-                print(f"[Peer {PEER_ID}] Model loaded, shadow weights ready")
-                state.ready_to_send.set()
             time.sleep(0.1)
             continue
+
+        step_start_time = time.time()
+
+        print(f"[Peer {PEER_ID}] Training step {step} (train_data len={len(train_data)})", flush=True)
 
         # 経過時間を更新
         state.elapsed_time = time.time() - state.experiment_start_time
@@ -557,11 +653,36 @@ def training_loop_thread(
                     if k in state.shadow_weights:
                         state.shadow_weights[k].copy_(v.detach().cpu())
 
-        # メトリクス送信
+        # メトリクス計算
         loss_value = loss.item()
+        step_duration = time.time() - step_start_time
         tokens_per_sec = (
             total_tokens / (time.time() - start_wait) if time.time() > start_wait else 0
         )
+        state.elapsed_time = time.time() - state.experiment_start_time
+
+        # 平均ステップ時間と残り推定
+        max_steps = _get_int("training", "num_training_steps", 10000)
+        avg_step_sec = state.elapsed_time / current_step_for_merge if current_step_for_merge > 0 else 0
+        remaining_steps = max_steps - current_step_for_merge
+        eta_sec = avg_step_sec * remaining_steps
+
+        eta_str = _eta_str(eta_sec)
+        print(
+            f"[Peer {PEER_ID}] Step {current_step_for_merge}: "
+            f"loss={loss_value:.4f}, tok/s={tokens_per_sec:.1f}, "
+            f"step={step_duration:.1f}s, elapsed={state.elapsed_time:.0f}s "
+            f"({_eta_str(state.elapsed_time)}), "
+            f"ETA={eta_str} ({remaining_steps}steps left)",
+            flush=True,
+        )
+
+        # 定期的に train/test スコアを評価
+        train_score = 0.0
+        test_score = 0.0
+        if current_step_for_merge % eval_freq == 0 and current_step_for_merge > 0:
+            train_score = evaluate_batch(model, tokenizer, train_samples, _get_int("training", "max_seq_len"))
+            test_score = evaluate_batch(model, tokenizer, test_samples, _get_int("training", "max_seq_len"))
 
         metric = {
             "type": "metric",
@@ -571,17 +692,20 @@ def training_loop_thread(
             "loss": loss_value,
             "tokens_per_sec": tokens_per_sec,
             "total_tokens": total_tokens,
+            "step_duration": step_duration,
+            "train_score": train_score,
+            "test_score": test_score,
         }
         try:
-            state.metrics_queue.put_nowait(metric)
+            state.metrics_queue.put(metric, timeout=1.0)
         except queue.Full:
             pass
 
-        # チェックポイント保存
+        # チェックポイント保存（最終ステップのみ）
         if current_step_for_merge % log_freq == 0 and current_step_for_merge > 0:
             ckpt_metric = {**metric, "type": "checkpoint"}
             try:
-                state.metrics_queue.put_nowait(ckpt_metric)
+                state.metrics_queue.put(ckpt_metric, timeout=1.0)
             except queue.Full:
                 pass
 
@@ -593,15 +717,17 @@ def training_loop_thread(
             print(
                 f"[Peer {PEER_ID}] Step {current_step_for_merge}: "
                 f"loss={loss_value:.4f}, tok/s={tokens_per_sec:.1f}, "
-                f"saved {ckpt_path}"
+                f"train={train_score:.1f}%, test={test_score:.1f}%, "
+                f"elapsed={state.elapsed_time:.0f}s, "
+                f"saved {ckpt_path}", flush=True
             )
 
         step += 1
 
         # 訓練ステップ数制限
-        max_steps = CONFIG.get("num_training_steps", 10000)
+        max_steps = _get_int("training", "num_training_steps", 10000)
         if step >= max_steps:
-            print(f"[Peer {PEER_ID}] Reached max steps ({max_steps}). Stopping.")
+            print(f"[Peer {PEER_ID}] Reached max steps ({max_steps}). Stopping.", flush=True)
             state.running = False
             break
 
@@ -614,19 +740,32 @@ def training_loop_thread(
 
 
 def async_logging_thread(state: SharedState) -> None:
-    """キュー経由でメトリクスとチェックポイントを非同期にディスクへ書き出し。"""
+    """キュー経由でメトリクスとチェックポイントを非同期にディスクへ書き出し。
+
+    SHUTDOWN シグネル（None）を受信するまでキューから読み取り、
+    実験終了後は残りのメトリクスを全てフラッシュしてから終了する。
+    """
     print(f"[Peer {PEER_ID}] Thread 4 (Async Logger) started")
 
-    metric_log_path = LOG_DIR / f"metrics_peer_{PEER_ID}.jsonl"
+    metric_log_path = LOG_DIR / f"metrics_peer_{PEER_ID}.log"
     metric_log_path.write_text("")
 
-    while state.running or not state.metrics_queue.empty():
+    received_count = 0
+    while True:
         try:
-            metric = state.metrics_queue.get(timeout=0.5)
+            metric = state.metrics_queue.get(timeout=1.0)
         except queue.Empty:
+            # 実験終了 + キュー空 → シャットダウン
+            if not state.running and state.metrics_queue.empty():
+                print(f"[Peer {PEER_ID}] Logger: shutting down (received={received_count})", flush=True)
+                break
             continue
 
-        # メトリクスをJSONLへ追記
+        # SHUTDOWN シグネル
+        if metric is None:
+            break
+
+        # メトリクスをログファイルへ追記
         try:
             with open(metric_log_path, "a") as f:
                 f.write(json.dumps(metric, default=str) + "\n")
@@ -642,7 +781,7 @@ def async_logging_thread(state: SharedState) -> None:
             print(f"[Peer {PEER_ID}] Logger error: {e}", file=sys.stderr)
 
     # 最終フラッシュ
-    final_log_path = LOG_DIR / f"metrics_peer_{PEER_ID}_final.jsonl"
+    final_log_path = LOG_DIR / f"metrics_peer_{PEER_ID}_final.log"
     try:
         metric_log_path.rename(final_log_path)
     except OSError:
@@ -658,21 +797,62 @@ def async_logging_thread(state: SharedState) -> None:
 
 def main() -> None:
     """クライアントのメインエントリポイント。"""
+    import sys
     global PEER_ID
     PEER_ID = int(os.environ.get("PEER_ID", "0"))
 
-    print(f"=" * 60)
-    print(f"[Peer {PEER_ID}] WAFL-PEFT Client Starting")
-    print(f"=" * 60)
+    print(f"=" * 60, flush=True)
+    print(f"[Peer {PEER_ID}] WAFL-PEFT Client Starting", flush=True)
+    print(f"[Peer {PEER_ID}] PEER_ID={PEER_ID}", flush=True)
+    print(f"[Peer {PEER_ID}] Model ID: {_get('model', 'model_id')}", flush=True)
+    print(f"[Peer {PEER_ID}] Server: {SERVER_HOST}:{SERVER_PORT}", flush=True)
+    print(f"[Peer {PEER_ID}] P2P Port: {P2P_PORT}", flush=True)
+    print(f"[Peer {PEER_ID}] Batch Size: {_get_int('training', 'batch_size')}", flush=True)
+    print(f"[Peer {PEER_ID}] Max Steps: {_get_int('training', 'num_training_steps', 10000)}", flush=True)
+    print(f"=" * 60, flush=True)
+    sys.stdout.flush()
 
     # モデル・データセットの初期化
-    print(f"[Peer {PEER_ID}] Loading model...")
-    model, tokenizer = initialize_model(CONFIG)
+    model_id = _get("model", "model_id")
+    max_seq_len = _get_int("training", "max_seq_len")
+    print(f"[Peer {PEER_ID}] [1/3] Loading model from {model_id}...", flush=True)
+    sys.stdout.flush()
+    model, tokenizer = initialize_model()
+    print(f"[Peer {PEER_ID}] [1/3] Model loaded successfully", flush=True)
+    sys.stdout.flush()
 
-    print(f"[Peer {PEER_ID}] Loading dataset...")
-    raw_dataset = load_sharded_dataset(CONFIG, PEER_ID)
-    train_data = tokenize_dataset(raw_dataset, tokenizer, CONFIG["max_seq_len"])
-    print(f"[Peer {PEER_ID}] Tokenized {len(train_data)} training samples")
+    print(f"[Peer {PEER_ID}] [2/3] Loading dataset...", flush=True)
+    sys.stdout.flush()
+    raw_dataset = load_sharded_dataset(PEER_ID)
+    print(f"[Peer {PEER_ID}] [2/3] Dataset loaded: {len(raw_dataset)} raw samples", flush=True)
+    sys.stdout.flush()
+
+    print(f"[Peer {PEER_ID}] [2/3] Tokenizing {len(raw_dataset)} samples (max_seq_len={max_seq_len})...", flush=True)
+    sys.stdout.flush()
+    train_data = tokenize_dataset(raw_dataset, tokenizer, max_seq_len)
+    print(f"[Peer {PEER_ID}] [2/3] Tokenized {len(train_data)} training samples (filtered: {len(raw_dataset) - len(train_data)} dropped)", flush=True)
+    sys.stdout.flush()
+
+    # 訓練サンプルを辞書形式に変換（評価用）
+    train_samples: list[dict[str, str]] = [
+        {"question": item["question"], "answer": item["answer"]}
+        for item in raw_dataset
+    ]
+
+    # テストデータセット読み込み（評価用）
+    test_file = BASE_DIR / "data" / "test" / f"peer_{PEER_ID}.json"
+    if test_file.exists():
+        with open(test_file) as f:
+            test_data = json.load(f)
+        test_samples = test_data.get("samples", [])
+        print(f"[Peer {PEER_ID}] [3/3] Test samples loaded: {len(test_samples)}")
+    else:
+        test_samples = []
+        print(f"[Peer {PEER_ID}] [3/3] No test file found, evaluation skipped")
+    sys.stdout.flush()
+
+    print(f"[Peer {PEER_ID}] [4/4] Initializing shared state and threads...", flush=True)
+    sys.stdout.flush()
 
     # 共有状態
     state = SharedState()
@@ -698,17 +878,26 @@ def main() -> None:
     # Thread 3（訓練ループ）を起動
     training_thread = threading.Thread(
         target=training_loop_thread,
-        args=(state, model, tokenizer, train_data),
+        args=(state, model, tokenizer, train_data, train_samples, test_samples),
         daemon=True,
     )
     training_thread.start()
 
     # 全スレッドの終了を待機
-    print(f"[Peer {PEER_ID}] All 4 threads started. Waiting...")
-    for t in [listener_thread, p2p_thread, training_thread, logger_thread]:
+    print(f"[Peer {PEER_ID}] All threads started. Waiting for experiment...", flush=True)
+    sys.stdout.flush()
+    for t in [listener_thread, p2p_thread, training_thread]:
         t.join()
 
-    print(f"[Peer {PEER_ID}] All threads stopped. Client exiting.")
+    # logger へシャットダウンシグナル（None = SHUTDOWN）
+    try:
+        state.metrics_queue.put_nowait(None)
+    except queue.Full:
+        pass
+    logger_thread.join()
+
+    print(f"[Peer {PEER_ID}] All threads stopped. Client exiting.", flush=True)
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":

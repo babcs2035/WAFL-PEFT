@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from utils import get_base_dir, get_hosts_path, load_config
+from utils import get_base_dir, get_hosts_path, _get_int, _get_str
 
 
 
@@ -83,7 +83,6 @@ class WAFLServer:
     """
 
     def __init__(self) -> None:
-        self.config = load_config()
         base_dir = get_base_dir()
 
         # 接触パターン読み込み
@@ -97,9 +96,11 @@ class WAFLServer:
             t = float(time_str)
             self.timeline.append((t, peers))
 
-        self.server_port = self.config["server_port"]
-        self.client_p2p_port = self.config["client_p2p_port"]
-        self.experiment_duration = self.config.get("experiment_duration_seconds", 300)
+        # experiment_duration は contact_pattern の最大時間 + 余裕から自動計算
+        self.experiment_duration = max(float(t) for t in self.contact_pattern.keys()) + 60.0 if self.contact_pattern else 300.0
+
+        self.server_port = _get_int("server", "server_port")
+        self.client_p2p_port = _get_int("communication", "client_p2p_port")
 
         # クライアント管理
         self.sessions: dict[int, ClientSession] = {}
@@ -113,8 +114,17 @@ class WAFLServer:
 
     def start(self) -> None:
         """サーバーを起動。"""
-        print(f"[SERVER] Starting WAFL-PEFT Experiment Server on port {self.server_port}")
-        print(f"[SERVER] Contact pattern timeline: {len(self.timeline)} events")
+        import sys
+        print(f"[SERVER] ============================================================", flush=True)
+        print(f"[SERVER] WAFL-PEFT Experiment Server Starting", flush=True)
+        print(f"[SERVER] ============================================================", flush=True)
+        print(f"[SERVER] Port: {self.server_port}", flush=True)
+        print(f"[SERVER] P2P Port: {self.client_p2p_port}", flush=True)
+        print(f"[SERVER] Experiment Duration: {self.experiment_duration}s", flush=True)
+        print(f"[SERVER] Contact Pattern Timeline: {len(self.timeline)} events", flush=True)
+        for t, peers in self.timeline:
+            print(f"[SERVER]   t={t}s: {len(peers)} peer connections", flush=True)
+        sys.stdout.flush()
 
         # TCPサーバーソケット作成
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -122,6 +132,8 @@ class WAFLServer:
         self.server_socket.settimeout(1.0)
         self.server_socket.bind(("0.0.0.0", self.server_port))
         self.server_socket.listen(128)
+        print(f"[SERVER] TCP socket bound to 0.0.0.0:{self.server_port}, listening...", flush=True)
+        sys.stdout.flush()
 
         # クライアント受信スレッド
         accept_thread = threading.Thread(target=self._accept_clients, daemon=True)
@@ -135,18 +147,22 @@ class WAFLServer:
         monitor_thread = threading.Thread(target=self._monitor_experiment, daemon=True)
         monitor_thread.start()
 
-        print(f"[SERVER] Waiting for clients... (max={len(self.contact_pattern.get('60', {}))})")
+        print(f"[SERVER] All threads started. Waiting for clients...", flush=True)
+        print(f"[SERVER] Expected clients: {len(self.timeline[0][1]) if self.timeline else 0}", flush=True)
+        sys.stdout.flush()
 
     def _accept_clients(self) -> None:
         """クライアント接続を受付け。登録後、Ready信号を待受。"""
         while self.server_socket and not self.experiment_end_time:
             try:
                 conn, addr = self.server_socket.accept()
+                print(f"[SERVER] New connection from {addr}", flush=True)
                 session = ClientSession(-1, conn, addr)
 
                 # 登録メッセージを受信
                 msg = session.receive_json(timeout=10.0)
                 if not msg or msg.get("type") != "register":
+                    print(f"[SERVER] Invalid registration from {addr}, closing", flush=True)
                     session.close()
                     continue
 
@@ -154,7 +170,8 @@ class WAFLServer:
                 with self.sessions_lock:
                     self.sessions[peer_id] = session
 
-                print(f"[SERVER] Client registered: peer_id={peer_id}, addr={addr}")
+                print(f"[SERVER] Client registered: peer_id={peer_id}, addr={addr}", flush=True)
+                print(f"[SERVER] Registered clients: {list(self.sessions.keys())}", flush=True)
 
                 # Ready信号を待受（別スレッドで処理）
                 def wait_ready(sess: ClientSession, pid: int) -> None:
@@ -163,7 +180,7 @@ class WAFLServer:
                         with self.sessions_lock:
                             if pid in self.sessions:
                                 self.sessions[pid].ready = True
-                        print(f"[SERVER] Client {pid} is ready.")
+                        print(f"[SERVER] Client {pid} is ready. ({sum(1 for s in self.sessions.values() if s.ready)}/{len(self.sessions)} ready)", flush=True)
 
                 ready_thread = threading.Thread(
                     target=wait_ready, args=(session, peer_id), daemon=True
@@ -203,9 +220,14 @@ class WAFLServer:
 
     def _wait_for_ready(self) -> None:
         """全クライアントのReadyを待受。"""
-        # contact_patternから期待されるクライアント数を推定
-        first_signal = self.timeline[0][1] if self.timeline else {}
-        expected = len(first_signal)
+        # contact_patternの全タイムステップから一意のpeer_idを数える
+        all_peers: set[int] = set()
+        for _, peers in self.timeline:
+            for pid in peers:
+                all_peers.add(int(pid))
+        expected = len(all_peers)
+        print(f"[SERVER] Expected clients from contact_pattern: {expected} (unique peers across all time buckets)", flush=True)
+        print(f"[SERVER] Waiting for {expected} clients to be ready...", flush=True)
 
         while not self.all_ready and not self.experiment_end_time:
             with self.sessions_lock:
@@ -224,17 +246,25 @@ class WAFLServer:
                     for session in self.sessions.values():
                         session.send_json(broadcast)
                     self.experiment_start_time = time.time()
-                    print(f"[SERVER] All {ready_count} clients ready. Experiment START at {now}")
+                    print(f"[SERVER] All {ready_count}/{expected} clients ready. Experiment START at {now}", flush=True)
+                    print(f"[SERVER] Registered peers: {list(self.sessions.keys())}", flush=True)
                     return
 
-            time.sleep(0.5)
+            with self.sessions_lock:
+                current_ready = sum(1 for s in self.sessions.values() if s.ready)
+                current_registered = len(self.sessions)
+            print(f"[SERVER] Ready: {current_ready}/{expected}, Registered: {current_registered}", flush=True)
+            time.sleep(1.0)
 
     def _monitor_experiment(self) -> None:
         """実験状態を監視。"""
         self._wait_for_ready()
 
         if self.experiment_start_time is None:
+            print(f"[SERVER] Experiment start time not set. Exiting monitor.", flush=True)
             return
+
+        print(f"[SERVER] Experiment running. Duration: {self.experiment_duration}s", flush=True)
 
         # 実験終了まで待機
         while True:
@@ -251,8 +281,11 @@ class WAFLServer:
                 with self.sessions_lock:
                     for session in self.sessions.values():
                         session.send_json(stop_signal)
-                print(f"[SERVER] Experiment STOPPED after {self.experiment_duration}s")
+                print(f"[SERVER] Experiment STOPPED after {self.experiment_duration}s", flush=True)
                 break
+            if int(elapsed) % 10 == 0:
+                remaining = self.experiment_duration - elapsed
+                print(f"[SERVER] Experiment running... Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s", flush=True)
             time.sleep(1.0)
 
     def get_client_list(self) -> list[str]:

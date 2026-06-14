@@ -14,7 +14,7 @@ venv/
 .env
 
 # Logs and data
-logs/
+results/
 collected_logs/
 data/
 

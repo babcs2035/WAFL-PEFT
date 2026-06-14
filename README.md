@@ -1,0 +1,551 @@
+# WAFL-PEFT
+
+WAFL-PEFT は，時変 P2P (Peer-to-Peer) トポロジー下でのフェデレーテッド PEFT (Parameter-Efficient Fine-Tuning) 実験フレームワークである．複数の学習デバイス (peer) が直接重みを交換しながら大規模言語モデルを LoRA で協調学習し，管理サーバーが動的な接触パターン (contact pattern) に応じて通信トポロジーを制御する．
+
+## 技術スタック
+
+| 分野           | 技術                                             |
+| -------------- | ------------------------------------------------ |
+| フレームワーク | Python 3.10+, PyTorch, transformers, peft (LoRA) |
+| データセット   | GSM8K (小学レベル数学文章題)                     |
+| コンテナ       | Docker (CPU 版 PyTorch)                          |
+| デプロイ       | SSH + rsync + Docker Registry (階層的配布)       |
+| 環境管理       | uv (Python), mise (タスクランナー)               |
+
+## 理論的背景
+
+### フェデレーテッド学習
+
+フェデレーテッド学習 (Federated Learning, FL) は，データプライバシーを維持しながら分散環境でモデルを訓練するパラダイムである．中央サーバーがモデルパラメータを配布し，各クライアントがローカルデータで訓練した後に重みを集約する (FedAvg: McMahan et al., 2017) ．
+
+標準的な FL では，すべてのクライアントがサーバーに接続するスター型トポロジーが仮定される．しかしこれは以下の課題を抱える．
+
+- **スケーラビリティ**: クライアント数が増えるとサーバーの通信ボトルネックが顕著になる
+- **単一障害点**: サーバーが停止すると全体が停止する
+- **ネットワーク制約**: リモート環境ではサーバーとの安定した接続が保証されない
+
+WAFL-PEFT はこの制約を取り除くため，**P2P トポロジー** を採用する． peer は直接重みを交換し，管理サーバーはトポロジー制御のみを行う．
+
+### パラメータ効率的ファインチューニング (PEFT)
+
+大規模言語モデル (LLM) のファインチューニングには数十億のパラメータを更新する必要があり，各 peer が全パラメータを保存・送信するにはメモリと帯域の両面で現実的ではない．
+
+LoRA (Low-Rank Adaptation: Hu et al., 2021) は，凍結された事前学習済みモデルの重み $W_0$ に対して，低ランク分解された更新 $\Delta W = BA$ を追加する．ここで $B \in \mathbb{R}^{d \times r}$, $A \in \mathbb{R}^{r \times k}$ であり，ランク $r \ll \min(d, k)$ である．
+
+$$W_0x + \Delta Wx = W_0x + BAx$$
+
+この方法により，更新対象パラメータが元のモデルの $0.01\%$ 以下に削減され，メモリと通信コストが劇的に減少する．本フレームワークでは，この LoRA パラメータのみを P2P 間で交換し，事前学習済み重みは各 peer がローカルに保持する．
+
+### Non-IID データ分布の課題
+
+現実の分散システムでは，各ノードが同じ確率分布からデータを取得するとは限らない．これを Non-IID (Non-Independent and Identically Distributed) 問題と呼ぶ．
+
+本フレームワークでは， GSM8K の問題をカテゴリ (加減算，乗除算，百分率，平均，混合) に分類し，各 peer を特定のカテゴリに専門化させる．このとき，データは以下のように分散される．
+
+- 70 〜 90%: 専門カテゴリの peer へ (確率的分配)
+- 10 〜 30%: ランダム peer へ (マルチホップ用)
+
+Non-IID 分布下では，各 peer のローカル訓練が異なる最適解に向かい，グローバルモデルの収束が不安定になる． P2P 重み交換と時変トポロジーは，この課題に対処するためのメカニズムである．
+
+### 時変トポロジー
+
+本フレームワークの核心概念である．固定トポロジーでは，接続されていない peer 間は知識が伝わらない．時変トポロジーでは，時間とともに通信ペアが変化する．
+
+$t$ 時刻における peer $i$ の通信相手集合を $N_i(t)$ と表す． contact_pattern.json は，離散時刻 $t_1, t_2, \ldots$ における $N_i(t_j)$ を定義する．各接続には `remaining_time` が付随し，その接続が有効な残り秒数を指定する．
+
+この設計により，すべての peer 対が最終的に通信する (グラフが時間的に連結) ，かつ，一度にすべての peer 対が通信するわけではないため，通信衝突を回避できる．
+
+## アーキテクチャ
+
+システム全体は管理サーバーと複数 peer で構成される．
+
+```mermaid
+graph TD
+    subgraph ctrl["管理サーバー wafl-ctrl1"]
+        S["server.py<br/>Port: 9999"]
+        R["Docker Registry<br/>Port: 5000"]
+    end
+
+    P0["Peer 0<br/>client.py<br/>Port: 8888"]
+    P1["Peer 1<br/>client.py<br/>Port: 8888"]
+    P2["Peer 2<br/>client.py<br/>Port: 8888"]
+
+    S -->|"contact_pattern 配信"| P0
+    S -->|"contact_pattern 配信"| P1
+    S -->|"contact_pattern 配信"| P2
+
+    P0 <-->|"P2P 重み交換"| P1
+    P1 <-->|"P2P 重み交換"| P2
+    P2 <-->|"P2P 重み交換"| P0
+```
+
+### 4 層スレッドアーキテクチャ (クライアント)
+
+各クライアントは 4 スレッドで並列動作する．この設計の目的は，**計算と通信の完全なオーバーラップ** を実現することである．
+
+| Thread                    | 責務                                                                                    | データフロー     |
+| ------------------------- | --------------------------------------------------------------------------------------- | ---------------- |
+| Thread 1: Server Listener | 管理サーバーとの永続 TCP 接続．シグナル (ホワイトリスト，実験開始 / 終了) を受信        | 制御プレーン     |
+| Thread 2: P2P Exchange    | ホワイトリストに基づき peer へ接続， LoRA 重みを gzip 圧縮して送受信，平均マージ        | データプレーン   |
+| Thread 3: Training Loop   | LoRA パラメータの順伝播・逆伝播・ optimizer.step ．各ステップでメトリクスをキューへ投入 | 計算プレーン     |
+| Thread 4: Async Logger    | メトリクスキューから読み取り，ファイルへ非同期書き出し (fsync 付き)                     | ロギングプレーン |
+
+スレッド間共有状態は `SharedState` クラスで管理され，ロックとキューで同期する．
+
+```mermaid
+flowchart LR
+    subgraph t1["Thread 1: Server Listener<br/>(制御プレーン)"]
+        WL["peer_whitelist"]
+    end
+
+    subgraph t2["Thread 2: P2P Exchange<br/>(データプレーン)"]
+        SW["shadow_weights"]
+    end
+
+    subgraph t3["Thread 3: Training Loop<br/>(計算プレーン)"]
+        MQ["metrics_queue"]
+    end
+
+    subgraph t4["Thread 4: Async Logger<br/>(ロギングプレーン)"]
+        LF["log file<br/>fsync"]
+    end
+
+    t1 -->|"update"| WL
+    WL -->|"read"| t2
+    t2 -->|"update"| SW
+    SW -->|"read"| t3
+    t3 -->|"put"| MQ
+    MQ -->|"get"| t4
+    t4 -->|"write"| LF
+```
+
+#### スレッド同期の詳細
+
+`SharedState` は以下の共有リソースを管理する．
+
+| リソース             | 型                  | 更新スレッド | 参照スレッド | 同期機構                   |
+| -------------------- | ------------------- | ------------ | ------------ | -------------------------- |
+| `peer_whitelist`     | `dict[int, float]`  | Thread 1     | Thread 2     | `threading.Lock`           |
+| `shadow_weights`     | `dict[str, Tensor]` | Thread 3     | Thread 2     | `threading.Lock`           |
+| `merge_queue`        | `queue.Queue`       | Thread 2     | Thread 3     | FIFO キュー (maxsize=32)   |
+| `metrics_queue`      | `queue.Queue`       | Thread 3     | Thread 4     | FIFO キュー (maxsize=8192) |
+| `current_step`       | `int`               | Thread 3     | Thread 2     | `threading.Lock`           |
+| `experiment_running` | `threading.Event`   | Thread 1     | Thread 3     | Event フラグ               |
+
+#### スループット平坦性 (Stall-Free Design)
+
+伝統的なフェデレーテッド学習では，重み同期のたびに訓練が停止する (synchronize-and-wait) ．これによりスループットが周期性を持ち，時間とスループットの相関が強く現れる．
+
+本フレームワークでは，以下の設計によりこれを回避する．
+
+1. **非同期マージ**: P2P 交換スレッドは訓練ループとは独立に動作し，訓練ステップの境界でマージ結果を適用する
+2. **シャドウコピー**: LoRA 重みのコピーを CPU 上に保持し， GPU 訓練とは独立に読み書きできる
+3. **マージタイミングの分離**: マージは `current_step` の変化を検知して実行され，訓練ループはブロックされない
+
+この結果，通信中でも計算は継続し，スループットと時間の相関係数は ~0 に近づく．
+
+## プロジェクト構成
+
+```mermaid
+graph LR
+    subgraph cfg["config/"]
+        S["settings.json<br/>実験設定"]
+        H["hosts.txt<br/>IPリスト"]
+        C["contact_pattern.json<br/>時変トポロジー"]
+    end
+
+    subgraph src["src/"]
+        SV["server.py<br/>管理サーバー"]
+        CL["client.py<br/>学習クライアント"]
+        SD["setup_data.py<br/>データ準備"]
+        AN["analyze.py<br/>分析・可視化"]
+        DD["deploy_distribute.py<br/>デプロイ"]
+        SC["start_clients.py<br/>並列起動"]
+        CLG["collect_logs.py<br/>ログ回収"]
+        CN["clean.py<br/>クリーンアップ"]
+        UT["utils.py<br/>共通関数"]
+    end
+
+    subgraph scripts["scripts/"]
+        AC["analyze_collect.sh<br/>ログ回収スクリプト"]
+    end
+
+    subgraph data["data/"]
+        TR["train/ peer_X.json"]
+        TE["test/ peer_X.json"]
+    end
+
+    cfg --> src
+    src --> data
+    scripts --> data
+```
+
+## 時変トポロジー (contact_pattern.json)
+
+`config/contact_pattern.json` で，時間経過に伴う P2P 通信相手の遷移を定義する．キーは実験開始からの経過秒数，値は各 peer が通信可能な peer のリストである．
+
+```jsonc
+{
+  "60": {
+    "0": { "allowed_peers": [{ "peer_id": 1, "remaining_time": 30.0 }] },
+    "1": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 30.0 }] },
+    "2": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 30.0 }] }
+  },
+  "90": {
+    "0": { "allowed_peers": [{ "peer_id": 1, "remaining_time": 15.0 }] },
+    "1": { "allowed_peers": [{ "peer_id": 2, "remaining_time": 15.0 }] },
+    "2": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 15.0 }] }
+  }
+}
+```
+
+この例では， t=60s で peer 0-1-2 の三つ編みトポロジーが形成され， t=90s でローテーションする． `remaining_time` はその接続が有効な残り秒数を表す．
+
+### トポロジーのグラフ理論的性質
+
+時変トポロジーは，時間とともに変化するグラフ $G(t) = (V, E(t))$ として定式化できる．ここで $V$ は peer の集合， $E(t)$ は t 時刻の辺の集合である．
+
+本フレームワークが目指す性質は，**時間的連結性 (temporal connectivity)** である．すなわち，任意の peer 対 $(i, j)$ に対して，時間区間 $[0, T]$ の中に $i$ から $j$ への時間依存パスが存在すること．
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: 実験開始待ち
+    Idle --> Ready: 全peerがモデルロード完了
+    Ready --> Running: 実験開始シグナル受信
+    Running --> Merging: P2P接続確立，重み交換
+    Merging --> Running: ステップ継続
+    Running --> Stopped: 実験終了時刻到達
+    Stopped --> [*]: 後処理
+```
+
+## GSM8K Non-IID データシャード
+
+`setup_data.py` は GSM8K データセットを peer 固有のシャードに分割する．各 peer が特定のカテゴリ (加減算，乗除算，百分率，平均，混合) に偏ったデータを持つ Non-IID 分布を生成する．
+
+### カテゴリ分類ロジック
+
+問題テキスト内の正規表現キーワードに基づき，最も一致数の多いカテゴリに分類する．
+
+| カテゴリ     | キーワード例                                                                     |
+| ------------ | -------------------------------------------------------------------------------- |
+| `add_sub`    | total, more, less, left, added, sum, increase, decrease, difference, plus, minus |
+| `mul_div`    | times, product, multipl, each, split, divide, per, rate, x\d+                    |
+| `percentage` | \d+%, percent, discount, interest, tax                                           |
+| `average`    | average, mean, median, per capita                                                |
+| `mixed`      | 上記いずれにも該当しない                                                         |
+
+### データ分配アルゴリズム
+
+```
+1. GSM8K データセットをシャッフル後，train/test に分割 (設定比率，デフォルト 90/10)
+2. 訓練データ各サンプルにカテゴリラベルを付与 (classify_problem関数)
+3. カテゴリごとにサンプルをシャッフル
+4. peer_id i にカテゴリ categories[i % num_categories] を割り当て
+5. 各サンプルを以下のように分配:
+   - 確率 p = 0.7 + 0.2 * U(0,1) で専門 peer へ
+   - それ以外: ランダム peer へ (マルチホップ用)
+6. テストデータは peer_id = idx % num_peers で均等分配
+```
+
+この結果，各 peer は自分の専門カテゴリのデータを主に持ちつつ，他のカテゴリのデータも一部持つ．これにより， P2P 交換を通じて他カテゴリの知識も獲得できる．
+
+## 通信プロトコル
+
+### 共通フォーマット
+
+すべてのメッセージは以下のフレーム構造を持つ．
+
+```
++------------------+-------------------+
+| Length (4 bytes) | Payload (variable)|
+|  (big-endian)    |   (JSON or binary)|
++------------------+-------------------+
+```
+
+Length は big-endian 4 バイト符号なし整数． JSON ペイロードは 10MB まで受信する．バイナリペイロードは 50MB まで受信する．
+
+### 管理サーバー <-> クライアント (制御プレーン)
+
+TCP 接続， JSON ボディのフォーマット． `type` フィールドでメッセージ種別を区別する．
+
+| メッセージ         | 方向            | 内容                                                               |
+| ------------------ | --------------- | ------------------------------------------------------------------ |
+| `register`         | Client → Server | `{"type": "register", "peer_id": int}`                             |
+| `ready`            | Client → Server | `{"type": "ready", "peer_id": int}`                                |
+| `signal`           | Server → Client | `{"type": "signal", "elapsed": float, "peers": {...}}`             |
+| `experiment_start` | Server → Client | `{"type": "experiment_start", "datetime": str, "duration": float}` |
+| `experiment_stop`  | Server → Client | `{"type": "experiment_stop", "elapsed": float}`                    |
+
+### P2P 重み交換 (データプレーン)
+
+TCP 接続，以下の順序で送信する．
+
+```
+1. peer_id フレーム: 4 バイト長さ + JSON ({"peer_id": int})
+2. 重みフレーム (複数可能): 4 バイト長さ + gzip 圧縮 pickle
+```
+
+重みデータは LoRA パラメータの state_dict であり，以下の圧縮手順を踏む．
+
+1. `torch.save(state_dict, buffer)` で pickle シリアライズ
+2. `gzip.compress(buffer.getvalue())` で圧縮
+
+受信時は逆の手順で復元し，平均マージする．平均マージは単純算術平均であり， peer $i$ の重み $w_i$ に対して，受信した $K$ peer の重みを以下で統合する．
+
+$$w_{\text{merged}} = \frac{1}{K} \sum_{i=1}^{K} w_i$$
+
+### 実験ライフサイクル
+
+```mermaid
+sequenceDiagram
+    participant C0 as Peer 0
+    participant C1 as Peer 1
+    participant S as Server
+
+    C0->>S: register(peer_id=0)
+    C1->>S: register(peer_id=1)
+    Note over C0,C1: モデルロード・データ準備中
+    C0->>S: ready(peer_id=0)
+    C1->>S: ready(peer_id=1)
+    S->>S: 全peerのreadyを待機
+    S-->>C0: experiment_start(datetime, duration)
+    S-->>C1: experiment_start(datetime, duration)
+
+    loop 1秒周期
+        S-->>C0: signal(elapsed, peers)
+        S-->>C1: signal(elapsed, peers)
+        C0->>C1: P2P 重み交換
+        C1->>C0: P2P 重み交換
+        Note over C0,C1: LoRA平均マージ
+    end
+
+    S-->>C0: experiment_stop(elapsed)
+    S-->>C1: experiment_stop(elapsed)
+    C0-->>C1: 通信終了
+```
+
+## 設定 (settings.json)
+
+```jsonc
+{
+  "model": {
+    "model_id": "google/gemma-4-E2B"       // 学習対象モデル
+  },
+  "training": {
+    "learning_rate": 5e-5,                  // AdamW学習率
+    "batch_size": 1,                        // バッチサイズ
+    "max_seq_len": 512,                     // 最大シーケンス長
+    "lora_rank": 16,                        // LoRAランク
+    "lora_alpha": 32,                       // LoRAアルファ
+    "num_training_steps": 10000             // 最大訓練ステップ数
+  },
+  "data": {
+    "validation_split": 0.1,                // 訓練/テスト分割比率
+    "seed": 42                              // 乱数シード
+  },
+  "communication": {
+    "client_p2p_port": 8888                 // P2P通信ポート
+  },
+  "server": {
+    "server_host": "wafl-ctrl1",            // 管理サーバーホスト
+    "server_ip": "192.168.11.10",           // 管理サーバーIP
+    "server_port": 9999,                    // 管理サーバーポート
+    "ufw_allow_from": "192.168.11.0/24,192.168.12.0/24"
+  },
+  "deployment": {
+    "ssh_user": "denjo",                    // SSHユーザー
+    "deploy_dir": "/home/denjo/workspace/ktakahashi/WAFL-PEFT"
+  },
+  "experiment": {
+    "experiment_name": "default"            // 実験名
+  }
+}
+```
+
+### LoRA パラメータの詳細
+
+`lora_rank` と `lora_alpha` は LoRA の内部次元とスケーリング係数を指定する． LoRA の実際の更新は以下のように計算される．
+
+$$\Delta W = \frac{\alpha}{r} BA$$
+
+ここで $\frac{\alpha}{r}$ はスケーリング係数であり，デフォルトでは $\frac{32}{16} = 2.0$ である． rank が小さいほどパラメータ数が削減されるが，表現力が低下する． alpha は rank に対する相対的な重みを調整する．
+
+target_modules は正規表現で指定され，以下のモジュールが対象となる．
+
+```
+self_attn.q_proj, self_attn.k_proj, self_attn.v_proj, self_attn.o_proj
+mlp.gate_proj, mlp.up_proj, mlp.down_proj
+```
+
+## 使用方法
+
+### 1. 環境セットアップ
+
+```bash
+# すべて (モデル・データ・Dockerイメージ)
+mise run setup
+
+# または個別に実行
+mise run setup:model    # HuggingFaceベースモデルをローカルキャッシュへダウンロード
+mise run setup:data     # GSM8KをNon-IIDシャードとして生成
+mise run setup:build    # Dockerイメージビルド
+```
+
+### 2. デプロイ
+
+```bash
+# すべて (ローカル → 管理サーバー → 各学習デバイス)
+mise run deploy
+
+# 個別フェーズ
+mise run deploy:sync-local    # 管理サーバーへファイル転送
+mise run deploy:registry      # 管理サーバーのレジストリへイメージpush
+mise run deploy:distribute    # 各学習デバイスへイメージ配布・コンテナ起動
+```
+
+デプロイフローは以下の 3 層階層である．
+
+```mermaid
+graph LR
+    LP["Local PC<br/>Dockerイメージビルド"]
+
+    subgraph ms["管理サーバー wafl-ctrl1"]
+        RS["Docker Registry<br/>127.0.0.1:5000"]
+        SV["server.py コンテナ"]
+    end
+
+    subgraph peers["学習デバイス"]
+        P0["Peer 0<br/>client コンテナ"]
+        P1["Peer 1<br/>client コンテナ"]
+        P2["Peer 2<br/>client コンテナ"]
+    end
+
+    LP -->|"rsync<br/>ファイル転送"| ms
+    LP -->|"push"| RS
+    P0 -. "SSHトンネル<br/>docker pull" .-> RS
+    P1 -. "SSHトンネル<br/>docker pull" .-> RS
+    P2 -. "SSHトンネル<br/>docker pull" .-> RS
+    RS -->|"コンテナ起動"| P0
+    RS -->|"コンテナ起動"| P1
+    RS -->|"コンテナ起動"| P2
+```
+
+### 3. 実験実行
+
+```bash
+# すべて (サーバー + 全クライアント起動)
+mise run start
+
+# 個別
+mise run start:server    # 管理サーバーコンテナ起動
+mise run start:clients   # 全学習デバイスコンテナ並列起動
+```
+
+### 4. 分析
+
+```bash
+# すべて (ログ回収 + 評価)
+mise run analyze
+
+# 個別
+mise run analyze:collect     # 各デバイスからメトリクス・LoRA重みを回収
+mise run analyze:evaluate    # マージ・グラフ生成・レポート作成
+```
+
+### 5. クリーンアップ
+
+```bash
+mise run clean
+```
+
+ローカル (cache/, .venv/, data/) ，管理サーバー，全学習デバイス上の Docker コンテナ・イメージ・デプロイディレクトリを削除する．
+
+## 実験結果分析 (analyze.py)
+
+`analyze.py` は以下の 5 つの評価グラフを生成する．
+
+### 評価 1: スループットの平坦性 (Stall-Free Demonstration)
+
+通信中でも計算が停止しないことを実時間軸で示す．各 peer の Token/s をプロットし，平均 (時間ビン分割) と標準偏差範囲を描画する．相関係数 ~0 が stall-free の指標である．
+
+時間ビン数は 50 に固定し，各ビン内で全 peer の測定値を平均・標準偏差計算する．相関係数はピアソン相関係数を用い， elapsed time と tokens_per_sec の線形関連性を定量する．
+
+### 評価 2: 損失関数の推移
+
+各 peer の訓練損失を時間軸でプロットする．赤線はビン平均， shaded area は 1 標準偏差．
+
+### 評価 3: 知識収束 (Convergence under Time-Varying Topology)
+
+回収した LoRA 重みチェックポイントを GSM8K バリデーションセットで評価し，ステップ wise の accuracy 推移を描画する．中央集約学習の上限 (推定) と既存のラウンド制フェデレーテッド学習 (推定) と比較する．
+
+評価手順は以下の通り．
+
+1. 各チェックポイント `weights_step_XXXXXX.pt` をロード
+2. GSM8K テストセットから最大 50 件サンプリング
+3. 各問題に対して `Question: {question}\nAnswer:` を入力とし，最大 64 トークン生成
+4. 生成テキストに正解数値 (`#### ` 以降) が含まれるかを判定
+5. accuracy = 正解数 / 処理件数
+
+### 評価 4: train/test スコア推移
+
+各 peer の訓練精度・テスト精度を時間軸でプロットする．過学習の有無を同時に確認できる．
+
+### 評価 5: loss vs throughput 散布図
+
+各データポイントを peer ID で色分けし，スループットと損失の関係を可視化する．
+
+生成されたレポートは `results/{experiment_name}_{timestamp}/output/analysis_report.md` に保存される．
+
+## Docker コンテナ構成
+
+各コンテナは以下のボリュームをマウントする．
+
+| マウント元 | マウント先  | 用途                                |
+| ---------- | ----------- | ----------------------------------- |
+| ./src      | /app/src    | ソースコード                        |
+| ./config   | /app/config | 設定ファイル                        |
+| ./data     | /app/data   | 訓練・テストデータ                  |
+| ./cache    | /app/cache  | モデルキャッシュ (クライアントのみ) |
+| ./logs     | /app/logs   | メトリクスログ，チェックポイント    |
+
+管理サーバーは `--net=host` モードで起動し，学習デバイスは `--add-host wafl-ctrl1:{server_ip}` で管理サーバーの IP を追加設定する．
+
+### Dockerfile のビルド順序
+
+Dockerfile はビルドレイヤーの最適化を考慮している．変更頻度の低い層を先にビルドし，キャッシュを最大化する．
+
+1. システム依存 (curl, rsync) — ほぼ不変
+2. uv インストール — 不変
+3. ユーザー作成 — 不変
+4. pyproject.toml コピー + 依存関係インストール — 稀に変更
+5. ソースコードコピー — 頻繁に変更
+6. Docker 設定 (insecure-registries) — 不変
+
+## ネットワークポート
+
+| ポート | 用途                           | 開放先                            |
+| ------ | ------------------------------ | --------------------------------- |
+| 9999   | 管理サーバー <-> クライアント  | 192.168.11.0/24, 192.168.12.0/24  |
+| 8888   | クライアント間 P2P 重み交換    | 192.168.11.0/24, 192.168.12.0/24  |
+| 5000   | Docker Registry (管理サーバー) | localhost のみ (SSH トンネル経由) |
+
+デプロイ時に `ufw_allow_from` に基づき自動で firewall ルールが設定される． 0.0.0.0 への全開放は行わず，指定サブネットからのみ許可する．
+
+## メトリクスログフォーマット
+
+各 peer の `logs/metrics_peer_{ID}_final.log` には， 1 行 1JSON で以下のフィールドを記録する．
+
+| フィールド     | 型     | 説明                               |
+| -------------- | ------ | ---------------------------------- |
+| peer_id        | int    | ペア識別子                         |
+| step           | int    | 訓練ステップ番号                   |
+| elapsed        | float  | 実験開始からの経過秒数             |
+| loss           | float  | 訓練損失                           |
+| tokens_per_sec | float  | スループット                       |
+| total_tokens   | int    | 累積トークン数                     |
+| step_duration  | float  | ステップ実行時間                   |
+| train_score    | float  | 訓練 accuracy (%) ，評価時点のみ   |
+| test_score     | float  | テスト accuracy (%) ，評価時点のみ |
+| type           | string | "metric" または "checkpoint"       |
+
+ログファイルは各 peer ごとに独立して作成され，実験終了後に `_final` サフィックス付きのリネームで確定する．書き出し時には `fsync` を呼び出し，データ損失を防止する．

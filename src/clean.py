@@ -18,7 +18,7 @@ import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from utils import get_base_dir, load_config
+from utils import get_base_dir, _get_str
 
 
 def load_hosts() -> list[str]:
@@ -110,7 +110,11 @@ def clean_local() -> None:
 
 def confirm(prompt: str) -> bool:
     """確認プロンプトを表示。y/Enter で True、他で False。"""
+    import sys
     try:
+        # TTYでない場合（mise実行時など）はデフォルトで許可
+        if not sys.stdin.isatty():
+            return True
         return input(prompt).strip().lower() in ("y", "yes", "")
     except (EOFError, KeyboardInterrupt):
         print("\nAborted.")
@@ -123,9 +127,8 @@ def main() -> None:
         print("Aborted.")
         return
 
-    config = load_config()
-    user = config["ssh_user"]
-    deploy_dir = os.path.expanduser(config["deploy_dir"])
+    user = _get_str("deployment", "ssh_user")
+    deploy_dir = os.path.expanduser(_get_str("deployment", "deploy_dir"))
     hosts = load_hosts()
 
     print("[clean] Full cleanup: local + management server + learning devices...")

@@ -7,19 +7,40 @@ hosts.txtを読み込み、各デバイスへ並列SSHを送り、Dockerコン�
 
 import json
 import os
+import socket
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
-from utils import get_base_dir, get_hosts_path, load_config
+from utils import get_base_dir, _get, _get_int, _get_str
 
 BASE_DIR = get_base_dir()
-CONFIG = load_config()
+DEPLOY_DIR = os.path.expanduser(_get_str("deployment", "deploy_dir"))
+SERVER_HOST = _get_str("server", "server_host")
 
-SSH_USER = CONFIG["ssh_user"]
-DEPLOY_DIR = os.path.expanduser(CONFIG["deploy_dir"])
-SERVER_HOST = CONFIG.get("server_host", "wafl-ctrl1")
+
+# 実験ディレクトリ名の取得（setup_data.py の .experiment_meta.json を優先参照）
+def _load_experiment_dir_name() -> str:
+    """実験ディレクトリ名を .experiment_meta.json から読み込み、なければ生成する。"""
+    meta_path = BASE_DIR / "results" / ".experiment_meta.json"
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+        name = meta.get("dir_name")
+        if name:
+            return name
+    exp_name = _get("experiment", "experiment_name", "default")
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    return f"{exp_name}_{timestamp}"
+
+
+EXPERIMENT_DIR_NAME = _load_experiment_dir_name()
+EXPERIMENT_DIR_REMOTE = f"{DEPLOY_DIR}/results/{EXPERIMENT_DIR_NAME}"
+
+SSH_USER = _get_str("deployment", "ssh_user")
+SERVER_HOST_IP = _get("server", "server_ip", socket.gethostbyname(SERVER_HOST))
 REGISTRY_PORT = 5000
 IMAGE_NAME = f"127.0.0.1:{REGISTRY_PORT}/wafl-peft:latest"
 
@@ -36,33 +57,11 @@ def load_hosts() -> list[str]:
 
 
 def sync_source(ip: str, peer_id: int) -> str:
-    """1デバイスへプロジェクトソースをrsyncで転送。"""
-    # リモートディレクトリ作成
-    subprocess.run(
-        f"ssh -o StrictHostKeyChecking=no {SSH_USER}@{ip} "
-        f"'mkdir -p {DEPLOY_DIR}/data/train {DEPLOY_DIR}/data/test'",
-        shell=True, capture_output=True, text=True, timeout=30,
-    )
+    """1デバイスへプロジェクトソースをrsyncで転送。
 
-    # peer固有の訓練データ転送
-    train_file = BASE_DIR / "data" / "train" / f"peer_{peer_id}.json"
-    if train_file.exists():
-        subprocess.run(
-            f"rsync -az --quiet {train_file} "
-            f"{SSH_USER}@{ip}:{DEPLOY_DIR}/data/train/peer_{peer_id}.json",
-            shell=True, capture_output=True, text=True, timeout=60,
-        )
-
-    # peer固有のテストデータ転送
-    test_file = BASE_DIR / "data" / "test" / f"peer_{peer_id}.json"
-    if test_file.exists():
-        subprocess.run(
-            f"rsync -az --quiet {test_file} "
-            f"{SSH_USER}@{ip}:{DEPLOY_DIR}/data/test/peer_{peer_id}.json",
-            shell=True, capture_output=True, text=True, timeout=60,
-        )
-
-    # ソースコード転送（data/ は除外）
+    データは deploy:distribute で配布済みなので、ここではソースコードのみ転送。
+    """
+    # ソースコード転送（data/ は除外＝deploy:distribute で配布済み）
     rsync_cmd = (
         f"rsync -az --quiet --delete "
         f"--exclude='__pycache__' --exclude='*.pyc' --exclude='.git' "
@@ -84,15 +83,18 @@ def start_client_container(ip: str, peer_id: int) -> str:
 
     cmd = (
         f"ssh {SSH_USER}@{ip} "
-        f"'docker rm -f wafl-peft-client-{peer_id} 2>/dev/null || true; "
+        f"'export LC_ALL=C; mkdir -p {DEPLOY_DIR}/logs && chown {SSH_USER}:{SSH_USER} {DEPLOY_DIR}/logs; "
+        f"docker rm -f wafl-peft-client-{peer_id} 2>/dev/null || true; "
         f"docker run -d --name wafl-peft-client-{peer_id} "
+        f"--add-host wafl-ctrl1:{SERVER_HOST_IP} "
         f"-e PEER_ID={peer_id} "
         f"-v {DEPLOY_DIR}/src:/app/src "
         f"-v {DEPLOY_DIR}/config:/app/config "
         f"-v {DEPLOY_DIR}/data:/app/data "
+        f"-v {DEPLOY_DIR}/cache:/app/cache "
         f"-v {DEPLOY_DIR}/logs:/app/logs "
         f"{IMAGE_NAME} "
-        f"uv run python src/client.py'"
+        f"/app/.venv/bin/python src/client.py'"
     )
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode == 0:
@@ -124,7 +126,7 @@ def main() -> None:
                 print(f"  [FAIL] peer={peer_id}: {e}")
 
     print("\n[start_clients] All containers launched.")
-    print("[start_clients] Monitor with: docker exec -it wafl-peft-server tail -f /app/logs/metrics_peer_0_final.jsonl")
+    print(f"[start_clients] Monitor with: docker exec -it wafl-peft-server tail -f /app/results/{EXPERIMENT_DIR_NAME}/logs/metrics_peer_0_final.jsonl")
 
 
 if __name__ == "__main__":
