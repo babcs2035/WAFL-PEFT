@@ -11,7 +11,7 @@ import socket
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from utils import get_base_dir, _get, _get_int, _get_str
@@ -32,7 +32,7 @@ def _load_experiment_dir_name() -> str:
         if name:
             return name
     exp_name = _get("experiment", "experiment_name", "default")
-    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
     return f"{exp_name}_{timestamp}"
 
 
@@ -40,9 +40,20 @@ EXPERIMENT_DIR_NAME = _load_experiment_dir_name()
 EXPERIMENT_DIR_REMOTE = f"{DEPLOY_DIR}/results/{EXPERIMENT_DIR_NAME}"
 
 SSH_USER = _get_str("deployment", "ssh_user")
-SERVER_HOST_IP = _get("server", "server_ip", socket.gethostbyname(SERVER_HOST))
+_server_ip = _get("server", "server_ip")
+if _server_ip:
+    SERVER_HOST_IP = _server_ip
+else:
+    SERVER_HOST_IP = socket.gethostbyname(SERVER_HOST)
 REGISTRY_PORT = 5000
 IMAGE_NAME = f"127.0.0.1:{REGISTRY_PORT}/wafl-peft:latest"
+
+# 管理サーバー上かローカルかでSSH接続方法を変える
+_CURRENT_HOSTNAME = socket.gethostname()
+if _CURRENT_HOSTNAME == SERVER_HOST or SERVER_HOST_IP in _CURRENT_HOSTNAME:
+    _JUMP = ""
+else:
+    _JUMP = f"-J {SSH_USER}@{SERVER_HOST}"
 
 
 def load_hosts() -> list[str]:
@@ -60,15 +71,18 @@ def sync_source(ip: str, peer_id: int) -> str:
     """1デバイスへプロジェクトソースをrsyncで転送。
 
     データは deploy:distribute で配布済みなので、ここではソースコードのみ転送。
+    --info=progress2 で進捗バーを表示する。
     """
     # ソースコード転送（data/ は除外＝deploy:distribute で配布済み）
+    jump_flag = f"-J {SSH_USER}@{SERVER_HOST} " if _JUMP else ""
     rsync_cmd = (
-        f"rsync -az --quiet --delete "
+        f"rsync -az --info=progress2 --delete "
+        f"-e 'ssh -o StrictHostKeyChecking=no {jump_flag}' "
         f"--exclude='__pycache__' --exclude='*.pyc' --exclude='.git' "
         f"--exclude='.venv' --exclude='data/' --exclude='logs/' --exclude='output/' "
         f"{BASE_DIR}/ {SSH_USER}@{ip}:{DEPLOY_DIR}/"
     )
-    result = subprocess.run(rsync_cmd, shell=True, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(rsync_cmd, shell=True, capture_output=False, text=True, timeout=120)
     if result.returncode == 0:
         return f"OK (peer={peer_id}, ip={ip})"
     return f"FAILED rsync (peer={peer_id}, ip={ip}): {result.stderr[:200]}"
@@ -81,12 +95,14 @@ def start_client_container(ip: str, peer_id: int) -> str:
     if not sync_result.startswith("OK"):
         return sync_result
 
+    jump_flag = f"-J {SSH_USER}@{SERVER_HOST} " if _JUMP else ""
     cmd = (
-        f"ssh {SSH_USER}@{ip} "
+        f"ssh -o StrictHostKeyChecking=no {jump_flag}{SSH_USER}@{ip} "
         f"'export LC_ALL=C; mkdir -p {DEPLOY_DIR}/logs && chown {SSH_USER}:{SSH_USER} {DEPLOY_DIR}/logs; "
         f"docker rm -f wafl-peft-client-{peer_id} 2>/dev/null || true; "
         f"docker run -d --name wafl-peft-client-{peer_id} "
-        f"--add-host wafl-ctrl1:{SERVER_HOST_IP} "
+        f"--gpus all "
+        f"--add-host {SERVER_HOST}:{SERVER_HOST_IP} "
         f"-e PEER_ID={peer_id} "
         f"-v {DEPLOY_DIR}/src:/app/src "
         f"-v {DEPLOY_DIR}/config:/app/config "

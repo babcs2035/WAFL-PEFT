@@ -5,7 +5,7 @@
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -83,7 +83,7 @@ def get_experiment_dir() -> Path:
         return Path(exp_dir)
 
     exp_name = get_experiment_name()
-    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
     return get_base_dir() / "results" / f"{exp_name}_{timestamp}"
 
 

@@ -9,7 +9,7 @@ import json
 import socket
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from utils import get_base_dir, get_hosts_path, _get_int, _get_str
@@ -237,7 +237,7 @@ class WAFLServer:
                 if ready_count >= expected and expected > 0:
                     self.all_ready = True
                     # 実験開始時刻をブロードキャスト
-                    now = datetime.now(timezone.utc).isoformat()
+                    now = datetime.now(timezone(timedelta(hours=9))).isoformat()
                     broadcast = {
                         "type": "experiment_start",
                         "datetime": now,

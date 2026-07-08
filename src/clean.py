@@ -11,7 +11,7 @@
   - Docker イメージ（wafl-peft:latest, registry:2）
   - デプロイディレクトリ
 
-学習デバイスは管理サーバー（wafl-ctrl1）経由でSSHする。
+学習デバイスは管理サーバー経由でSSHする。
 """
 
 import os
@@ -19,6 +19,8 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils import get_base_dir, _get_str
+
+SERVER_HOST = _get_str("server", "server_host")
 
 
 def load_hosts() -> list[str]:
@@ -36,7 +38,7 @@ def clean_node(user: str, target: str, deploy_dir: str, peer_id: int | None = No
     """1ノードからデプロイ成果物をクリーンアップ。
 
     管理サーバー（peer_id=None）には直接SSHし、学習デバイスには
-    ローカル→wafl-ctrl1→学習デバイス(IP) のネストSSHで接続する。
+    ローカル→管理サーバー→学習デバイス(IP) のネストSSHで接続する。
 
     Args:
         user: SSH接続ユーザー
@@ -57,11 +59,11 @@ def clean_node(user: str, target: str, deploy_dir: str, peer_id: int | None = No
     def run_via_master(cmd: str, timeout: int = 60) -> None:
         """管理サーバー経由でコマンドを実行（ネストSSH）。
 
-        ローカル→wafl-ctrl1→学習デバイス(IP) の順でSSHする。
+        ローカル→管理サーバー→学習デバイス(IP) の順でSSHする。
         deploy_distribute.pyと同様、heredocでコマンドを渡す。
         """
         result = subprocess.run(
-            f"ssh -o StrictHostKeyChecking=no {user}@wafl-ctrl1 "
+            f"ssh -o StrictHostKeyChecking=no {user}@{SERVER_HOST} "
             f"ssh -o StrictHostKeyChecking=no {user}@{target} "
             f"bash -s <<'CLEANEOF'\n{cmd}\nCLEANEOF",
             shell=True, capture_output=True, text=True, timeout=timeout,
@@ -71,7 +73,7 @@ def clean_node(user: str, target: str, deploy_dir: str, peer_id: int | None = No
 
     if peer_id is not None:
         run_fn = run_via_master
-        print(f"  [client-{peer_id}] Cleaning {target} via wafl-ctrl1...")
+        print(f"  [client-{peer_id}] Cleaning {target} via {SERVER_HOST}...")
     else:
         run_fn = run
         print(f"  [server] Cleaning {target}...")
@@ -135,12 +137,12 @@ def main() -> None:
     print(f"\n[clean] Cleaning local (cache, .venv, data)...")
     clean_local()
 
-    # 管理サーバーのクリーン（SSH config: wafl-ctrl1 → ProxyJump: wafl）
-    print("\n[clean] Cleaning management server (wafl-ctrl1)...")
-    clean_node(user, "wafl-ctrl1", deploy_dir)
+    # 管理サーバーのクリーン
+    print(f"\n[clean] Cleaning management server ({SERVER_HOST})...")
+    clean_node(user, SERVER_HOST, deploy_dir)
     print("  OK (server)")
 
-    # 学習デバイスのクリーン（wafl-ctrl1経由のネストSSH）
+    # 学習デバイスのクリーン（管理サーバー経由のネストSSH）
     print("\n[clean] Cleaning learning devices...")
     max_workers = 5
     with ThreadPoolExecutor(max_workers=max_workers) as executor:

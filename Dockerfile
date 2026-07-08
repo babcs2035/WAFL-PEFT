@@ -20,8 +20,9 @@ COPY pyproject.toml /app/pyproject.toml
 # 5. 仮想環境の作成＋パッケージインストール（root で実行）
 RUN uv venv /app/.venv && \
     . /app/.venv/bin/activate && \
-    uv pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+    uv pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
     torch torchvision torchaudio peft torchinfo tensorboard 'pyarrow<15' 'numpy<2' && \
+    uv pip install bitsandbytes && \
     uv pip install 'git+https://github.com/huggingface/transformers.git' 'git+https://github.com/huggingface/accelerate.git' 'git+https://github.com/huggingface/datasets.git'
 ENV PATH="/app/.venv/bin:$PATH"
 

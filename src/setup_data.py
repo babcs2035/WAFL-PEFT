@@ -10,11 +10,14 @@ import json
 import random
 import re
 import subprocess
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import datasets
 
+from log import dot, fail, info, ok, phase, skip
 from utils import get_base_dir, get_experiment_dir, get_hosts_path, _get, _get_int, _get_str
 
 # GSM8K問題のカテゴリ分類用キーワード
@@ -85,7 +88,7 @@ def save_peer_files(
             )
         )
         total_train += len(sharded[peer_id])
-        print(f"  Saved train/peer_{peer_id}.json ({len(sharded[peer_id])} samples)")
+        ok(f"train/peer_{peer_id}.json ({len(sharded[peer_id])} samples)")
 
         test_file = test_path / f"peer_{peer_id}.json"
         test_file.write_text(
@@ -96,9 +99,29 @@ def save_peer_files(
             )
         )
         total_test += len(test_sharded.get(peer_id, []))
-        print(f"  Saved test/peer_{peer_id}.json ({len(test_sharded.get(peer_id, []))} samples)")
+        ok(f"test/peer_{peer_id}.json ({len(test_sharded.get(peer_id, []))} samples)")
 
-    print(f"Train total: {total_train}, Test total: {total_test}")
+    ok(f"Train total: {total_train}, Test total: {total_test}")
+
+
+def _download_with_progress(cmd: list[str], cache_dir: Path) -> None:
+    """hf download を実行中、進行中にドット進捗を表示する。"""
+    print(f"\n  Downloading gsm8k dataset to {cache_dir} ...")
+    stop = threading.Event()
+
+    def _dots() -> None:
+        while not stop.is_set():
+            print(".", end="", flush=True)
+            time.sleep(3)
+
+    t = threading.Thread(target=_dots, daemon=True)
+    t.start()
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        print()  # dot 行の改行
 
 
 def main() -> None:
@@ -109,7 +132,7 @@ def main() -> None:
 
     # 実験ディレクトリメタ情報を保存（deploy_distribute.py などが参照する）
     exp_name = _get("experiment", "experiment_name", "default")
-    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
     meta = {
         "experiment_name": exp_name,
         "timestamp": timestamp,
@@ -126,39 +149,40 @@ def main() -> None:
         if ip and not ip.startswith("#"):
             hosts.append(ip)
     num_peers = len(hosts)
-    print(f"Detected {num_peers} peers from hosts.txt")
+    info(f"{num_peers} peers from hosts.txt")
 
     # GSM8Kデータセットの読み込み
-    print("Loading GSM8K dataset...")
+    phase("Load GSM8K dataset")
     cache_dir = experiment_dir / "cache" / "datasets" / "gsm8k"
     cache_dir.mkdir(parents=True, exist_ok=True)
     train_path = cache_dir / "main" / "train-00000-of-00001.parquet"
     if not train_path.exists():
-        print("Downloading gsm8k dataset...")
-        subprocess.run(
+        _download_with_progress(
             [
                 "hf", "download", "gsm8k", "--repo-type", "dataset",
                 "--include", "main/*", "--local-dir", str(cache_dir),
             ],
-            check=True,
+            cache_dir,
         )
     dataset = datasets.load_dataset(
         "parquet", data_dir=str(cache_dir / "main"), split="train"
     )
     raw_data = dataset.to_list()
 
-    print(f"Loaded {len(raw_data)} total examples")
+    ok(f"{len(raw_data)} examples loaded")
 
     # train/test 分割（設定からデフォルト90/10）
+    phase("Split train/test")
     validation_split = _get("data", "validation_split", 0.1)
     rng = random.Random(_get_int("data", "seed", 42))
     rng.shuffle(raw_data)
     split_idx = int(len(raw_data) * (1.0 - validation_split))
     train_data = raw_data[:split_idx]
     test_data = raw_data[split_idx:]
-    print(f"Train: {len(train_data)}, Test: {len(test_data)}")
+    ok(f"Train: {len(train_data)}, Test: {len(test_data)}")
 
     # 訓練データにカテゴリラベルを付与
+    phase("Classify & shard (Non-IID)")
     labeled_train = []
     for item in train_data:
         labeled_train.append({**item, "_category": classify_problem(item["question"])})
@@ -203,18 +227,17 @@ def main() -> None:
         rng.shuffle(sharded[peer_id])
 
     # カテゴリ分布の統計を出力
-    print("=== Non-IID Train Shard Distribution ===")
+    ok("Non-IID shard assignment done")
     for peer_id in sorted(sharded.keys()):
         cat_counts: dict[str, int] = {}
         for item in sharded[peer_id]:
             cat = classify_problem(item["question"])
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
-        print(
-            f"  Peer {peer_id} (specialty={peer_categories[peer_id]}): "
+        info(
+            f"Peer {peer_id} (specialty={peer_categories[peer_id]}): "
             f"total={len(sharded[peer_id])}, "
             f"distribution={cat_counts}"
         )
-    print("========================================")
 
     # テストデータをpeerごとに均等分配（ランダム）
     test_sharded: dict[int, list[dict]] = {i: [] for i in range(num_peers)}
@@ -225,7 +248,7 @@ def main() -> None:
         rng.shuffle(test_sharded[peer_id])
 
     # peerごとのファイルとして保存（プロジェクトルート直下の data/ へ）
-    print("\nSaving peer files...")
+    phase("Save peer files")
     save_peer_files(
         sharded, test_sharded, base_dir,
         train_dir_name="data/train",

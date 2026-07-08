@@ -19,9 +19,13 @@ run = """\
 docker build --build-arg ssh_user={{vars.ssh_user}} --cache-from wafl-peft:latest -t wafl-peft:latest .
 """
 
+[tasks."setup:gpu-nodes"]
+description = "各学習デバイスにnvidia-container-toolkitをインストールしDockerのGPUランタイムを設定（冪等）"
+run = "uv run python src/setup_gpu_nodes.py"
+
 [tasks.setup]
-description = "モデル・データ・イメージのすべてを準備"
-depends = ["setup:build"]
+description = "モデル・データ・イメージのすべてを準備（GPUランタイム設定を含む）"
+depends = ["setup:build", "setup:gpu-nodes"]
 
 # ============================================================
 # deploy: 階層的物理デプロイ
@@ -30,11 +34,11 @@ depends = ["setup:build"]
 [tasks."deploy:sync-local"]
 description = "ローカルから管理サーバーへモデル・データ・設定ファイルを転送"
 run = """\
-rsync -avz --exclude='.venv' --exclude='.git' --exclude='__pycache__' --exclude='.gitignore' --exclude='Dockerfile' --exclude='mise.toml' \
+rsync -avz --info=progress2 --exclude='.venv' --exclude='.git' --exclude='__pycache__' --exclude='.gitignore' --exclude='Dockerfile' --exclude='mise.toml' \
   --exclude='cache/' \
   ./ {{vars.ssh_user}}@{{vars.server_host}}:{{vars.deploy_dir}}/ \
   --rsync-path="mkdir -p {{vars.deploy_dir}} && rsync" && \
-rsync -az --quiet --progress \
+rsync -az --info=progress2 \
   cache/models/{{vars.model_id}}/ \
   {{vars.ssh_user}}@{{vars.server_host}}:{{vars.deploy_dir}}/cache/models/{{vars.model_id}}/ \
   --rsync-path="mkdir -p {{vars.deploy_dir}}/cache/models/$(echo {{vars.model_id}} | cut -d/ -f1) && rsync"
@@ -51,12 +55,14 @@ ssh -o StrictHostKeyChecking=no {{vars.ssh_user}}@{{vars.server_host}} \
    else \
      docker start registry 2>/dev/null || docker run -d -p 127.0.0.1:5000:5000 --name registry registry:2; \
    fi' && \
-ssh -f -N -L 5000:127.0.0.1:5000 {{vars.ssh_user}}@{{vars.server_host}} \
+ssh -f -N -M -S /tmp/wafl-peft-registry-tunnel.sock -L 5000:127.0.0.1:5000 {{vars.ssh_user}}@{{vars.server_host}} \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null && \
 sleep 2 && \
-DOCKER_MAX_CONCURRENT_UPLOADED_LAYERS=5 docker tag wafl-peft:latest 127.0.0.1:5000/wafl-peft:latest && \
-DOCKER_MAX_CONCURRENT_UPLOADED_LAYERS=5 docker push 127.0.0.1:5000/wafl-peft:latest && \
-ssh -O exit {{vars.ssh_user}}@{{vars.server_host}} -L 5000:127.0.0.1:5000 2>/dev/null || true
+DOCKER_MAX_CONCURRENT_UPLOADED_LAYERS=5 docker tag wafl-peft:latest 127.0.0.1:5000/wafl-peft:latest ; \
+DOCKER_MAX_CONCURRENT_UPLOADED_LAYERS=5 docker push 127.0.0.1:5000/wafl-peft:latest ; \
+push_status=$? ; \
+ssh -S /tmp/wafl-peft-registry-tunnel.sock -O exit {{vars.ssh_user}}@{{vars.server_host}} 2>/dev/null || true ; \
+exit $push_status
 """
 
 [tasks."deploy:distribute"]
@@ -107,6 +113,7 @@ run = "bash scripts/analyze_collect.sh"
 
 [tasks."analyze:evaluate"]
 description = "回収した全データをマージし、評価グラフを自動レンダリング"
+depends = ["analyze:collect"]
 run = "uv run python src/analyze.py"
 
 [tasks.analyze]
@@ -120,5 +127,5 @@ depends = ["analyze:collect", "analyze:evaluate"]
 [vars]
 model_id = "google/gemma-4-E2B"
 ssh_user = "denjo"
-server_host = "wafl-ctrl1"
+server_host = "wafl-ctrl5"
 deploy_dir = "/home/denjo/workspace/ktakahashi/WAFL-PEFT"

@@ -5,10 +5,10 @@
   "training": {
     "learning_rate": 5e-5,
     "batch_size": 1,
-    "max_seq_len": 512,
+    "max_seq_len": 256,
     "lora_rank": 16,
     "lora_alpha": 32,
-    "num_training_steps": 10000
+    "num_training_steps": 200
   },
   "data": {
     "validation_split": 0.1,
@@ -18,10 +18,10 @@
     "client_p2p_port": 8888
   },
   "server": {
-    "server_host": "wafl-ctrl1",
-    "server_ip": "192.168.11.10",
+    "server_host": "wafl-ctrl5",
+    "server_ip": "192.168.15.10",
     "server_port": 9999,
-    "ufw_allow_from": "192.168.11.0/24,192.168.12.0/24"
+    "ufw_allow_from": "192.168.15.0/24"
   },
   "deployment": {
     "ssh_user": "denjo",

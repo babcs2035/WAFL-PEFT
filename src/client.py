@@ -12,6 +12,7 @@
 """
 
 import json
+import math
 import os
 import queue
 import socket
@@ -21,11 +22,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+# CUDA メモリアロケータの断片化を軽減（torch インポート前に設定する必要がある）
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model
 from torch.optim import AdamW
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from utils import get_base_dir, get_hosts_path, get_log_dir, _get, _get_float, _get_int, _get_str
 
@@ -35,7 +39,7 @@ from utils import get_base_dir, get_hosts_path, get_log_dir, _get, _get_float, _
 
 # コンテナ内では /app がプロジェクトルート（ホストの DEPLOY_DIR にマッピング）
 BASE_DIR = Path("/app")
-SERVER_HOST = _get_str("server", "server_host")  # 管理サーバーのホスト名（wafl-ctrl1等）
+SERVER_HOST = _get_str("server", "server_host")  # 管理サーバーのホスト名（settings.json で定義）
 SERVER_PORT = _get_int("server", "server_port")
 P2P_PORT = _get_int("communication", "client_p2p_port")
 PEER_ID = int(os.environ.get("PEER_ID", "0"))
@@ -112,6 +116,33 @@ class SharedState:
 # ============================================================
 
 
+def _prepare_kbit_model_for_training(model: Any, use_gradient_checkpointing: bool = True) -> Any:
+    """4-bit量子化モデルの学習準備（peft.prepare_model_for_kbit_training()の代替実装）。
+
+    元関数は非4bitパラメータ（float16/bfloat16 かつ Params4bit でないもの）を
+    無条件にfloat32へキャストする。Gemma4の embed_tokens_per_layer
+    （Per-Layer Embedding、約4.7GB）のような巨大な非LoRA対象パラメータまで
+    float32化すると一時的に約9GBを追加要求しVRAM不足でOOMになるため、
+    LayerNormの重み等（常に1次元）のみに限定してfloat32へキャストする。
+    """
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for param in model.parameters():
+        if (
+            param.dtype in (torch.float16, torch.bfloat16)
+            and param.__class__.__name__ != "Params4bit"
+            and param.dim() == 1
+        ):
+            param.data = param.data.to(torch.float32)
+
+    if use_gradient_checkpointing:
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
+
+    return model
+
+
 def initialize_model() -> tuple[Any, Any]:
     """LoRA付きモデルを初期化（AutoModelで自動判定）。
 
@@ -130,10 +161,30 @@ def initialize_model() -> tuple[Any, Any]:
         print(f"[Peer {PEER_ID}]   Local model not found, downloading from {model_id}...", flush=True)
         sys.stdout.flush()
 
+    # GPU が存在する場合は 4-bit QLoRA (NF4) でモデルを量子化してロードする。
+    # 5.1B パラメータを float16 でロードすると ~10.2 GiB を消費し 12GB VRAM に入らないため、
+    # 4-bit 量子化で ~2.5 GiB に圧縮する。LoRA アダプタは float16 で学習する。
+    # GPU が存在しない場合は float16 のまま CPU でロードする。
+    if torch.cuda.is_available():
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        _device_map = "auto"
+        _quantization_config = bnb_config
+        print(f"[Peer {PEER_ID}]   Using 4-bit NF4 quantization (QLoRA)", flush=True)
+    else:
+        _device_map = "cpu"
+        _quantization_config = None
+        print(f"[Peer {PEER_ID}]   No GPU found, loading in float16 on CPU", flush=True)
+
     model = AutoModelForCausalLM.from_pretrained(
         str(local_model_path) if local_model_path.exists() else model_id,
         torch_dtype=torch.float16,
-        device_map="auto",
+        device_map=_device_map,
+        quantization_config=_quantization_config,
         trust_remote_code=True,
     )
     print(f"[Peer {PEER_ID}]   Model weights loaded, device={next(model.parameters()).device}", flush=True)
@@ -150,8 +201,35 @@ def initialize_model() -> tuple[Any, Any]:
 
     print(f"[Peer {PEER_ID}]   Applying LoRA (rank={_get_int('training', 'lora_rank')}, alpha={_get_int('training', 'lora_alpha')})...", flush=True)
     sys.stdout.flush()
+    # 4-bit 量子化モデルでは学習前の準備（ベースモデル凍結・gradient checkpointing）が必須。
+    if _quantization_config is not None:
+        model = _prepare_kbit_model_for_training(model, use_gradient_checkpointing=True)
+    else:
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+
+    # device_map="auto" + PEFT の組み合わせで LoRA パラメータが meta デバイスに
+    # 残ることがある（PEFT の既知の挙動）。meta テンソルは実データを持たないため
+    # forward/backward/clone が全て失敗する。ここで CPU/GPU へ実体化する。
+    _fallback_device = next(
+        (p.device for p in model.parameters() if p.device.type != "meta"),
+        torch.device("cpu"),
+    )
+    for module in model.modules():
+        for pname, param in list(module.named_parameters(recurse=False)):
+            if param.device.type != "meta":
+                continue
+            new_data = torch.empty(param.shape, dtype=param.dtype, device=_fallback_device)
+            # lora_B はゼロ初期化。lora_A は kaiming_uniform（2D 以上のみ）。
+            # 1D テンソル（バイアス等）はゼロ初期化で安全に代替。
+            if "lora_b" in pname.lower() or new_data.dim() < 2:
+                torch.nn.init.zeros_(new_data)
+            else:
+                torch.nn.init.kaiming_uniform_(new_data, a=math.sqrt(5))
+            setattr(module, pname, torch.nn.Parameter(new_data, requires_grad=param.requires_grad))
+    print(f"[Peer {PEER_ID}]   LoRA applied, target_device={_fallback_device}", flush=True)
 
     print(f"[Peer {PEER_ID}]   Loading tokenizer...", flush=True)
     sys.stdout.flush()
@@ -431,8 +509,11 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                     try:
                         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         conn.settimeout(5.0)
-                        # peer_idからIPを取得（localhostまたはhosts.txt）
-                        peer_ip = host_map.get(pid, "localhost")
+                        # peer_idからIPを取得（hosts.txt）
+                        if pid not in host_map:
+                            print(f"[Peer {PEER_ID}]   Skipping peer {pid}: not in hosts.txt", flush=True)
+                            continue
+                        peer_ip = host_map[pid]
                         conn.connect((peer_ip, P2P_PORT))
                         # peer_idを通知
                         pid_msg = json.dumps({"peer_id": PEER_ID}).encode("utf-8")
@@ -530,7 +611,7 @@ def evaluate_batch(
     tokenizer: Any,
     samples: list[dict[str, str]],
     max_seq_len: int,
-    max_eval_samples: int = 50,
+    max_eval_samples: int = 5,
 ) -> float:
     """簡易accuracy評価（GSM8K形式のquestion/answer）。
 
@@ -579,18 +660,33 @@ def training_loop_thread(
     """
     print(f"[Peer {PEER_ID}] Thread 3 (Training Loop) started", flush=True)
 
-    # シャドウコピーを初期化（LoRAパラメータのみ＝メモリ節約）
-    lora_keys = [k for k in model.state_dict().keys() if "lora" in k.lower()]
+    # LoRA パラメータを named_parameters() 経由で収集する。
+    # state_dict() はディスクオフロードモデルで全重みをロードしてしまう可能性があるが、
+    # named_parameters() は訓練可能なパラメータのみ実体化する。
+    lora_param_dict = {
+        name: param
+        for name, param in model.named_parameters()
+        if "lora" in name.lower()
+    }
+    lora_keys = list(lora_param_dict.keys())
     print(f"[Peer {PEER_ID}]   Cloning {len(lora_keys)} LoRA weight tensors to CPU...", flush=True)
     with state.weights_lock:
         state.shadow_weights = {
-            k: model.state_dict()[k].detach().cpu().clone() for k in lora_keys
+            k: lora_param_dict[k].detach().cpu().clone() for k in lora_keys
         }
     print(f"[Peer {PEER_ID}] Model loaded, shadow weights ready (LoRA keys: {len(lora_keys)})")
     state.ready_to_send.set()
 
+    # GPU 環境では LoRA パラメータがある device に inputs を置く。
+    # disk-offload 環境では cpu になるため、そのままで問題ない。
+    _train_device = next(
+        (p.device for p in model.parameters() if p.requires_grad and p.device.type != "meta"),
+        torch.device("cpu"),
+    )
+    print(f"[Peer {PEER_ID}]   Training device: {_train_device}", flush=True)
+
     optimizer = AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=_get_float("training", "learning_rate"),
         weight_decay=0.01,
     )
@@ -614,11 +710,11 @@ def training_loop_thread(
         # 経過時間を更新
         state.elapsed_time = time.time() - state.experiment_start_time
 
-        # データローディング
+        # データローディング（inputs を LoRA device へ）
         idx = step % len(train_data)
         batch = train_data[idx]
-        input_ids = batch["input_ids"].unsqueeze(0)
-        labels = batch["labels"].unsqueeze(0)
+        input_ids = batch["input_ids"].unsqueeze(0).to(_train_device)
+        labels = batch["labels"].unsqueeze(0).to(_train_device)
 
         # フォワードパス
         optimizer.zero_grad()
@@ -646,12 +742,17 @@ def training_loop_thread(
 
         optimizer.step()
 
-        # シャドウコピー更新
+        # GPUメモリ解放（断片化防止。evaluate_batch後の解放と合わせて重要）
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # シャドウコピー更新（named_parameters 経由で LoRA のみ更新）
         with state.weights_lock:
             if state.shadow_weights is not None:
-                for k, v in model.state_dict().items():
-                    if k in state.shadow_weights:
-                        state.shadow_weights[k].copy_(v.detach().cpu())
+                for name, param in model.named_parameters():
+                    if name in state.shadow_weights:
+                        state.shadow_weights[name].copy_(param.detach().cpu())
 
         # メトリクス計算
         loss_value = loss.item()
@@ -683,6 +784,10 @@ def training_loop_thread(
         if current_step_for_merge % eval_freq == 0 and current_step_for_merge > 0:
             train_score = evaluate_batch(model, tokenizer, train_samples, _get_int("training", "max_seq_len"))
             test_score = evaluate_batch(model, tokenizer, test_samples, _get_int("training", "max_seq_len"))
+            # evaluate_batch の model.generate() 確保メモリを解放（重要：これがないとOOM）
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
 
         metric = {
             "type": "metric",
@@ -795,6 +900,26 @@ def async_logging_thread(state: SharedState) -> None:
 # ============================================================
 
 
+def _thread_wrapper(state: SharedState, target: Any, args: tuple) -> None:
+    """スレッド内の未捕捉例外を検知し、プロセス全体を異常終了させるラッパー。
+
+    デーモンスレッドの例外は当該スレッドを終了させるだけで他スレッドには
+    伝播しない。state.running を見ているスレッドは無限ループを続けるため、
+    main() の join() が永久にブロックされ、コンテナは「Up」のまま実質停止
+    する（学習停止が外部から検知できないゾンビ状態になる）。ここで例外を
+    捕捉し、state.running を落とした上でプロセスを即時終了させる。
+    """
+    import traceback
+
+    try:
+        target(*args)
+    except Exception:
+        print(f"[Peer {PEER_ID}] FATAL: thread '{target.__name__}' crashed:", flush=True)
+        traceback.print_exc()
+        state.running = False
+        os._exit(1)
+
+
 def main() -> None:
     """クライアントのメインエントリポイント。"""
     import sys
@@ -859,26 +984,26 @@ def main() -> None:
 
     # Thread 4（ロガー）を先に起動
     logger_thread = threading.Thread(
-        target=async_logging_thread, args=(state,), daemon=True
+        target=_thread_wrapper, args=(state, async_logging_thread, (state,)), daemon=True
     )
     logger_thread.start()
 
     # Thread 1（サーバーリスナー）を起動
     listener_thread = threading.Thread(
-        target=server_listener_thread, args=(state, model), daemon=True
+        target=_thread_wrapper, args=(state, server_listener_thread, (state, model)), daemon=True
     )
     listener_thread.start()
 
     # Thread 2（P2P交換）を起動
     p2p_thread = threading.Thread(
-        target=p2p_exchange_thread, args=(state, model), daemon=True
+        target=_thread_wrapper, args=(state, p2p_exchange_thread, (state, model)), daemon=True
     )
     p2p_thread.start()
 
     # Thread 3（訓練ループ）を起動
     training_thread = threading.Thread(
-        target=training_loop_thread,
-        args=(state, model, tokenizer, train_data, train_samples, test_samples),
+        target=_thread_wrapper,
+        args=(state, training_loop_thread, (state, model, tokenizer, train_data, train_samples, test_samples)),
         daemon=True,
     )
     training_thread.start()

@@ -24,5 +24,10 @@
     "0": { "allowed_peers": [{ "peer_id": 1, "remaining_time": 60.0 }, { "peer_id": 2, "remaining_time": 60.0 }] },
     "1": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 60.0 }, { "peer_id": 2, "remaining_time": 60.0 }] },
     "2": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 60.0 }, { "peer_id": 1, "remaining_time": 60.0 }] }
+  },
+  "600": {
+    "0": { "allowed_peers": [{ "peer_id": 1, "remaining_time": 120.0 }, { "peer_id": 2, "remaining_time": 120.0 }] },
+    "1": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 120.0 }, { "peer_id": 2, "remaining_time": 120.0 }] },
+    "2": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 120.0 }, { "peer_id": 1, "remaining_time": 120.0 }] }
   }
 }
