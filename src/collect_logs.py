@@ -115,6 +115,12 @@ def main() -> None:
     """メインエントリポイント。"""
     print("[collect_logs] Starting log collection...")
 
+    # EXPERIMENT_DIR_NAME をメタファイルへ保存。setup_data.py 実行済みなら
+    # 既存ファイルと同じ内容を書き戻すだけだが、setup_data.py を経ずに
+    # deploy/start した場合はここで初めて確定するフォールバック名を
+    # analyze.py などの後続スクリプトが読めるようにする
+    save_experiment_meta()
+
     hosts = load_hosts()
     print(f"[collect_logs] Target devices: {len(hosts)}")
 

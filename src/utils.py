@@ -69,7 +69,7 @@ def get_base_dir() -> Path:
 
 def get_experiment_name() -> str:
     """settings.json から実験名を取得。デフォルトは "default"。"""
-    return load_config().get("experiment_name", "default")
+    return _get_str("experiment", "experiment_name", "default")
 
 
 def get_experiment_dir() -> Path:

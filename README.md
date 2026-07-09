@@ -8,7 +8,7 @@ WAFL-PEFT は，時変 P2P (Peer-to-Peer) トポロジー下でのフェデレ�
 | -------------- | ------------------------------------------------ |
 | フレームワーク | Python 3.10+, PyTorch, transformers, peft (LoRA) |
 | データセット   | GSM8K (小学レベル数学文章題)                     |
-| コンテナ       | Docker (CPU 版 PyTorch)                          |
+| コンテナ       | Docker (CUDA 12.8 版 PyTorch，QLoRA 4-bit 量子化) |
 | デプロイ       | SSH + rsync + Docker Registry (階層的配布)       |
 | 環境管理       | uv (Python), mise (タスクランナー)               |
 
@@ -79,16 +79,19 @@ graph TD
     P2 <-->|"P2P 重み交換"| P0
 ```
 
-### 4 層スレッドアーキテクチャ (クライアント)
+### 5 層スレッドアーキテクチャ (クライアント)
 
-各クライアントは 4 スレッドで並列動作する．この設計の目的は，**計算と通信の完全なオーバーラップ** を実現することである．
+各クライアントは 5 スレッドで並列動作する．この設計の目的は，**計算と通信の完全なオーバーラップ** を実現することである．
 
 | Thread                    | 責務                                                                                    | データフロー     |
 | ------------------------- | --------------------------------------------------------------------------------------- | ---------------- |
 | Thread 1: Server Listener | 管理サーバーとの永続 TCP 接続．シグナル (ホワイトリスト，実験開始 / 終了) を受信        | 制御プレーン     |
-| Thread 2: P2P Exchange    | ホワイトリストに基づき peer へ接続， LoRA 重みを gzip 圧縮して送受信，平均マージ        | データプレーン   |
+| Thread 2: P2P Exchange    | ホワイトリストに基づき peer へ接続・失効時に切断， LoRA 重みを送受信・平均マージ計算 (model への反映は Thread 3 が行う) | データプレーン   |
 | Thread 3: Training Loop   | LoRA パラメータの順伝播・逆伝播・ optimizer.step ．各ステップでメトリクスをキューへ投入 | 計算プレーン     |
 | Thread 4: Async Logger    | メトリクスキューから読み取り，ファイルへ非同期書き出し (fsync 付き)                     | ロギングプレーン |
+| Thread 5: Async Evaluator | train/test スコアの評価 (`model.generate()`) を Thread 3 から分離して非同期に実行        | 評価プレーン     |
+
+train/test スコア評価 (`model.generate()`) は実測で 10 サンプルの評価に約 87 秒かかる．これを Thread 3 内で直列実行すると訓練が長時間完全停止するストールを引き起こすため，Thread 5 に分離し，訓練と並行して実行する．
 
 スレッド間共有状態は `SharedState` クラスで管理され，ロックとキューで同期する．
 
@@ -123,14 +126,18 @@ flowchart LR
 
 `SharedState` は以下の共有リソースを管理する．
 
-| リソース             | 型                  | 更新スレッド | 参照スレッド | 同期機構                   |
-| -------------------- | ------------------- | ------------ | ------------ | -------------------------- |
-| `peer_whitelist`     | `dict[int, float]`  | Thread 1     | Thread 2     | `threading.Lock`           |
-| `shadow_weights`     | `dict[str, Tensor]` | Thread 3     | Thread 2     | `threading.Lock`           |
-| `merge_queue`        | `queue.Queue`       | Thread 2     | Thread 3     | FIFO キュー (maxsize=32)   |
-| `metrics_queue`      | `queue.Queue`       | Thread 3     | Thread 4     | FIFO キュー (maxsize=8192) |
-| `current_step`       | `int`               | Thread 3     | Thread 2     | `threading.Lock`           |
-| `experiment_running` | `threading.Event`   | Thread 1     | Thread 3     | Event フラグ               |
+| リソース                 | 型                  | 更新スレッド | 参照スレッド    | 同期機構                   |
+| ------------------------ | ------------------- | ------------ | --------------- | -------------------------- |
+| `peer_whitelist`         | `dict[int, float]`  | Thread 1     | Thread 2        | `threading.Lock`           |
+| `peer_whitelist_expiry`  | `dict[int, float]`  | Thread 1     | Thread 2        | `threading.Lock`           |
+| `shadow_weights`         | `dict[str, Tensor]` | Thread 3     | Thread 2        | `threading.Lock`           |
+| `merge_queue`            | `queue.Queue`       | Thread 2     | Thread 3        | FIFO キュー (maxsize=32)   |
+| `eval_request_queue`     | `queue.Queue`       | Thread 3     | Thread 5        | キュー (maxsize=1，最新のみ保持) |
+| `metrics_queue`          | `queue.Queue`       | Thread 3, 5  | Thread 4        | FIFO キュー (maxsize=8192) |
+| `current_step`           | `int`               | Thread 3     | Thread 2        | `threading.Lock`           |
+| `experiment_running`     | `threading.Event`   | Thread 1     | Thread 3, 5      | Event フラグ               |
+
+`peer_whitelist_expiry` は各 peer との接触が失効する絶対時刻 (Unix time) を保持する． Thread 1 が signal 受信時に `remaining_time` から算出し， Thread 2 がこの時刻を過ぎた peer との TCP 接続を切断することで，時変トポロジーのローテーションを実際の接続状態に反映する．
 
 #### スループット平坦性 (Stall-Free Design)
 
@@ -138,9 +145,9 @@ flowchart LR
 
 本フレームワークでは，以下の設計によりこれを回避する．
 
-1. **非同期マージ**: P2P 交換スレッドは訓練ループとは独立に動作し，訓練ステップの境界でマージ結果を適用する
+1. **非同期マージ**: P2P 交換スレッドは訓練ループとは独立に動作し，受信した重みの平均マージ計算のみを行って `merge_queue` に渡す．計算結果をモデル本体へ反映するのは常に訓練ループ (Thread 3) であり，`optimizer.step()` 完了直後のステップ境界でのみ行う．これにより，順伝播・逆伝播の実行中に別スレッドがモデルパラメータを書き換えるデータ競合を構造的に防ぐ
 2. **シャドウコピー**: LoRA 重みのコピーを CPU 上に保持し， GPU 訓練とは独立に読み書きできる
-3. **マージタイミングの分離**: マージは `current_step` の変化を検知して実行され，訓練ループはブロックされない
+3. **マージタイミングの分離**: マージ結果の反映は `current_step` の変化を検知して実行され，訓練ループはブロックされない
 
 この結果，通信中でも計算は継続し，スループットと時間の相関係数は ~0 に近づく．
 
@@ -262,7 +269,7 @@ stateDiagram-v2
 +------------------+-------------------+
 ```
 
-Length は big-endian 4 バイト符号なし整数． JSON ペイロードは 10MB まで受信する．バイナリペイロードは 50MB まで受信する．
+Length は big-endian 4 バイト符号なし整数． JSON ペイロードは 10MB まで受信する．バイナリペイロードは 100MB まで受信する．
 
 ### 管理サーバー <-> クライアント (制御プレーン)
 
@@ -282,13 +289,15 @@ TCP 接続，以下の順序で送信する．
 
 ```
 1. peer_id フレーム: 4 バイト長さ + JSON ({"peer_id": int})
-2. 重みフレーム (複数可能): 4 バイト長さ + gzip 圧縮 pickle
+2. 重みフレーム (複数可能): 4 バイト長さ + pickle (gzip 圧縮なし)
 ```
 
-重みデータは LoRA パラメータの state_dict であり，以下の圧縮手順を踏む．
+重みデータは LoRA パラメータの state_dict であり，以下の手順で送信用に変換する．
 
-1. `torch.save(state_dict, buffer)` で pickle シリアライズ
-2. `gzip.compress(buffer.getvalue())` で圧縮
+1. 訓練時は数値安定性のため float32 で保持している各テンソルを float16 へダウンキャスト（通信量を約半分に削減．実測で 410 テンソル・約 96.6MB → 約 48MB）
+2. `torch.save(state_dict, buffer)` で pickle シリアライズ
+
+gzip 圧縮は行わない．ニューラルネットの重みは乱数に近い分布のため圧縮率が低く（float32・96MB の実測で圧縮後 88.6MB と 8% 程度の削減），圧縮・解凍自体に数秒（実測: 圧縮 6.3 秒，解凍 1.1 秒）かかる．この間 Thread 3 (訓練ループ) との GIL 競合でスループットが周期的に停止するストールを引き起こすため，圧縮による通信量削減よりも計算のブロッキングを避けることを優先する．
 
 受信時は逆の手順で復元し，平均マージする．平均マージは単純算術平均であり， peer $i$ の重み $w_i$ に対して，受信した $K$ peer の重みを以下で統合する．
 
@@ -508,7 +517,7 @@ mise run clean
 | ./cache    | /app/cache  | モデルキャッシュ (クライアントのみ) |
 | ./logs     | /app/logs   | メトリクスログ，チェックポイント    |
 
-管理サーバーは `--net=host` モードで起動し，学習デバイスは `--add-host wafl-ctrl1:{server_ip}` で管理サーバーの IP を追加設定する．
+管理サーバー・学習デバイスの両方が `--net=host` モードで起動する．学習デバイス側の P2P 用ポート（`client_p2p_port`）はこのモードでなければホストに公開されず，他 peer から一切接続できなくなるため必須である．学習デバイスは加えて `--add-host wafl-ctrl1:{server_ip}` で管理サーバーの IP を追加設定する．
 
 ### Dockerfile のビルド順序
 
@@ -535,17 +544,25 @@ Dockerfile はビルドレイヤーの最適化を考慮している．変更頻
 
 各 peer の `logs/metrics_peer_{ID}_final.log` には， 1 行 1JSON で以下のフィールドを記録する．
 
-| フィールド     | 型     | 説明                               |
-| -------------- | ------ | ---------------------------------- |
-| peer_id        | int    | ペア識別子                         |
-| step           | int    | 訓練ステップ番号                   |
-| elapsed        | float  | 実験開始からの経過秒数             |
-| loss           | float  | 訓練損失                           |
-| tokens_per_sec | float  | スループット                       |
-| total_tokens   | int    | 累積トークン数                     |
-| step_duration  | float  | ステップ実行時間                   |
-| train_score    | float  | 訓練 accuracy (%) ，評価時点のみ   |
-| test_score     | float  | テスト accuracy (%) ，評価時点のみ |
-| type           | string | "metric" または "checkpoint"       |
+| フィールド        | 型            | 説明                                                        |
+| ----------------- | ------------- | ----------------------------------------------------------- |
+| peer_id           | int           | ペア識別子                                                   |
+| step              | int           | 訓練ステップ番号（"metric" / "checkpoint" のみ）             |
+| elapsed           | float         | 実験開始からの経過秒数                                       |
+| loss              | float         | 訓練損失（"metric" / "checkpoint" のみ）                     |
+| tokens_per_sec    | float         | スループット（"metric" / "checkpoint" のみ）                 |
+| total_tokens      | int           | 累積トークン数（"metric" / "checkpoint" のみ）                |
+| step_duration     | float         | ステップ全体の実行時間（"metric" / "checkpoint" のみ）        |
+| compute_duration  | float         | forward/backward/optimizer.step の純計算時間                |
+| stall_duration     | float         | step_duration - compute_duration （マージ反映・GPU解放・評価等のオーバーヘッド。Computation Stall 指標） |
+| gpu_util_percent  | float \| null | GPU SM 使用率 (%) ． CPU 環境では null                        |
+| train_score       | float         | 訓練 accuracy (%) ，"eval" タイプのみ (それ以外は常に 0.0)     |
+| test_score        | float         | テスト accuracy (%) ，"eval" タイプのみ (それ以外は常に 0.0)   |
+| allowed_peers     | list[int]     | 接触可能peer一覧（"contact_event" のみ）                      |
+| type              | string        | "metric" ・ "checkpoint" ・ "contact_event" ・ "eval" のいずれか |
+
+"contact_event" は Thread 1 がサーバーからの signal で許可 peer リストが変化した瞬間にのみ記録され，`contact_pattern.json` の意図した切り替え時刻と実際の接続状態がずれていないかを事後検証できる．
+
+"eval" は Thread 5 (非同期評価スレッド) が train/test スコアを計算し終えた時点で記録される．Thread 3 (訓練ループ) とは非同期に実行されるため，`step` は評価をリクエストした時点のステップ番号であり，実際に評価対象とした重みの厳密なスナップショットとは限らない（進捗モニタリング目的のため許容している）．
 
 ログファイルは各 peer ごとに独立して作成され，実験終了後に `_final` サフィックス付きのリネームで確定する．書き出し時には `fsync` を呼び出し，データ損失を防止する．

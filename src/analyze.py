@@ -23,6 +23,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils import get_base_dir, get_experiment_dir, get_log_dir, get_output_dir, _get, _get_int
 

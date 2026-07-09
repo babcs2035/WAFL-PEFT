@@ -15,11 +15,7 @@ venv/
 
 # Logs and data
 results/
-collected_logs/
 data/
-
-# Output
-output/
 
 # IDE
 .vscode/

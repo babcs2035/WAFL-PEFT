@@ -89,7 +89,13 @@ def sync_source(ip: str, peer_id: int) -> str:
 
 
 def start_client_container(ip: str, peer_id: int) -> str:
-    """1デバイス上でクライアントコンテナを起動（ポート開放なし）。"""
+    """1デバイス上でクライアントコンテナを起動。
+
+    --net=host が必須: これがないとコンテナはデフォルトのbridgeネットワークに
+    入り、P2P用ポート（client_p2p_port）がホストに全く公開されず、他のpeerから
+    一切接続できない（ufwでホスト側ポートを許可していても無意味になる）。
+    サーバーコンテナ（start:server）と同じくホストネットワークを直接使う。
+    """
     # ソースコード転送
     sync_result = sync_source(ip, peer_id)
     if not sync_result.startswith("OK"):
@@ -102,6 +108,7 @@ def start_client_container(ip: str, peer_id: int) -> str:
         f"docker rm -f wafl-peft-client-{peer_id} 2>/dev/null || true; "
         f"docker run -d --name wafl-peft-client-{peer_id} "
         f"--gpus all "
+        f"--net=host "
         f"--add-host {SERVER_HOST}:{SERVER_HOST_IP} "
         f"-e PEER_ID={peer_id} "
         f"-v {DEPLOY_DIR}/src:/app/src "
@@ -142,7 +149,7 @@ def main() -> None:
                 print(f"  [FAIL] peer={peer_id}: {e}")
 
     print("\n[start_clients] All containers launched.")
-    print(f"[start_clients] Monitor with: docker exec -it wafl-peft-server tail -f /app/results/{EXPERIMENT_DIR_NAME}/logs/metrics_peer_0_final.jsonl")
+    print("[start_clients] Monitor with: docker exec -it wafl-peft-client-0 tail -f /app/logs/metrics_peer_0_final.log")
 
 
 if __name__ == "__main__":

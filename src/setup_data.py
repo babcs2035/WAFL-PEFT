@@ -18,7 +18,7 @@ from pathlib import Path
 import datasets
 
 from log import dot, fail, info, ok, phase, skip
-from utils import get_base_dir, get_experiment_dir, get_hosts_path, _get, _get_int, _get_str
+from utils import get_base_dir, get_hosts_path, _get, _get_int, _get_str
 
 # GSM8K問題のカテゴリ分類用キーワード
 CATEGORY_KEYWORDS = {
@@ -127,10 +127,11 @@ def _download_with_progress(cmd: list[str], cache_dir: Path) -> None:
 def main() -> None:
     """メインエントリポイント。"""
     base_dir = get_base_dir()
-    experiment_dir = get_experiment_dir()
-    experiment_dir.mkdir(parents=True, exist_ok=True)
 
-    # 実験ディレクトリメタ情報を保存（deploy_distribute.py などが参照する）
+    # 実験ディレクトリ名を確定し、results/.experiment_meta.json（直下）に保存する。
+    # deploy_distribute.py / collect_logs.py / start_clients.py / analyze.py は
+    # いずれもこの固定パスを読むため、ここで書き込み先を揃える
+    # （以前はタイムスタンプ付きサブディレクトリの中に書いており、読み込み側と食い違っていた）。
     exp_name = _get("experiment", "experiment_name", "default")
     timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
     meta = {
@@ -138,9 +139,9 @@ def main() -> None:
         "timestamp": timestamp,
         "dir_name": f"{exp_name}_{timestamp}",
     }
-    (experiment_dir / ".experiment_meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2)
-    )
+    meta_path = base_dir / "results" / ".experiment_meta.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
     # hosts.txtの読み込み
     hosts = []
@@ -151,9 +152,10 @@ def main() -> None:
     num_peers = len(hosts)
     info(f"{num_peers} peers from hosts.txt")
 
-    # GSM8Kデータセットの読み込み
+    # GSM8Kデータセットの読み込み（実行毎に再ダウンロードしないよう、
+    # 実験ディレクトリとは独立した固定キャッシュを使う）
     phase("Load GSM8K dataset")
-    cache_dir = experiment_dir / "cache" / "datasets" / "gsm8k"
+    cache_dir = base_dir / "cache" / "datasets" / "gsm8k"
     cache_dir.mkdir(parents=True, exist_ok=True)
     train_path = cache_dir / "main" / "train-00000-of-00001.parquet"
     if not train_path.exists():

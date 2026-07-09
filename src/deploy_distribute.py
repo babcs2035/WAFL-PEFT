@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """管理サーバー上から学習デバイスへの並列デプロイスクリプト。
 
-Phase 1: rsyncで設定ファイル・データを各デバイスへ転送
-Phase 2: 各デバイスが管理サーバーのレジストリからSSHトンネル経由でpull
-Phase 3: サーバー・クライアントコンテナを起動
+Phase 0: ufwポート開放
+Phase 2: rsyncで設定ファイル・データを各デバイスへ転送
+Phase 3: 各デバイスが管理サーバーのレジストリからSSHトンネル経由でpull
+
+コンテナの起動は行わない（start_clients.py / mise run start が担当する）。
+以前はこのスクリプトの中でコンテナ起動まで行っていたため、後続の
+`mise run start` を実行すると起動済みの実験を強制終了して起動し直す
+という重複が生じていた。デプロイ（配布）と実験実行（起動）を明確に分離する。
 """
 
 import json
@@ -134,12 +139,20 @@ def open_ufw_on_server() -> str:
     return f"FAILED: {result.stderr[:300]}"
 
 
-def _rsync_to_peer(ip: str, src: str, dst: str) -> subprocess.CompletedProcess[str]:
-    """ピアノードへ rsync をSSHで実行。"""
+def _rsync_to_peer(
+    ip: str, src: str, dst: str, extra_args: str = ""
+) -> subprocess.CompletedProcess[str]:
+    """ピアノードへ rsync をSSHで実行。
+
+    -e オプションにはrsyncが内部で使うリモートシェルコマンドのみを渡す。
+    ユーザー名は宛先側（{SSH_USER}@{ip}:{dst}）で指定するため、ここに
+    含めてはならない（含めると rsync がユーザー名をホスト名と誤認して
+    名前解決に失敗し、転送が常に失敗する）。
+    """
     jump_flag = f"-J {SSH_USER}@{SERVER_HOST} " if _JUMP else ""
     return subprocess.run(
-        f"rsync -az -e 'ssh -o StrictHostKeyChecking=no {jump_flag}{SSH_USER}' "
-        f"--info=progress2 '{src}' '{SSH_USER}@{ip}:{dst}'",
+        f"rsync -az -e 'ssh -o StrictHostKeyChecking=no {jump_flag}' "
+        f"{extra_args} --info=progress2 '{src}' '{SSH_USER}@{ip}:{dst}'",
         shell=True, capture_output=True, text=True, timeout=600,
     )
 
@@ -191,22 +204,32 @@ def rsync_to_device(ip: str, peer_id: int) -> str:
         return f"FAILED mkdir (peer={peer_id}, ip={ip})"
 
     # 設定ファイル転送
-    _rsync_to_peer(ip, str(BASE_DIR / "config" / "settings.json"), f"{DEPLOY_DIR}/config/settings.json")
+    r = _rsync_to_peer(ip, str(BASE_DIR / "config" / "settings.json"), f"{DEPLOY_DIR}/config/settings.json")
+    if r.returncode != 0:
+        return f"FAILED rsync settings.json (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
     # peer固有の訓練データ転送（deploy_dir/data/ 下を参照）
     train_file = Path(DEPLOY_DIR) / "data" / "train" / f"peer_{peer_id}.json"
     if train_file.exists():
-        _rsync_to_peer(ip, str(train_file), f"{DEPLOY_DIR}/data/train/peer_{peer_id}.json")
+        r = _rsync_to_peer(ip, str(train_file), f"{DEPLOY_DIR}/data/train/peer_{peer_id}.json")
+        if r.returncode != 0:
+            return f"FAILED rsync train data (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
     # peer固有のテストデータ転送（deploy_dir/data/ 下を参照）
     test_file = Path(DEPLOY_DIR) / "data" / "test" / f"peer_{peer_id}.json"
     if test_file.exists():
-        _rsync_to_peer(ip, str(test_file), f"{DEPLOY_DIR}/data/test/peer_{peer_id}.json")
+        r = _rsync_to_peer(ip, str(test_file), f"{DEPLOY_DIR}/data/test/peer_{peer_id}.json")
+        if r.returncode != 0:
+            return f"FAILED rsync test data (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
-    # ソースコード転送（data/ は転送しない）
-    _rsync_to_peer(
+    # ソースコード転送（data/・cache/・results/ は別途転送または不要のため除外）
+    r = _rsync_to_peer(
         ip, str(BASE_DIR) + "/", DEPLOY_DIR + "/",
+        extra_args="--exclude='data/' --exclude='cache/' --exclude='results/' "
+                   "--exclude='.git/' --exclude='__pycache__' --exclude='.venv/'",
     )
+    if r.returncode != 0:
+        return f"FAILED rsync source (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
     # モデルキャッシュ転送（HuggingFaceキャッシュ形式）
     model_id = _get("model", "model_id", "google/gemma-4-E2B")
@@ -214,7 +237,9 @@ def rsync_to_device(ip: str, peer_id: int) -> str:
     model_src = str(BASE_DIR / "cache" / "models" / model_path_parts[0] / model_path_parts[1])
     model_dst = f"{DEPLOY_DIR}/cache/models/{model_id}/"
     if Path(model_src).exists():
-        _rsync_to_peer(ip, model_src + "/", model_dst)
+        r = _rsync_to_peer(ip, model_src + "/", model_dst)
+        if r.returncode != 0:
+            return f"FAILED rsync model cache (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
     return f"OK (peer={peer_id}, ip={ip})"
 
@@ -306,54 +331,6 @@ def pull_docker_image(ip: str, peer_id: int) -> str:
         if attempt < 2:
             time.sleep(5)
     return f"FAILED (peer={peer_id}, ip={ip}): {pull_failed.stderr[:500]}"
-
-
-def start_server_container() -> str:
-    """管理サーバー上でサーバーコンテナを起動。"""
-    cmd = (
-        f"ssh -o StrictHostKeyChecking=no {SSH_USER}@localhost "
-        f"'mkdir -p {DEPLOY_DIR}/logs && chown {SSH_USER}:{SSH_USER} {DEPLOY_DIR}/logs; "
-        f"docker rm -f wafl-peft-server 2>/dev/null; "
-        f"docker run -d --name wafl-peft-server "
-        f"--net=host "
-        f"-v {DEPLOY_DIR}/src:/app/src "
-        f"-v {DEPLOY_DIR}/config:/app/config "
-        f"-v {DEPLOY_DIR}/data:/app/data "
-        f"-v {DEPLOY_DIR}/logs:/app/logs "
-        f"{IMAGE_NAME} "
-        f"/app/.venv/bin/python src/server.py'"
-    )
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode == 0:
-        container_id = result.stdout.strip()[:12]
-        return f"OK (container={container_id})"
-    return f"FAILED: {result.stderr[:300]}"
-
-
-def start_client_container(ip: str, peer_id: int) -> str:
-    """1デバイス上でクライアントコンテナを起動（ポート開放なし）。"""
-    jump_flag = f"-J {SSH_USER}@{SERVER_HOST} " if _JUMP else ""
-    cmd = (
-        f"ssh -o StrictHostKeyChecking=no {jump_flag}{SSH_USER}@{ip} "
-        f"'export LC_ALL=C; mkdir -p {DEPLOY_DIR}/logs && chown {SSH_USER}:{SSH_USER} {DEPLOY_DIR}/logs; "
-        f"docker rm -f wafl-peft-client-{peer_id} 2>/dev/null || true; "
-        f"docker run -d --name wafl-peft-client-{peer_id} "
-        f"--gpus all "
-        f"--add-host {SERVER_HOST}:{SERVER_HOST_IP} "
-        f"-e PEER_ID={peer_id} "
-        f"-v {DEPLOY_DIR}/src:/app/src "
-        f"-v {DEPLOY_DIR}/config:/app/config "
-        f"-v {DEPLOY_DIR}/data:/app/data "
-        f"-v {DEPLOY_DIR}/cache:/app/cache "
-        f"-v {DEPLOY_DIR}/logs:/app/logs "
-        f"{IMAGE_NAME} "
-        f"/app/.venv/bin/python src/client.py'"
-    )
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if result.returncode == 0:
-        container_id = result.stdout.strip()[:12]
-        return f"OK (peer={peer_id}, ip={ip}, container={container_id})"
-    return f"FAILED (peer={peer_id}, ip={ip}): {result.stderr[:300]}"
 
 
 def _run_parallel(
@@ -449,26 +426,11 @@ def main() -> None:
     fail_count = sum(1 for r in results if r is None or (not r.startswith("OK")))
     summary("Phase 3", ok_count, fail_count)
 
-    # Phase 4: Start server container
-    phase("Phase 4: Start server container")
-    result = start_server_container()
-    if result.startswith("OK"):
-        ok(result)
-    else:
-        fail(result)
-
-    # Phase 5: Start client containers
-    phase("Phase 5: Start client containers")
-    results = _run_parallel(start_client_container, hosts, max_workers, "start")
-    ok_count = sum(1 for r in results if r is not None and r.startswith("OK"))
-    fail_count = sum(1 for r in results if r is None or (not r.startswith("OK")))
-    summary("Phase 5", ok_count, fail_count)
-
-    # Final summary
+    # Final summary（コンテナ起動は行わない。mise run start が担当する）
     print()
     ok("Distribution complete")
     info(f"Experiment dir: {EXPERIMENT_DIR_NAME}")
-    info(f"Monitor: docker exec -it wafl-peft-server tail -f /app/results/{EXPERIMENT_DIR_NAME}/logs/metrics_peer_0_final.jsonl")
+    info("Next: run `mise run start` to launch the server and client containers")
 
 
 if __name__ == "__main__":

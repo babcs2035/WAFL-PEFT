@@ -16,6 +16,7 @@ dependencies = [
     "tensorboard",
     "matplotlib",
     "numpy",
+    "bitsandbytes",
 ]
 
 [[tool.uv.index]]
