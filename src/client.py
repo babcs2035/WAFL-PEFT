@@ -24,9 +24,10 @@ GPU上で自分のチェックポイント履歴を評価し（run_post_experime
 メトリクスは訓練ループ内でキューへputし、ロガスレッドが非同期にファイルへ書き出す。
 各ステップで loss, throughput をログ出力する。
 
-ログのprefixは "[HH:MM:SS][Peer {peer_id}][<スレッド識別子>]" の形式で、
-実時刻とどのスレッドの出力かを一目で判別できるようにする（本アプリケーションは
-実時間ベースで実験終了を判定するため、ログ上でも実時刻を追えることが重要）。
+ログのprefixは "[+{経過秒}s]\t[Peer {peer_id}]\t[<スレッド識別子>]\t<本文>" の
+tab区切り形式で、フィールドを揃えて読みやすくする。時刻は実時刻(HH:MM:SS)ではなく
+「実験開始からの経過秒数」を表す（本アプリは時間ベースで実験を制御するため、
+経過時間の方がログ追跡に有用。実験開始前は "init" を表示）。
   [Main]        : メインスレッド（モデル・データ初期化，起動/終了ログ）
   [T1:Listener] : Thread 1（管理サーバー交信リスナー）
   [T2:P2P]      : Thread 2（P2P重み交換・マージ）
@@ -75,9 +76,22 @@ WEIGHT_DIR = LOG_DIR / "weights"
 WEIGHT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# 実験開始のwall-clock時刻（time.time()）。experiment_start受信時にセットされ、
+# 以降ログのprefix時刻は「実験開始からの経過秒数」を表す。実験開始前（モデル
+# ロード等）はNoneのままで、prefixには "init" を表示する
+_EXP_START_WALL: float | None = None
+
+
 def _now() -> str:
-    """現在時刻をHH:MM:SS形式で返す（ログの実時刻prefix用）。"""
-    return time.strftime("%H:%M:%S")
+    """ログprefix用の時刻文字列を返す。
+
+    実験開始後は「実験開始からの経過秒数」を +NNNN.Ns 形式（固定幅9文字）で返す。
+    本アプリは時間ベースで実験を制御するため、実時刻(HH:MM:SS)より経過時間の方が
+    ログを追う上で有用。実験開始前は "init" を返す。
+    """
+    if _EXP_START_WALL is None:
+        return f"{'init':^9}"
+    return f"+{time.time() - _EXP_START_WALL:7.1f}s"
 
 
 def _eta_str(seconds: float) -> str:
@@ -153,6 +167,13 @@ class SharedState:
         self.shadow_weights: dict[str, torch.Tensor] | None = None
         self.weights_lock = threading.Lock()
 
+        # shadow_weights が実際に更新された回数（Thread 3 が勾配累積境界で更新する
+        # たびに +1）。Thread 2 はこの版番号の変化を見て「重みが変わった時だけ」
+        # シリアライズ・送信する。これがないと Thread 2 はループ毎に 48MB の重みを
+        # torch.save で再シリアライズし続け、GIL を保持して Thread 3 の forward/backward を
+        # 断続的に数秒ブロックする（step 時間が 0.7s→7s に跳ねる原因になっていた）
+        self.shadow_version = 0
+
         self.merge_queue: queue.Queue[dict[str, torch.Tensor]] = queue.Queue(maxsize=32)
 
         self.metrics_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8192)
@@ -218,9 +239,9 @@ def initialize_model() -> tuple[Any, Any]:
     local_model_path = BASE_DIR / "cache" / "models" / model_path_parts[0] / model_path_parts[1]
 
     if local_model_path.exists() and (local_model_path / "config.json").exists():
-        print(f"[{_now()}][Peer {PEER_ID}][Main]   Using local model from {local_model_path}", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Using local model from {local_model_path}", flush=True)
     else:
-        print(f"[{_now()}][Peer {PEER_ID}][Main]   Local model not found, downloading from {model_id}...", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Local model not found, downloading from {model_id}...", flush=True)
         sys.stdout.flush()
 
     # GPU が存在する場合は 4-bit QLoRA (NF4) でモデルを量子化してロードする。
@@ -236,11 +257,11 @@ def initialize_model() -> tuple[Any, Any]:
         )
         _device_map = "auto"
         _quantization_config = bnb_config
-        print(f"[{_now()}][Peer {PEER_ID}][Main]   Using 4-bit NF4 quantization (QLoRA)", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Using 4-bit NF4 quantization (QLoRA)", flush=True)
     else:
         _device_map = "cpu"
         _quantization_config = None
-        print(f"[{_now()}][Peer {PEER_ID}][Main]   No GPU found, loading in float16 on CPU", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  No GPU found, loading in float16 on CPU", flush=True)
 
     model = AutoModelForCausalLM.from_pretrained(
         str(local_model_path) if local_model_path.exists() else model_id,
@@ -249,7 +270,7 @@ def initialize_model() -> tuple[Any, Any]:
         quantization_config=_quantization_config,
         trust_remote_code=True,
     )
-    print(f"[{_now()}][Peer {PEER_ID}][Main]   Model weights loaded, device={next(model.parameters()).device}", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Model weights loaded, device={next(model.parameters()).device}", flush=True)
     sys.stdout.flush()
 
     lora_config = LoraConfig(
@@ -261,7 +282,7 @@ def initialize_model() -> tuple[Any, Any]:
         task_type="CAUSAL_LM",
     )
 
-    print(f"[{_now()}][Peer {PEER_ID}][Main]   Applying LoRA (rank={_get_int('training', 'lora_rank')}, alpha={_get_int('training', 'lora_alpha')})...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Applying LoRA (rank={_get_int('training', 'lora_rank')}, alpha={_get_int('training', 'lora_alpha')})...", flush=True)
     sys.stdout.flush()
     # 4-bit 量子化モデルでは学習前の準備（ベースモデル凍結・gradient checkpointing）が必須。
     if _quantization_config is not None:
@@ -291,14 +312,14 @@ def initialize_model() -> tuple[Any, Any]:
             else:
                 torch.nn.init.kaiming_uniform_(new_data, a=math.sqrt(5))
             setattr(module, pname, torch.nn.Parameter(new_data, requires_grad=param.requires_grad))
-    print(f"[{_now()}][Peer {PEER_ID}][Main]   LoRA applied, target_device={_fallback_device}", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  LoRA applied, target_device={_fallback_device}", flush=True)
 
-    print(f"[{_now()}][Peer {PEER_ID}][Main]   Loading tokenizer...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Loading tokenizer...", flush=True)
     sys.stdout.flush()
     tokenizer = AutoTokenizer.from_pretrained(
         str(local_model_path) if local_model_path.exists() else model_id,
     )
-    print(f"[{_now()}][Peer {PEER_ID}][Main]   Tokenizer loaded", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Tokenizer loaded", flush=True)
     sys.stdout.flush()
 
     return model, tokenizer
@@ -310,7 +331,7 @@ def load_sharded_dataset(peer_id: int) -> Dataset:
     with open(train_file) as f:
         data = json.load(f)
     samples = data.get("samples", [])
-    print(f"[Peer {peer_id}] Loaded {len(samples)} samples from {train_file}")
+    print(f"[{_now()}]\t[Peer {peer_id}]\t[Main       ]\tLoaded {len(samples)} samples from {train_file}", flush=True)
     return Dataset.from_list(samples)
 
 
@@ -398,28 +419,28 @@ def server_listener_thread(state: SharedState, model: Any) -> None:
     接続時にpeer_idを登録し、以降は1秒周期のシグナルを待受。
     切断された場合は自動再接続する。
     """
-    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Thread 1 (Server Listener) started. Connecting to {SERVER_HOST}:{SERVER_PORT}...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\tThread 1 (Server Listener) started. Connecting to {SERVER_HOST}:{SERVER_PORT}...", flush=True)
 
     while state.running:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(2.0)
-                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Connecting to server...", flush=True)
+                print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\t  Connecting to server...", flush=True)
                 s.connect((SERVER_HOST, SERVER_PORT))
-                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Connected to server", flush=True)
+                print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\t  Connected to server", flush=True)
 
                 # ペアID登録
                 if not _send_json(s, {"type": "register", "peer_id": PEER_ID}):
-                    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Failed to send registration, retrying...", flush=True)
+                    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\t  Failed to send registration, retrying...", flush=True)
                     time.sleep(1.0)
                     continue
-                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Registration sent (peer_id={PEER_ID})", flush=True)
+                print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\t  Registration sent (peer_id={PEER_ID})", flush=True)
 
                 # モデルロード完了を待ってReadyを送信
-                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Waiting for model load to complete (timeout=60s)...", flush=True)
+                print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\t  Waiting for model load to complete (timeout=60s)...", flush=True)
                 state.ready_to_send.wait(timeout=60.0)
                 _send_json(s, {"type": "ready", "peer_id": PEER_ID})
-                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Ready signal sent. Waiting for signals...", flush=True)
+                print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\t  Ready signal sent. Waiting for signals...", flush=True)
 
                 while state.running:
                     # サーバーは全peerがreadyになるまでsignalを一切送信しないため
@@ -446,7 +467,7 @@ def server_listener_thread(state: SharedState, model: Any) -> None:
                             for event in events:
                                 peers = event.get("peers", [])
                                 if len(peers) != 2:
-                                    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Malformed event (peers must have 2 elements): {event}", flush=True)
+                                    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\tMalformed event (peers must have 2 elements): {event}", flush=True)
                                     continue
                                 if PEER_ID not in peers:
                                     continue
@@ -457,7 +478,7 @@ def server_listener_thread(state: SharedState, model: Any) -> None:
                                 elif event_type == "end":
                                     state.peer_whitelist.discard(other_pid)
                                 else:
-                                    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Unknown event type, ignored: {event}", flush=True)
+                                    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\tUnknown event type, ignored: {event}", flush=True)
                                     continue
                                 changed_events.append({"event": event_type, "other_peer_id": other_pid})
                             current_whitelist_snapshot = sorted(state.peer_whitelist)
@@ -487,24 +508,27 @@ def server_listener_thread(state: SharedState, model: Any) -> None:
                     elif msg_type == "experiment_start":
                         state.experiment_start_time = time.time()
                         state.experiment_duration = float(data.get("duration", 0.0))
+                        # 以降、ログprefixの時刻を「実験開始からの経過秒数」にする
+                        global _EXP_START_WALL
+                        _EXP_START_WALL = state.experiment_start_time
                         state.experiment_running.set()
                         print(
-                            f"[{_now()}][Peer {PEER_ID}][T1:Listener] Experiment STARTED. "
+                            f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\tExperiment STARTED. "
                             f"Duration: {data.get('duration')}s",
                             flush=True
                         )
 
                     elif msg_type == "experiment_stop":
-                        print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Experiment STOPPED.", flush=True)
+                        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\tExperiment STOPPED.", flush=True)
                         state.running = False
                         break
 
         except (OSError, ConnectionError) as e:
             if state.running:
-                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Server connection lost ({e}). Reconnecting in 1s...", flush=True)
+                print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\tServer connection lost ({e}). Reconnecting in 1s...", flush=True)
                 time.sleep(1.0)
 
-    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Thread 1 (Server Listener) stopped")
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T1:Listener]\tThread 1 (Server Listener) stopped")
 
 
 # ============================================================
@@ -571,7 +595,7 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
     - マージ結果はmerge_queueに渡すだけで、model本体には触れない
       （実際の反映はThread 3がステップ境界で行う。C1/C2参照）
     """
-    print(f"[{_now()}][Peer {PEER_ID}][T2:P2P] Thread 2 (P2P Exchange) started")
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tThread 2 (P2P Exchange) started")
 
     # peer_id -> IP マッピング
     host_map = resolve_hosts()
@@ -676,6 +700,10 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
             receive_buffers.pop(pid, None)
 
     last_merge_step: int = -1
+    # 前回シリアライズ・送信した shadow_weights の版番号。重みが変わった時
+    # （版番号が進んだ時）だけ再シリアライズ・送信し、ループ毎の無駄な
+    # torch.save による GIL 競合を防ぐ
+    last_sent_version: int = -1
 
     # 前回周回時点でのホワイトリスト（新たに切断すべきpidを検出するための比較用）
     prev_whitelist: set[int] = set()
@@ -690,7 +718,7 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
         # 実際の接続状態に反映される
         newly_removed = prev_whitelist - whitelist
         for pid in newly_removed:
-            print(f"[{_now()}][Peer {PEER_ID}][T2:P2P] Contact with peer {pid} ended.", flush=True)
+            print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tContact with peer {pid} ended.", flush=True)
         prev_whitelist = whitelist
 
         # ホワイトリストから外れた（サーバー側で明示的に除外された）peerとの
@@ -716,7 +744,7 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                 conn.settimeout(5.0)
                 # peer_idからIPを取得（hosts.txt）
                 if pid not in host_map:
-                    print(f"[{_now()}][Peer {PEER_ID}][T2:P2P]   Skipping peer {pid}: not in hosts.txt", flush=True)
+                    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\t  Skipping peer {pid}: not in hosts.txt", flush=True)
                     continue
                 peer_ip = host_map[pid]
                 conn.connect((peer_ip, P2P_PORT))
@@ -730,17 +758,27 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                 conn.sendall(pid_msg)
                 with conn_lock:
                     active_connections[pid] = conn
-                print(f"[{_now()}][Peer {PEER_ID}][T2:P2P] P2P connected to peer {pid} ({peer_ip})")
+                print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tP2P connected to peer {pid} ({peer_ip})")
             except OSError:
                 pass
 
-        # 接続済みpeerへ重みを送信
+        # 接続済みpeerへ重みを送信。shadow_weights が実際に更新された時
+        # （版番号が進んだ時）だけシリアライズ・送信する。以前は
+        # current_step != last_merge_step を条件にしていたため、マージが起きるまでの
+        # 間ループ毎に 48MB の重みを torch.save で再シリアライズし続け、GIL を保持して
+        # Thread 3 の forward/backward を断続的に数秒ブロックしていた（step 時間が
+        # 0.7s→7s に跳ねる原因）。版番号ベースにすることで、送信は重みの更新頻度
+        # （勾配累積境界ごと）に一致し、無駄な再シリアライズが消える
         current_step = state.current_step
-        if state.shadow_weights is not None and current_step != last_merge_step:
+        current_version = state.shadow_version
+        with conn_lock:
+            peers_to_send = list(active_connections.keys())
+        # 新しい版があり、かつ送信先がある時だけシリアライズ・送信する
+        # （送信先ゼロで serialize しても無駄なので、接続確立まで版番号は据え置く）
+        if state.shadow_weights is not None and current_version != last_sent_version and peers_to_send:
             with state.weights_lock:
                 serialized = _serialize_weights(state.shadow_weights)
-            with conn_lock:
-                peers_to_send = list(active_connections.keys())
+            sent_ok = False
             for pid in peers_to_send:
                 try:
                     conn = active_connections[pid]
@@ -748,9 +786,12 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                     # 送って早期に返ることがあるため、sendall()で確実に送り切る
                     conn.sendall(len(serialized).to_bytes(4, "big"))
                     conn.sendall(serialized)
+                    sent_ok = True
                 except OSError:
                     with conn_lock:
                         active_connections.pop(pid, None)
+            if sent_ok:
+                last_sent_version = current_version
 
         # 受信バッファのマージ（訓練イテレーションの境界で実行）
         # ここではCPU上のテンソルを平均化するだけで、model・shadow_weightsには
@@ -796,12 +837,12 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                         state.merge_queue.put(merged, timeout=1.0)
                         last_merge_step = current_step
                         print(
-                            f"[{_now()}][Peer {PEER_ID}][T2:P2P] Queued merged weights from {count} peers "
+                            f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tQueued merged weights from {count} peers "
                             f"at step {current_step}"
                         )
                     except queue.Full:
                         print(
-                            f"[{_now()}][Peer {PEER_ID}][T2:P2P] merge_queue full, dropping merge "
+                            f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tmerge_queue full, dropping merge "
                             f"at step {current_step}",
                             flush=True,
                         )
@@ -818,7 +859,7 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
         except OSError:
             pass
 
-    print(f"[{_now()}][Peer {PEER_ID}][T2:P2P] Thread 2 (P2P Exchange) stopped")
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tThread 2 (P2P Exchange) stopped")
 
 
 # ============================================================
@@ -840,7 +881,7 @@ def training_loop_thread(
     このスレッドは一定間隔でLoRA重みをチェックポイントとして保存するのみで、
     評価は管理サーバー（server.pyのGlobalEvalスレッド）が専用GPUで行う。
     """
-    print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Thread 3 (Training Loop) started", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tThread 3 (Training Loop) started", flush=True)
 
     # LoRA パラメータを named_parameters() 経由で収集する。
     # state_dict() はディスクオフロードモデルで全重みをロードしてしまう可能性があるが、
@@ -851,12 +892,12 @@ def training_loop_thread(
         if "lora" in name.lower()
     }
     lora_keys = list(lora_param_dict.keys())
-    print(f"[{_now()}][Peer {PEER_ID}][T3:Train]   Cloning {len(lora_keys)} LoRA weight tensors to CPU...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\t  Cloning {len(lora_keys)} LoRA weight tensors to CPU...", flush=True)
     with state.weights_lock:
         state.shadow_weights = {
             k: lora_param_dict[k].detach().cpu().clone() for k in lora_keys
         }
-    print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Model loaded, shadow weights ready (LoRA keys: {len(lora_keys)})")
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tModel loaded, shadow weights ready (LoRA keys: {len(lora_keys)})")
     state.ready_to_send.set()
 
     # GPU 環境では LoRA パラメータがある device に inputs を置く。
@@ -865,7 +906,7 @@ def training_loop_thread(
         (p.device for p in model.parameters() if p.requires_grad and p.device.type != "meta"),
         torch.device("cpu"),
     )
-    print(f"[{_now()}][Peer {PEER_ID}][T3:Train]   Training device: {_train_device}", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\t  Training device: {_train_device}", flush=True)
 
     optimizer = AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -879,16 +920,23 @@ def training_loop_thread(
     # 拡大して勾配を平滑化する（単一サンプルの極めてノイジーな勾配が学習効率を
     # 下げていた）
     grad_accum_steps = max(1, _get_int("training", "grad_accum_steps", 1))
-    # LR warmup: optimizer ステップ単位で線形に warmup した後は定数。step0 から
-    # 定数LRだと初期が不安定なため、序盤を緩やかに立ち上げる
+    # LR スケジュール: optimizer ステップ単位で線形 warmup した後、実験の経過時間
+    # 割合（elapsed/duration）で cosine 減衰させる。本アプリは時間ベース制御で
+    # 総ステップ数が事前に定まらないため、cosine 減衰の horizon をステップ数ではなく
+    # 実験時間割合で駆動する（throughput がノード間で違っても、各ノードが実験終盤で
+    # 同様に LR を下げられる）。warmup で序盤の不安定を抑え、終盤の減衰で収束を安定化する
+    base_lr = _get_float("training", "learning_rate")
     warmup_steps = max(0, _get_int("training", "lr_warmup_steps", 0))
+    lr_min_ratio = _get_float("training", "lr_min_ratio", 0.1)
+    opt_step = 0  # 実行済み optimizer.step() 回数（warmup 判定用）
 
-    def _lr_lambda(opt_step: int) -> float:
-        if warmup_steps > 0 and opt_step < warmup_steps:
-            return (opt_step + 1) / warmup_steps
-        return 1.0
+    def _lr_scale(opt_step_done: int, elapsed: float, duration: float) -> float:
+        """現在の LR 倍率を返す（warmup 線形 → cosine 減衰）。"""
+        if warmup_steps > 0 and opt_step_done < warmup_steps:
+            return opt_step_done / warmup_steps
+        frac = min(1.0, max(0.0, elapsed / duration)) if duration > 0 else 0.0
+        return lr_min_ratio + 0.5 * (1.0 - lr_min_ratio) * (1.0 + math.cos(math.pi * frac))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
     optimizer.zero_grad()
 
     # データ走査順序。逐次巡回（step % len）だと毎エポック同じ順序で同じデータを
@@ -916,7 +964,7 @@ def training_loop_thread(
 
         step_start_time = time.time()
 
-        print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Training step {step} (train_data len={len(train_data)})", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tTraining step {step} (train_data len={len(train_data)})", flush=True)
 
         # 経過時間を更新
         state.elapsed_time = time.time() - state.experiment_start_time
@@ -955,7 +1003,11 @@ def training_loop_thread(
         # P2Pマージ反映を行うとパラメータが書き換わり、加算中の勾配と不整合になる
         if do_optim_step:
             optimizer.step()
-            scheduler.step()
+            opt_step += 1
+            # warmup 線形 → 経過時間割合で cosine 減衰した LR を各 param group へ設定
+            lr_scale = _lr_scale(opt_step, state.elapsed_time, state.experiment_duration)
+            for group in optimizer.param_groups:
+                group["lr"] = base_lr * lr_scale
             optimizer.zero_grad()
         compute_duration = time.time() - compute_start_time
 
@@ -993,6 +1045,9 @@ def training_loop_thread(
                     for name, param in model.named_parameters():
                         if name in state.shadow_weights:
                             state.shadow_weights[name].copy_(param.detach().cpu())
+            # 版番号を上げ、Thread 2 に「重みが変わった」ことを知らせる（Thread 2 は
+            # この変化時のみ再シリアライズ・送信する）
+            state.shadow_version += 1
 
         # メトリクス計算。ログには未スケールの loss を用いる（backward には
         # grad_accum_steps で割った値を渡しているが、監視指標としては元の損失が自然）
@@ -1025,10 +1080,9 @@ def training_loop_thread(
         # 「残り時間」で進捗を見積もる
         remaining_time = max(0.0, state.experiment_duration - state.elapsed_time)
         print(
-            f"[{_now()}][Peer {PEER_ID}][T3:Train] Step {current_step_for_merge}: "
+            f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tStep {current_step_for_merge}: "
             f"loss={loss_value:.4f}, tok/s={tokens_per_sec:.1f}, "
-            f"step={step_duration:.1f}s, elapsed={state.elapsed_time:.0f}s "
-            f"({_eta_str(state.elapsed_time)}), "
+            f"step={step_duration:.1f}s, "
             f"remaining={_eta_str(remaining_time)}",
             flush=True,
         )
@@ -1075,9 +1129,8 @@ def training_loop_thread(
                     torch.save(state.shadow_weights, str(ckpt_path))
             state.checkpoint_elapsed[current_step_for_merge] = state.elapsed_time
             print(
-                f"[{_now()}][Peer {PEER_ID}][T3:Train] Step {current_step_for_merge}: "
+                f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tStep {current_step_for_merge}: "
                 f"loss={loss_value:.4f}, tok/s={tokens_per_sec:.1f}, "
-                f"elapsed={state.elapsed_time:.0f}s, "
                 f"saved {ckpt_path}", flush=True
             )
 
@@ -1093,9 +1146,9 @@ def training_loop_thread(
                 final_ckpt_path = WEIGHT_DIR / f"weights_step_{step:06d}.pt"
                 torch.save(state.shadow_weights, str(final_ckpt_path))
         state.checkpoint_elapsed[step] = state.elapsed_time
-        print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Final checkpoint saved at step {step}", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tFinal checkpoint saved at step {step}", flush=True)
 
-    print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Thread 3 (Training Loop) stopped")
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tThread 3 (Training Loop) stopped")
 
 
 # ============================================================
@@ -1117,7 +1170,7 @@ def async_logging_thread(state: SharedState) -> None:
     仕事を終えたことを確認したうえで明示的にNoneを送るため、シャットダウンの
     判定はこのシグネル受信のみに委ねてよい。
     """
-    print(f"[{_now()}][Peer {PEER_ID}][T4:Logger] Thread 4 (Async Logger) started")
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T4:Logger  ]\tThread 4 (Async Logger) started")
 
     metric_log_path = LOG_DIR / f"metrics_peer_{PEER_ID}.log"
     metric_log_path.write_text("")
@@ -1128,7 +1181,7 @@ def async_logging_thread(state: SharedState) -> None:
 
         # SHUTDOWN シグネル
         if metric is None:
-            print(f"[{_now()}][Peer {PEER_ID}][T4:Logger] Logger: shutting down (received={received_count})", flush=True)
+            print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T4:Logger  ]\tLogger: shutting down (received={received_count})", flush=True)
             break
 
         # メトリクスをログファイルへ追記
@@ -1141,11 +1194,11 @@ def async_logging_thread(state: SharedState) -> None:
 
             if metric.get("type") == "checkpoint":
                 print(
-                    f"[{_now()}][Peer {PEER_ID}][T4:Logger] Logger: checkpoint saved at step "
+                    f"[{_now()}]\t[Peer {PEER_ID}]\t[T4:Logger  ]\tLogger: checkpoint saved at step "
                     f"{metric.get('step')} (loss={metric.get('loss'):.4f})"
                 )
         except OSError as e:
-            print(f"[{_now()}][Peer {PEER_ID}][T4:Logger] Logger error: {e}", file=sys.stderr)
+            print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T4:Logger  ]\tLogger error: {e}", file=sys.stderr)
 
     # 最終フラッシュ
     final_log_path = LOG_DIR / f"metrics_peer_{PEER_ID}_final.log"
@@ -1154,19 +1207,22 @@ def async_logging_thread(state: SharedState) -> None:
     except OSError:
         pass
 
-    print(f"[{_now()}][Peer {PEER_ID}][T4:Logger] Thread 4 (Async Logger) stopped")
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T4:Logger  ]\tThread 4 (Async Logger) stopped")
 
 
 # ============================================================
 # 実験後評価（訓練終了後、自分のGPUで自分のチェックポイント履歴を評価）
 # ============================================================
 
-# 評価に用いるGSM8K検証サンプル数。settings.jsonのglobal_eval.sample_limitと
-# 揃え、管理サーバーが実験中に評価するマージモデルのaccuracyと比較可能にする
-_POST_EVAL_SAMPLE_LIMIT = 20
+# 評価に用いるGSM8K検証サンプル数。20だとaccuracyが5%刻みでノイズが大きく
+# （±10pt程度）、イテレーション間の学習効率の差を確実に判別できないため40に増やす。
+# 生成評価はKVキャッシュ有効（実験後はgradient_checkpointing無効化）で高速なため、
+# サンプル倍増でも実機で許容範囲（checkpoints数を8→6に減らして時間を相殺）
+_POST_EVAL_SAMPLE_LIMIT = 40
 # 評価するチェックポイント数の上限（全期間から均等サンプリング）。
-# 全チェックポイントを評価すると時間がかかりすぎるため上限を設ける
-_POST_EVAL_MAX_CHECKPOINTS = 8
+# 40サンプル×外部GPU競合で1チェックポイント約4分かかり、6個だと1ノード~27分と
+# cycleが長くなりすぎるため4個に絞る（学習序盤→終盤の推移は4点でも十分追える）
+_POST_EVAL_MAX_CHECKPOINTS = 4
 
 
 def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: Any) -> None:
@@ -1185,7 +1241,7 @@ def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: An
     """
     import gsm8k_eval
 
-    print(f"[{_now()}][Peer {PEER_ID}][Main] Starting post-experiment evaluation...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tStarting post-experiment evaluation...", flush=True)
 
     # 訓練中はgradient_checkpointingによりuse_cache=Falseだったが、評価では
     # もうbackward passを行わないため、KVキャッシュを有効化して生成を高速化する
@@ -1195,7 +1251,7 @@ def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: An
 
     val_data = gsm8k_eval.load_gsm8k_val_data(BASE_DIR, sample_limit=_POST_EVAL_SAMPLE_LIMIT)
     if not val_data:
-        print(f"[{_now()}][Peer {PEER_ID}][Main] GSM8K validation data not available. Skipping post-experiment evaluation.", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tGSM8K validation data not available. Skipping post-experiment evaluation.", flush=True)
         return
 
     all_steps = sorted(
@@ -1203,7 +1259,7 @@ def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: An
         for f in WEIGHT_DIR.glob("weights_step_*.pt")
     )
     if not all_steps:
-        print(f"[{_now()}][Peer {PEER_ID}][Main] No checkpoints found. Skipping post-experiment evaluation.", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tNo checkpoints found. Skipping post-experiment evaluation.", flush=True)
         return
 
     if len(all_steps) > _POST_EVAL_MAX_CHECKPOINTS:
@@ -1216,7 +1272,7 @@ def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: An
         eval_steps = all_steps
 
     print(
-        f"[{_now()}][Peer {PEER_ID}][Main] Evaluating {len(eval_steps)}/{len(all_steps)} "
+        f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tEvaluating {len(eval_steps)}/{len(all_steps)} "
         f"checkpoints (samples={_POST_EVAL_SAMPLE_LIMIT})...", flush=True,
     )
 
@@ -1225,14 +1281,16 @@ def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: An
         try:
             weights = torch.load(ckpt_path, weights_only=True, map_location="cpu")
         except (EOFError, RuntimeError) as e:
-            print(f"[{_now()}][Peer {PEER_ID}][Main]   Step {step}: failed to load checkpoint ({e}), skipping", flush=True)
+            print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Step {step}: failed to load checkpoint ({e}), skipping", flush=True)
             continue
 
         model.load_state_dict(weights, strict=False)
         accuracy = gsm8k_eval.score_generations(model, tokenizer, val_data, max_new_tokens=256)
         elapsed = state.checkpoint_elapsed.get(step, 0.0)
+        # ここの時刻はチェックポイントが訓練中に保存された時点（=学習経過）を表し、
+        # prefixの「現在の経過時間」とは別物なので ckpt@Ns と明示する
         print(
-            f"[{_now()}][Peer {PEER_ID}][Main]   Step {step} (elapsed={elapsed:.0f}s): "
+            f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t  Step {step} (ckpt@{elapsed:.0f}s): "
             f"accuracy = {accuracy:.1f}%", flush=True,
         )
 
@@ -1246,7 +1304,7 @@ def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: An
             pass
         torch.cuda.empty_cache()
 
-    print(f"[{_now()}][Peer {PEER_ID}][Main] Post-experiment evaluation complete.", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tPost-experiment evaluation complete.", flush=True)
 
 
 def notify_server_evaluation_complete() -> None:
@@ -1261,9 +1319,9 @@ def notify_server_evaluation_complete() -> None:
             s.settimeout(10.0)
             s.connect((SERVER_HOST, SERVER_PORT))
             _send_json(s, {"type": "evaluation_complete", "peer_id": PEER_ID})
-        print(f"[{_now()}][Peer {PEER_ID}][Main] Notified server of evaluation completion.", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tNotified server of evaluation completion.", flush=True)
     except OSError as e:
-        print(f"[{_now()}][Peer {PEER_ID}][Main] Failed to notify server of evaluation completion: {e}", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tFailed to notify server of evaluation completion: {e}", flush=True)
 
 
 # ============================================================
@@ -1285,7 +1343,7 @@ def _thread_wrapper(state: SharedState, target: Any, args: tuple) -> None:
     try:
         target(*args)
     except Exception:
-        print(f"[{_now()}][Peer {PEER_ID}] FATAL: thread '{target.__name__}' crashed:", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tFATAL: thread '{target.__name__}' crashed:", flush=True)
         traceback.print_exc()
         state.running = False
         os._exit(1)
@@ -1297,22 +1355,24 @@ def main() -> None:
     global PEER_ID
     PEER_ID = int(os.environ.get("PEER_ID", "0"))
 
-    print(f"=" * 60, flush=True)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] WAFL-PEFT Client Starting", flush=True)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] PEER_ID={PEER_ID}", flush=True)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] Model ID: {_get('model', 'model_id')}", flush=True)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] Server: {SERVER_HOST}:{SERVER_PORT}", flush=True)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] P2P Port: {P2P_PORT}", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t" + "=" * 60, flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tWAFL-PEFT Client Starting", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tPEER_ID={PEER_ID}", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tModel ID: {_get('model', 'model_id')}", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tServer: {SERVER_HOST}:{SERVER_PORT}", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tP2P Port: {P2P_PORT}", flush=True)
     print(
-        f"[{_now()}][Peer {PEER_ID}][Main] Micro-batch: {_get_int('training', 'batch_size')}, "
+        f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tMicro-batch: {_get_int('training', 'batch_size')}, "
         f"grad_accum_steps: {_get_int('training', 'grad_accum_steps', 1)} "
         f"(effective batch = {_get_int('training', 'batch_size') * _get_int('training', 'grad_accum_steps', 1)}), "
-        f"lr: {_get_float('training', 'learning_rate')}, warmup_steps: {_get_int('training', 'lr_warmup_steps', 0)}",
+        f"lr: {_get_float('training', 'learning_rate')} (warmup {_get_int('training', 'lr_warmup_steps', 0)} steps "
+        f"-> cosine decay by time to x{_get_float('training', 'lr_min_ratio', 0.1)}), "
+        f"max_seq_len: {_get_int('training', 'max_seq_len')}",
         flush=True,
     )
-    print(f"[{_now()}][Peer {PEER_ID}][Main] Eval/Checkpoint Interval: {_get_float('training', 'eval_interval_seconds', 60.0)}s", flush=True)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] Stop condition: server experiment_stop signal (time-based, no step limit)", flush=True)
-    print(f"=" * 60, flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tEval/Checkpoint Interval: {_get_float('training', 'eval_interval_seconds', 60.0)}s", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tStop condition: server experiment_stop signal (time-based, no step limit)", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t" + "=" * 60, flush=True)
     sys.stdout.flush()
 
     # 前回実験のチェックポイントをクリア。WEIGHT_DIR はメトリクスログと異なり
@@ -1321,7 +1381,7 @@ def main() -> None:
     # ログ回収・分析のたびに不要な大容量データを転送することになる
     old_ckpts = list(WEIGHT_DIR.glob("weights_step_*.pt"))
     if old_ckpts:
-        print(f"[{_now()}][Peer {PEER_ID}][Main] Clearing {len(old_ckpts)} checkpoint(s) from previous run...", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tClearing {len(old_ckpts)} checkpoint(s) from previous run...", flush=True)
         for ckpt in old_ckpts:
             ckpt.unlink(missing_ok=True)
 
@@ -1337,37 +1397,37 @@ def main() -> None:
         if f.name not in (f"metrics_peer_{PEER_ID}.log", f"metrics_peer_{PEER_ID}_final.log")
     ]
     if stale_logs:
-        print(f"[{_now()}][Peer {PEER_ID}][Main] Clearing {len(stale_logs)} stale log(s) from other peer_id(s)...", flush=True)
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tClearing {len(stale_logs)} stale log(s) from other peer_id(s)...", flush=True)
         for stale_log in stale_logs:
             stale_log.unlink(missing_ok=True)
 
     # 決定論的シード設定（モデル初期化・データローディング順序の再現性のため、
     # モデルロードより前に行う必要がある）
     seed = set_deterministic_seed(PEER_ID)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] Deterministic seed set: {seed} (data.seed + PEER_ID)", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tDeterministic seed set: {seed} (data.seed + PEER_ID)", flush=True)
 
     # モデル・データセットの初期化
     model_id = _get("model", "model_id")
     max_seq_len = _get_int("training", "max_seq_len")
-    print(f"[{_now()}][Peer {PEER_ID}][Main] [1/3] Loading model from {model_id}...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t[1/3] Loading model from {model_id}...", flush=True)
     sys.stdout.flush()
     model, tokenizer = initialize_model()
-    print(f"[{_now()}][Peer {PEER_ID}][Main] [1/3] Model loaded successfully", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t[1/3] Model loaded successfully", flush=True)
     sys.stdout.flush()
 
-    print(f"[{_now()}][Peer {PEER_ID}][Main] [2/3] Loading dataset...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t[2/3] Loading dataset...", flush=True)
     sys.stdout.flush()
     raw_dataset = load_sharded_dataset(PEER_ID)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] [2/3] Dataset loaded: {len(raw_dataset)} raw samples", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t[2/3] Dataset loaded: {len(raw_dataset)} raw samples", flush=True)
     sys.stdout.flush()
 
-    print(f"[{_now()}][Peer {PEER_ID}][Main] [2/3] Tokenizing {len(raw_dataset)} samples (max_seq_len={max_seq_len})...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t[2/3] Tokenizing {len(raw_dataset)} samples (max_seq_len={max_seq_len})...", flush=True)
     sys.stdout.flush()
     train_data = tokenize_dataset(raw_dataset, tokenizer, max_seq_len)
-    print(f"[{_now()}][Peer {PEER_ID}][Main] [2/3] Tokenized {len(train_data)} training samples (filtered: {len(raw_dataset) - len(train_data)} dropped)", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t[2/3] Tokenized {len(train_data)} training samples (filtered: {len(raw_dataset) - len(train_data)} dropped)", flush=True)
     sys.stdout.flush()
 
-    print(f"[{_now()}][Peer {PEER_ID}][Main] [3/3] Initializing shared state and threads...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t[3/3] Initializing shared state and threads...", flush=True)
     sys.stdout.flush()
 
     # 共有状態
@@ -1400,7 +1460,7 @@ def main() -> None:
     training_thread.start()
 
     # 全スレッドの終了を待機
-    print(f"[{_now()}][Peer {PEER_ID}][Main] All threads started. Waiting for experiment...", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tAll threads started. Waiting for experiment...", flush=True)
     sys.stdout.flush()
     for t in [listener_thread, p2p_thread, training_thread]:
         t.join()
@@ -1419,7 +1479,7 @@ def main() -> None:
     state.metrics_queue.put(None, timeout=30.0)
     logger_thread.join()
 
-    print(f"[{_now()}][Peer {PEER_ID}][Main] All threads stopped. Client exiting.", flush=True)
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tAll threads stopped. Client exiting.", flush=True)
     sys.stdout.flush()
 
 

@@ -21,8 +21,9 @@ accuracy）のリアルタイム評価を並行して行う。
     1台分の評価時間で全ノードの収束曲線が得られる。管理サーバーは
     collect_logs.pyの既存rsync機構でこれを回収するだけでよい。
 
-ログのprefixは "[HH:MM:SS][SERVER][<スレッド識別子>]" の形式で、実時刻と
-どのスレッドの出力かを一目で判別できるようにする。
+ログのprefixは "[+{経過秒}s]\t[SERVER]\t[<スレッド識別子>]\t<本文>" のtab区切り
+形式で、フィールドを揃えて読みやすくする。時刻は実時刻(HH:MM:SS)ではなく
+「実験開始からの経過秒数」を表す（実験開始前は "init"）。
   [Main]       : メインスレッド（起動・シャットダウン処理）
   [Accept]     : クライアント接続受付スレッド（_accept_clients）。実験開始前は
                  登録・Ready待受を、実験終了後は各クライアントの実験後評価
@@ -74,9 +75,22 @@ _EXPERIMENT_END_BUFFER_SECONDS = 60.0
 _POST_EXPERIMENT_EVAL_GRACE_SECONDS = 2400.0
 
 
+# 実験開始のwall-clock時刻（time.time()）。全クライアントreadyで実験開始した時に
+# セットされ、以降ログのprefix時刻は「実験開始からの経過秒数」を表す。開始前は
+# Noneのままで、prefixには "init" を表示する
+_EXP_START_WALL: float | None = None
+
+
 def _now() -> str:
-    """現在時刻をHH:MM:SS形式で返す（ログの実時刻prefix用）。"""
-    return time.strftime("%H:%M:%S")
+    """ログprefix用の時刻文字列を返す。
+
+    実験開始後は「実験開始からの経過秒数」を +NNNN.Ns 形式（固定幅9文字）で返す。
+    本アプリは時間ベースで実験を制御するため、実時刻(HH:MM:SS)より経過時間の方が
+    ログを追う上で有用。実験開始前（クライアント待受中）は "init" を返す。
+    """
+    if _EXP_START_WALL is None:
+        return f"{'init':^9}"
+    return f"+{time.time() - _EXP_START_WALL:7.1f}s"
 
 
 class ClientSession:
@@ -208,15 +222,15 @@ class WAFLServer:
     def start(self) -> None:
         """サーバーを起動。"""
         import sys
-        print(f"[{_now()}][SERVER][Main] ============================================================", flush=True)
-        print(f"[{_now()}][SERVER][Main] WAFL-PEFT Experiment Server Starting", flush=True)
-        print(f"[{_now()}][SERVER][Main] ============================================================", flush=True)
-        print(f"[{_now()}][SERVER][Main] Port: {self.server_port}", flush=True)
-        print(f"[{_now()}][SERVER][Main] P2P Port: {self.client_p2p_port}", flush=True)
-        print(f"[{_now()}][SERVER][Main] Experiment Duration: {self.experiment_duration}s", flush=True)
-        print(f"[{_now()}][SERVER][Main] Contact Pattern Timeline: {len(self.timeline)} events", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\t============================================================", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tWAFL-PEFT Experiment Server Starting", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\t============================================================", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tPort: {self.server_port}", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tP2P Port: {self.client_p2p_port}", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tExperiment Duration: {self.experiment_duration}s", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tContact Pattern Timeline: {len(self.timeline)} events", flush=True)
         for t, event in self.timeline:
-            print(f"[{_now()}][SERVER][Main]   t={t}s: {event['event']} peers={event['peers']}", flush=True)
+            print(f"[{_now()}]\t[SERVER]\t[Main      ]\t  t={t}s: {event['event']} peers={event['peers']}", flush=True)
         sys.stdout.flush()
 
         # TCPサーバーソケット作成
@@ -225,7 +239,7 @@ class WAFLServer:
         self.server_socket.settimeout(1.0)
         self.server_socket.bind(("0.0.0.0", self.server_port))
         self.server_socket.listen(128)
-        print(f"[{_now()}][SERVER][Main] TCP socket bound to 0.0.0.0:{self.server_port}, listening...", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tTCP socket bound to 0.0.0.0:{self.server_port}, listening...", flush=True)
         sys.stdout.flush()
 
         # クライアント受信スレッド
@@ -244,8 +258,8 @@ class WAFLServer:
         global_eval_thread = threading.Thread(target=self._global_eval_thread, daemon=True)
         global_eval_thread.start()
 
-        print(f"[{_now()}][SERVER][Main] All threads started. Waiting for clients...", flush=True)
-        print(f"[{_now()}][SERVER][Main] Expected clients: {len(self._collect_all_peers())}", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tAll threads started. Waiting for clients...", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tExpected clients: {len(self._collect_all_peers())}", flush=True)
         sys.stdout.flush()
 
     def _collect_all_peers(self) -> set[int]:
@@ -294,30 +308,30 @@ class WAFLServer:
                         done_count = len(self.evaluation_done)
                     expected = len(self._collect_all_peers())
                     print(
-                        f"[{_now()}][SERVER][Accept] Peer {peer_id} finished experiment and "
+                        f"[{_now()}]\t[SERVER]\t[Accept    ]\tPeer {peer_id} finished experiment and "
                         f"post-experiment evaluation. ({done_count}/{expected})", flush=True,
                     )
                     if self._all_evaluations_done() and not self._all_evaluations_logged:
                         self._all_evaluations_logged = True
                         print(
-                            f"[{_now()}][SERVER][Accept] All {expected}/{expected} devices have "
+                            f"[{_now()}]\t[SERVER]\t[Accept    ]\tAll {expected}/{expected} devices have "
                             "finished the experiment and evaluation.", flush=True,
                         )
                     session.close()
                     continue
 
                 if msg.get("type") != "register":
-                    print(f"[{_now()}][SERVER][Accept] Invalid registration from {addr}, closing", flush=True)
+                    print(f"[{_now()}]\t[SERVER]\t[Accept    ]\tInvalid registration from {addr}, closing", flush=True)
                     session.close()
                     continue
 
-                print(f"[{_now()}][SERVER][Accept] New connection from {addr}", flush=True)
+                print(f"[{_now()}]\t[SERVER]\t[Accept    ]\tNew connection from {addr}", flush=True)
                 peer_id = msg["peer_id"]
                 with self.sessions_lock:
                     self.sessions[peer_id] = session
 
-                print(f"[{_now()}][SERVER][Accept] Client registered: peer_id={peer_id}, addr={addr}", flush=True)
-                print(f"[{_now()}][SERVER][Accept] Registered clients: {list(self.sessions.keys())}", flush=True)
+                print(f"[{_now()}]\t[SERVER]\t[Accept    ]\tClient registered: peer_id={peer_id}, addr={addr}", flush=True)
+                print(f"[{_now()}]\t[SERVER]\t[Accept    ]\tRegistered clients: {list(self.sessions.keys())}", flush=True)
 
                 # Ready信号を待受（別スレッドで処理）
                 def wait_ready(sess: ClientSession, pid: int) -> None:
@@ -326,7 +340,7 @@ class WAFLServer:
                         with self.sessions_lock:
                             if pid in self.sessions:
                                 self.sessions[pid].ready = True
-                        print(f"[{_now()}][SERVER][Accept] Client {pid} is ready. ({sum(1 for s in self.sessions.values() if s.ready)}/{len(self.sessions)} ready)", flush=True)
+                        print(f"[{_now()}]\t[SERVER]\t[Accept    ]\tClient {pid} is ready. ({sum(1 for s in self.sessions.values() if s.ready)}/{len(self.sessions)} ready)", flush=True)
 
                 ready_thread = threading.Thread(
                     target=wait_ready, args=(session, peer_id), daemon=True
@@ -385,8 +399,8 @@ class WAFLServer:
     def _wait_for_ready(self) -> None:
         """全クライアントのReadyを待受。"""
         expected = len(self._collect_all_peers())
-        print(f"[{_now()}][SERVER][Monitor] Expected clients from contact_pattern: {expected} (unique peers across all events)", flush=True)
-        print(f"[{_now()}][SERVER][Monitor] Waiting for {expected} clients to be ready...", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tExpected clients from contact_pattern: {expected} (unique peers across all events)", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tWaiting for {expected} clients to be ready...", flush=True)
 
         while not self.all_ready and not self.experiment_end_time:
             with self.sessions_lock:
@@ -417,15 +431,18 @@ class WAFLServer:
                     for session in self.sessions.values():
                         session.send_json(broadcast)
                     self.experiment_start_time = time.time()
-                    print(f"[{_now()}][SERVER][Monitor] All {ready_count}/{expected} clients ready. Experiment START at {now}", flush=True)
-                    print(f"[{_now()}][SERVER][Monitor] Experiment directory: results/{exp_dir_name}", flush=True)
-                    print(f"[{_now()}][SERVER][Monitor] Registered peers: {list(self.sessions.keys())}", flush=True)
+                    # 以降、ログprefixの時刻を「実験開始からの経過秒数」にする
+                    global _EXP_START_WALL
+                    _EXP_START_WALL = self.experiment_start_time
+                    print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tAll {ready_count}/{expected} clients ready. Experiment START at {now}", flush=True)
+                    print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tExperiment directory: results/{exp_dir_name}", flush=True)
+                    print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tRegistered peers: {list(self.sessions.keys())}", flush=True)
                     return
 
             with self.sessions_lock:
                 current_ready = sum(1 for s in self.sessions.values() if s.ready)
                 current_registered = len(self.sessions)
-            print(f"[{_now()}][SERVER][Monitor] Ready: {current_ready}/{expected}, Registered: {current_registered}", flush=True)
+            print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tReady: {current_ready}/{expected}, Registered: {current_registered}", flush=True)
             time.sleep(1.0)
 
     def _monitor_experiment(self) -> None:
@@ -433,10 +450,10 @@ class WAFLServer:
         self._wait_for_ready()
 
         if self.experiment_start_time is None:
-            print(f"[{_now()}][SERVER][Monitor] Experiment start time not set. Exiting monitor.", flush=True)
+            print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tExperiment start time not set. Exiting monitor.", flush=True)
             return
 
-        print(f"[{_now()}][SERVER][Monitor] Experiment running. Duration: {self.experiment_duration}s", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tExperiment running. Duration: {self.experiment_duration}s", flush=True)
 
         # 実験終了まで待機
         while True:
@@ -453,11 +470,11 @@ class WAFLServer:
                 with self.sessions_lock:
                     for session in self.sessions.values():
                         session.send_json(stop_signal)
-                print(f"[{_now()}][SERVER][Monitor] Experiment STOPPED after {self.experiment_duration}s", flush=True)
+                print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tExperiment STOPPED after {self.experiment_duration}s", flush=True)
                 break
             if int(elapsed) % 10 == 0:
                 remaining = self.experiment_duration - elapsed
-                print(f"[{_now()}][SERVER][Monitor] Experiment running... Elapsed: {elapsed:.1f}s, Remaining: {remaining:.1f}s", flush=True)
+                print(f"[{_now()}]\t[SERVER]\t[Monitor   ]\tExperiment running... Remaining: {remaining:.1f}s", flush=True)
             time.sleep(1.0)
 
     def _collect_latest_weights(self, ip: str, peer_id: int, tmp_dir: Any) -> str:
@@ -513,22 +530,22 @@ class WAFLServer:
         lora_rank = _get_int("training", "lora_rank")
         lora_alpha = _get_int("training", "lora_alpha")
 
-        print(f"[{_now()}][SERVER][GlobalEval] Loading GSM8K validation data...", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tLoading GSM8K validation data...", flush=True)
         val_data = gsm8k_eval.load_gsm8k_val_data(base_dir, sample_limit=sample_limit)
         if not val_data:
-            print(f"[{_now()}][SERVER][GlobalEval] GSM8K validation data not available. Disabled.", flush=True)
+            print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tGSM8K validation data not available. Disabled.", flush=True)
             return
 
         device_id = 0 if torch.cuda.is_available() else None
-        print(f"[{_now()}][SERVER][GlobalEval] Loading model: {model_id} (4-bit quantized)...", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tLoading model: {model_id} (4-bit quantized)...", flush=True)
         model, tokenizer = gsm8k_eval.build_lora_model(model_id, lora_rank, lora_alpha, device_id, base_dir=base_dir)
-        print(f"[{_now()}][SERVER][GlobalEval] Model ready. Waiting for experiment to start...", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tModel ready. Waiting for experiment to start...", flush=True)
 
         # 実験開始（全peer ready）を待つ
         while not self.experiment_start_time and not self.experiment_end_time:
             time.sleep(1.0)
         if self.experiment_end_time or self.experiment_dir_name is None:
-            print(f"[{_now()}][SERVER][GlobalEval] Experiment ended before starting. Exiting.", flush=True)
+            print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tExperiment ended before starting. Exiting.", flush=True)
             return
 
         experiment_dir = base_dir / "results" / self.experiment_dir_name
@@ -537,28 +554,28 @@ class WAFLServer:
         log_path = experiment_dir / "global_eval.log"
         hosts = self.get_client_list()
 
-        print(f"[{_now()}][SERVER][GlobalEval] Monitoring started. Interval: {interval_seconds}s", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tMonitoring started. Interval: {interval_seconds}s", flush=True)
 
         while not self.experiment_end_time:
             try:
-                print(f"[{_now()}][SERVER][GlobalEval] Collecting checkpoints from {len(hosts)} devices...", flush=True)
+                print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tCollecting checkpoints from {len(hosts)} devices...", flush=True)
                 for i, ip in enumerate(hosts):
                     result = self._collect_latest_weights(ip, i, tmp_dir)
                     if not result.startswith("OK"):
-                        print(f"[{_now()}][SERVER][GlobalEval]   {result}", flush=True)
+                        print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\t  {result}", flush=True)
 
                 steps = gsm8k_eval.find_all_checkpoint_steps(tmp_dir)
                 if not steps:
-                    print(f"[{_now()}][SERVER][GlobalEval] No checkpoints available yet. Skipping this round.", flush=True)
+                    print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tNo checkpoints available yet. Skipping this round.", flush=True)
                 else:
                     latest_step = steps[-1]
                     weights = gsm8k_eval.load_merged_checkpoint(tmp_dir, latest_step)
                     if weights is None:
-                        print(f"[{_now()}][SERVER][GlobalEval] Failed to load checkpoint at step {latest_step}. Skipping.", flush=True)
+                        print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tFailed to load checkpoint at step {latest_step}. Skipping.", flush=True)
                     else:
                         accuracy = gsm8k_eval.evaluate_weights(model, tokenizer, weights, val_data)
                         print(
-                            f"[{_now()}][SERVER][GlobalEval] Step {latest_step}: "
+                            f"[{_now()}]\t[SERVER]\t[GlobalEval]\tStep {latest_step}: "
                             f"Global merged model accuracy = {accuracy:.1f}%", flush=True,
                         )
                         record = {
@@ -570,7 +587,7 @@ class WAFLServer:
                             f.flush()
                             os.fsync(f.fileno())
             except Exception as e:
-                print(f"[{_now()}][SERVER][GlobalEval] Error during evaluation round: {e}", flush=True)
+                print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tError during evaluation round: {e}", flush=True)
 
             for _ in range(int(interval_seconds)):
                 if self.experiment_end_time:
@@ -578,7 +595,7 @@ class WAFLServer:
                 time.sleep(1.0)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        print(f"[{_now()}][SERVER][GlobalEval] Stopped.", flush=True)
+        print(f"[{_now()}]\t[SERVER]\t[GlobalEval]\tStopped.", flush=True)
 
     def get_client_list(self) -> list[str]:
         """SSH接続用のクライアントIPリストを返す。"""
@@ -598,7 +615,7 @@ def main() -> None:
     import signal
 
     def shutdown(signum: int, frame: Any) -> None:
-        print(f"[{_now()}][SERVER][Main] Received signal {signum}. Shutting down...")
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tReceived signal {signum}. Shutting down...")
         server.experiment_end_time = time.time()
 
     signal.signal(signal.SIGINT, shutdown)
@@ -613,7 +630,7 @@ def main() -> None:
     finally:
         if server.server_socket:
             server.server_socket.close()
-        print("[{_now()}][SERVER][Main] Server stopped.")
+        print(f"[{_now()}]\t[SERVER]\t[Main      ]\tServer stopped.")
 
 
 if __name__ == "__main__":

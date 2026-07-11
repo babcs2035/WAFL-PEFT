@@ -178,11 +178,10 @@ def _compute_throughput_correlations(
 
 
 def plot_throughput(all_metrics: dict[int, list[dict[str, Any]]]) -> Path:
-    """グラフ1: Token/s vs 時間（実時間軸でのスループット平坦性）。"""
+    """グラフ1: Token/s vs 時間（実時間軸でのスループット平坦性）。1画像1グラフ。"""
     print("\n=== Evaluation 1: Throughput Flatness ===")
 
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
-    ax1 = axes[0]
+    fig, ax1 = plt.subplots(figsize=(12, 7))
     all_times: list[float] = []
     all_tok_s: list[float] = []
 
@@ -228,22 +227,33 @@ def plot_throughput(all_metrics: dict[int, list[dict[str, Any]]]) -> Path:
             corr_text += f"\nCorrelation (t>={_WARMUP_EXCLUDE_SECONDS:.0f}s, excl. warmup): {corr_post_warmup:.4f}"
         ax1.text(0.02, 0.98, corr_text, transform=ax1.transAxes, verticalalignment="top", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
 
-    ax2 = axes[1]
-    for peer_id, metrics in all_metrics.items():
+    plt.tight_layout()
+    out_path = OUTPUT_DIR / "fig01_throughput_flatness.png"
+    plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out_path}")
+    return out_path
+
+
+def plot_cumulative_tokens(all_metrics: dict[int, list[dict[str, Any]]]) -> Path:
+    """グラフ1b: 各ノードの累積トークン数の推移。1画像1グラフ。"""
+    print("\n=== Evaluation 1b: Cumulative Tokens ===")
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for peer_id, metrics in sorted(all_metrics.items()):
         peer_times, peer_cumulative = [], []
         for m in metrics:
             if "total_tokens" in m:
                 peer_times.append(m["elapsed"])
                 peer_cumulative.append(m["total_tokens"])
         if peer_times:
-            ax2.plot(peer_times, peer_cumulative, alpha=0.4, linewidth=1)
-    ax2.set_xlabel("Elapsed Time (seconds)")
-    ax2.set_ylabel("Cumulative Tokens")
-    ax2.set_title("Cumulative Token Count per Peer")
-    ax2.grid(True, alpha=0.3)
-
+            ax.plot(peer_times, peer_cumulative, alpha=0.7, linewidth=1.2, label=f"Peer {peer_id}")
+    ax.set_xlabel("Elapsed Time (seconds)")
+    ax.set_ylabel("Cumulative Tokens")
+    ax.set_title("Evaluation 1b: Cumulative Token Count per Peer")
+    ax.legend(loc="upper left", fontsize="small")
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    out_path = OUTPUT_DIR / "fig01_throughput_flatness.png"
+    out_path = OUTPUT_DIR / "fig01b_cumulative_tokens.png"
     plt.savefig(str(out_path), dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  Saved: {out_path}")
@@ -428,9 +438,6 @@ def plot_convergence(time_steps: list[float], accuracies: list[float]) -> Path:
                 smoothed.append(np.mean(accuracies[start:end]))
             ax.plot(time_steps, smoothed, "r-", linewidth=2, label=f"Smoothed (window={window})")
 
-    ax.axhline(y=85.0, color="green", linestyle="--", alpha=0.7, label="Centralized Upper Bound (est.)")
-    ax.axhline(y=65.0, color="orange", linestyle="--", alpha=0.7, label="Nakajima et al. (2026) Round-based (est.)")
-
     ax.set_xlabel("Elapsed Time (seconds)")
     ax.set_ylabel("Test Accuracy (%)")
     ax.set_title("Evaluation 5: Knowledge Convergence under Time-Varying Topology")
@@ -478,6 +485,7 @@ def plot_per_peer_accuracy(per_peer: dict[int, tuple[list[float], list[float]]])
 def generate_report(
     all_metrics: dict[int, list[dict[str, Any]]],
     throughput_path: Path,
+    cumulative_path: Path,
     loss_path: Path,
     scatter_path: Path,
     convergence_path: Path,
@@ -486,69 +494,17 @@ def generate_report(
     per_peer_acc: dict[int, tuple[list[float], list[float]]],
     per_peer_acc_path: Path,
 ) -> Path:
-    """分析レポートを生成。
+    """自己完結的な分析レポート（Markdown）を生成する。
 
-    画像はレポートと同じOUTPUT_DIR内に保存されるため、リンクはファイル名のみの
-    相対パスで埋め込む（絶対パスだとレポートを別環境へコピーした際にリンク切れ
-    になるため）。
+    このファイル単体を読むだけで、実験の目的・設定・各指標の意味・結果・解釈が
+    すべて分かるように構成する。本文（設定→指標定義→結果→解釈）を先に置き、
+    グラフ画像はファイル末尾にまとめて 1 画像 1 グラフで埋め込む。画像リンクは
+    レポートと同じ OUTPUT_DIR 内のファイル名のみの相対パスにする（別環境へ
+    コピーしてもリンク切れしないように）。
     """
-    report_lines: list[str] = []
-    report_lines.append("# WAFL-PEFT Experiment Analysis Report")
-    report_lines.append("")
+    L: list[str] = []
 
-    report_lines.append("## Experiment Configuration")
-    report_lines.append("")
-    report_lines.append(f"- Experiment name: `{get_experiment_name()}`")
-    report_lines.append(f"- Experiment directory: `{EXPERIMENT_DIR.name}`")
-    report_lines.append(f"- Model: `{_get('model', 'model_id')}`")
-    report_lines.append(
-        f"- LoRA rank / alpha: {_get_int('training', 'lora_rank')} / {_get_int('training', 'lora_alpha')}"
-    )
-    report_lines.append(f"- Learning rate: {_get_float('training', 'learning_rate')}")
-    report_lines.append(f"- Batch size: {_get_int('training', 'batch_size')}")
-    report_lines.append(f"- Max sequence length: {_get_int('training', 'max_seq_len')}")
-    report_lines.append(
-        f"- Eval/checkpoint interval: {_get_float('training', 'eval_interval_seconds', 60.0):.0f}s"
-    )
-    report_lines.append(f"- Contact pattern file: `{_get_str('experiment', 'contact_pattern_file')}`")
-    report_lines.append("")
-
-    report_lines.append("## Summary")
-    report_lines.append(f"- Peers analyzed: {len(all_metrics)}")
-    report_lines.append(f"- Total metric entries: {sum(len(m) for m in all_metrics.values())}")
-    report_lines.append("")
-
-    report_lines.append("## Evaluation Graphs")
-    report_lines.append("")
-    report_lines.append("### Evaluation 1: Throughput Flatness (Stall-Free Demonstration)")
-    report_lines.append(f"![Throughput Flatness]({throughput_path.name})")
-    report_lines.append("")
-    report_lines.append("### Evaluation 2: Per-Peer Loss Curves")
-    report_lines.append(f"![Loss Curves]({loss_path.name})")
-    report_lines.append("")
-    report_lines.append("### Evaluation 3: Loss vs Throughput Scatter")
-    report_lines.append(f"![Loss vs Throughput]({scatter_path.name})")
-    report_lines.append("")
-    if convergence_path != Path("N/A"):
-        report_lines.append("### Evaluation 5: Knowledge Convergence (Merged Model Accuracy)")
-        report_lines.append(f"![Convergence]({convergence_path.name})")
-        report_lines.append("")
-    if per_peer_acc_path != Path("N/A"):
-        report_lines.append("### Evaluation 6: Per-Peer Model Accuracy over Time")
-        report_lines.append(f"![Per-Peer Accuracy]({per_peer_acc_path.name})")
-        report_lines.append("")
-
-    report_lines.append("## Per-Peer Statistics")
-    report_lines.append("")
-    report_lines.append(
-        "| Peer | Steps | Checkpoints | Avg Loss | Min Loss | Max Loss | Avg Token/s | "
-        "Avg Stall (s) | Contact Events | Accuracy (first→last) | Duration (s) |"
-    )
-    report_lines.append(
-        "|------|-------|-------------|----------|----------|----------|-------------|"
-        "---------------|----------------|------------------------|---------------|"
-    )
-
+    # ---- 集計 ----
     peer_stats: dict[int, dict[str, float]] = {}
     for peer_id in sorted(all_metrics.keys()):
         metrics = all_metrics[peer_id]
@@ -556,89 +512,194 @@ def generate_report(
         tok_s = [m["tokens_per_sec"] for m in metrics if m.get("tokens_per_sec", 0) > 0]
         times = [m["elapsed"] for m in metrics if "elapsed" in m]
         stalls = [m["stall_duration"] for m in metrics if "stall_duration" in m]
+        step_vals = [m["step"] for m in metrics if m.get("type") == "metric" and "step" in m]
         checkpoint_count = sum(1 for m in metrics if m.get("type") == "checkpoint")
         contact_event_count = sum(1 for m in metrics if m.get("type") == "contact_event")
-
-        # 実験後評価（評価6）由来のノード別 accuracy から最初と最後を引く
-        acc_first, acc_last = 0.0, 0.0
+        acc_first, acc_last, acc_peak = 0.0, 0.0, 0.0
         if peer_id in per_peer_acc and per_peer_acc[peer_id][1]:
             acc_list = per_peer_acc[peer_id][1]
-            acc_first, acc_last = acc_list[0], acc_list[-1]
-
-        stats = {
-            "steps": len(metrics),
+            acc_first, acc_last, acc_peak = acc_list[0], acc_list[-1], max(acc_list)
+        peer_stats[peer_id] = {
+            "train_steps": int(max(step_vals)) if step_vals else len(metrics),
             "avg_loss": float(np.mean(losses)) if losses else 0.0,
             "min_loss": float(np.min(losses)) if losses else 0.0,
-            "max_loss": float(np.max(losses)) if losses else 0.0,
             "avg_tok_s": float(np.mean(tok_s)) if tok_s else 0.0,
             "avg_stall": float(np.mean(stalls)) if stalls else 0.0,
+            "checkpoints": checkpoint_count,
+            "contacts": contact_event_count,
             "acc_first": acc_first,
             "acc_last": acc_last,
+            "acc_peak": acc_peak,
             "duration": float(np.max(times)) if times else 0.0,
         }
-        peer_stats[peer_id] = stats
-        report_lines.append(
-            f"| {peer_id} | {len(metrics)} | {checkpoint_count} | "
-            f"{stats['avg_loss']:.4f} | {stats['min_loss']:.4f} | {stats['max_loss']:.4f} | "
-            f"{stats['avg_tok_s']:.1f} | {stats['avg_stall']:.2f} | {contact_event_count} | "
-            f"{acc_first:.1f}%→{acc_last:.1f}% | "
-            f"{stats['duration']:.1f} |"
-        )
 
     all_avg_losses = [s["avg_loss"] for s in peer_stats.values()]
     all_avg_tok_s = [s["avg_tok_s"] for s in peer_stats.values()]
     all_durations = [s["duration"] for s in peer_stats.values()]
-    # accuracy の改善量（正の差=改善）
     acc_deltas = [s["acc_last"] - s["acc_first"] for s in peer_stats.values() if s["acc_last"] or s["acc_first"]]
-
-    report_lines.append("")
-    report_lines.append("## Overall Statistics")
-    report_lines.append("")
-    report_lines.append(f"- Average loss across peers: {np.mean(all_avg_losses):.4f}")
-    report_lines.append(f"- Average throughput: {np.mean(all_avg_tok_s):.1f} tokens/s")
-    if acc_deltas:
-        report_lines.append(
-            f"- Mean per-peer accuracy change (first→last, positive = improvement): {np.mean(acc_deltas):+.1f} pts"
-        )
-    report_lines.append(f"- Total experiment duration: {max(all_durations):.1f} seconds")
-    report_lines.append(f"- Number of peers: {len(peer_stats)}")
-
+    acc_lasts = [s["acc_last"] for s in peer_stats.values() if s["acc_last"] or s["acc_first"]]
     corr_full, corr_post_warmup = _compute_throughput_correlations(all_metrics)
-    if corr_full is not None:
-        report_lines.append(f"- Throughput/elapsed correlation (full, should be ~0 for stall-free): {corr_full:.4f}")
-        if corr_post_warmup is not None:
-            report_lines.append(
-                f"- Throughput/elapsed correlation (t>={_WARMUP_EXCLUDE_SECONDS:.0f}s, excl. GPU/model warmup): {corr_post_warmup:.4f}"
-            )
-        corr_for_judgement = corr_post_warmup if corr_post_warmup is not None else corr_full
-        if abs(corr_for_judgement) < 0.1:
-            report_lines.append(
-                f"  - Interpretation: |correlation|={abs(corr_for_judgement):.4f} < 0.1 なので、"
-                "通信中でも計算スループットがほぼ一定であり stall-free 設計が機能していると判断できる。"
-            )
-        else:
-            report_lines.append(
-                f"  - Interpretation: |correlation|={abs(corr_for_judgement):.4f} >= 0.1 であり、"
-                "経過時間とスループットに無視できない相関がある（通信・マージ処理によるストールの可能性）。"
-            )
+    corr_judge = corr_post_warmup if corr_post_warmup is not None else corr_full
 
+    # ---- タイトルと概要 ----
+    L.append("# WAFL-PEFT 実験分析レポート")
+    L.append("")
+    L.append(
+        "本レポートは WAFL-PEFT（Wireless Ad-hoc Federated Learning + PEFT/LoRA）実験の結果をまとめたものである。"
+        "複数の学習デバイス（peer）が中央サーバーを介さず P2P で LoRA アダプタを交換・平均マージしながら、"
+        "時変トポロジー（接触パターン）の下で GSM8K 数学文章題を分散学習する。各 peer は Non-IID な"
+        "データシャードを持ち、実験時間は接触パターンのタイムラインで時間ベースに制御される。"
+    )
+    L.append("")
+    L.append(f"- 実験名 / ディレクトリ: `{get_experiment_name()}` / `{EXPERIMENT_DIR.name}`")
+    L.append(f"- 参加ノード数: {len(all_metrics)}（peer_0 〜 peer_{len(all_metrics) - 1}）")
+    L.append(f"- 総メトリクスエントリ数: {sum(len(m) for m in all_metrics.values())}")
+    if all_durations:
+        L.append(f"- 実験継続時間: {max(all_durations):.0f} 秒")
+    L.append("")
+
+    # ---- 総合結果（最重要指標を冒頭に） ----
+    L.append("## 総合結果（要点）")
+    L.append("")
+    if acc_deltas:
+        L.append(
+            f"- **各ノードの GSM8K accuracy の平均改善（学習前→後）: {np.mean(acc_deltas):+.1f} ポイント**"
+            f"（最終 accuracy の平均: {np.mean(acc_lasts):.1f}%）。"
+            "これが「各ノードのモデル性能が着実に向上したか」を示す中心指標である。"
+        )
+    if convergence_accuracies:
+        L.append(
+            f"- 全ノード平均マージモデルの accuracy: {convergence_accuracies[0]:.1f}% → {convergence_accuracies[-1]:.1f}%"
+            f"（ピーク {max(convergence_accuracies):.1f}%）。フェデレーテッド学習全体の収束傾向を示す。"
+        )
+    L.append(f"- 平均訓練損失（全ノード平均）: {np.mean(all_avg_losses):.4f}")
+    L.append(f"- 平均スループット（全ノード平均）: {np.mean(all_avg_tok_s):.1f} tokens/s")
+    if corr_judge is not None:
+        verdict = "ストールフリー設計が機能" if abs(corr_judge) < 0.1 else "無視できないストールの可能性"
+        L.append(
+            f"- スループットと経過時間の相関: {corr_judge:+.4f}（|r|<0.1 が目標）→ {verdict}。"
+        )
+    L.append("")
+
+    # ---- 実験設定 ----
+    L.append("## 実験設定")
+    L.append("")
+    L.append("| 項目 | 値 |")
+    L.append("|------|----|")
+    L.append(f"| モデル | `{_get('model', 'model_id')}`（4-bit QLoRA） |")
+    L.append(f"| LoRA rank / alpha | {_get_int('training', 'lora_rank')} / {_get_int('training', 'lora_alpha')} |")
+    L.append(f"| 学習率 | {_get_float('training', 'learning_rate')} |")
+    L.append(f"| micro-batch / 勾配累積 | {_get_int('training', 'batch_size')} / {_get_int('training', 'grad_accum_steps', 1)}"
+             f"（実効バッチ {_get_int('training', 'batch_size') * _get_int('training', 'grad_accum_steps', 1)}） |")
+    L.append(f"| LR warmup steps / min ratio | {_get_int('training', 'lr_warmup_steps', 0)} / {_get_float('training', 'lr_min_ratio', 1.0)} |")
+    L.append(f"| 最大系列長 | {_get_int('training', 'max_seq_len')} |")
+    L.append(f"| チェックポイント間隔 | {_get_float('training', 'eval_interval_seconds', 60.0):.0f} 秒 |")
+    L.append(f"| 接触パターン | `{_get_str('experiment', 'contact_pattern_file')}` |")
+    L.append("")
+
+    # ---- 指標の定義 ----
+    L.append("## 指標の定義")
+    L.append("")
+    L.append("- **Train steps**: そのノードが実験時間内に実行した学習ステップ（micro-batch forward/backward）数。")
+    L.append("- **Avg / Min Loss**: 学習中の per-token 損失（answer 部分のみ、prompt は -100 でマスク）の平均・最小。"
+             "小シャードで過学習すると低くなるため、低いほど良いとは限らない（汎化とのトレードオフ）。")
+    L.append("- **Avg Token/s**: 1 ステップあたりの瞬間スループット（そのステップのトークン数 / 所要時間）の平均。")
+    L.append("- **Avg Stall (s)**: 1 ステップのうち forward/backward/optimizer 以外（P2P マージ反映・GPU 解放等）に"
+             "要した時間の平均。通信・マージが計算をブロックしていないかの指標（小さいほど良い）。")
+    L.append("- **Contact Events**: そのノードが接触パターンに従って P2P 接触の開始/終了を経験した回数。")
+    L.append("- **Accuracy (first→last)**: そのノード単体の LoRA モデルを、実験終了後に自分の GPU で GSM8K 検証セットに対し"
+             "生成評価（`#### 数値` の厳密一致）した accuracy の、学習序盤→終盤の変化。**本実験の主目的の指標**。")
+    L.append("")
+
+    # ---- ノード別統計 ----
+    L.append("## ノード別統計")
+    L.append("")
+    L.append("| Peer | Train steps | Checkpoints | Avg Loss | Min Loss | Avg Token/s | Avg Stall (s) "
+             "| Contact Events | Accuracy first→last (peak) | Duration (s) |")
+    L.append("|------|-------------|-------------|----------|----------|-------------|---------------"
+             "|----------------|-----------------------------|--------------|")
+    for peer_id in sorted(peer_stats.keys()):
+        s = peer_stats[peer_id]
+        L.append(
+            f"| {peer_id} | {s['train_steps']} | {s['checkpoints']} | {s['avg_loss']:.4f} | {s['min_loss']:.4f} "
+            f"| {s['avg_tok_s']:.1f} | {s['avg_stall']:.2f} | {s['contacts']} "
+            f"| {s['acc_first']:.1f}%→{s['acc_last']:.1f}% (peak {s['acc_peak']:.1f}%) | {s['duration']:.1f} |"
+        )
+    L.append("")
+
+    # ---- 全ノード平均マージモデルの収束 ----
     if convergence_time_steps and convergence_accuracies:
-        report_lines.append("")
-        report_lines.append("## Convergence Detail (Merged Model Accuracy over Time)")
-        report_lines.append("")
-        report_lines.append("| Elapsed (s) | Accuracy (%) |")
-        report_lines.append("|-------------|--------------|")
+        L.append("## 全ノード平均マージモデルの収束（実験中サーバー評価）")
+        L.append("")
+        L.append("管理サーバーが実験中、一定間隔で全ノードの LoRA 重みを収集・平均マージし GSM8K で評価した記録。")
+        L.append("")
+        L.append("| 経過時間 (s) | Accuracy (%) |")
+        L.append("|-------------|--------------|")
         for t, acc in zip(convergence_time_steps, convergence_accuracies):
-            report_lines.append(f"| {t:.1f} | {acc:.1f} |")
-        report_lines.append("")
-        report_lines.append(f"- First measured accuracy: {convergence_accuracies[0]:.1f}% (at {convergence_time_steps[0]:.1f}s)")
-        report_lines.append(f"- Last measured accuracy: {convergence_accuracies[-1]:.1f}% (at {convergence_time_steps[-1]:.1f}s)")
-        report_lines.append(f"- Change: {convergence_accuracies[-1] - convergence_accuracies[0]:+.1f} percentage points")
-        report_lines.append(f"- Peak accuracy: {max(convergence_accuracies):.1f}%")
+            L.append(f"| {t:.1f} | {acc:.1f} |")
+        L.append("")
+        L.append(f"- 初回 {convergence_accuracies[0]:.1f}%（{convergence_time_steps[0]:.1f}s）→ "
+                 f"最終 {convergence_accuracies[-1]:.1f}%（{convergence_time_steps[-1]:.1f}s）、"
+                 f"変化 {convergence_accuracies[-1] - convergence_accuracies[0]:+.1f}pt、ピーク {max(convergence_accuracies):.1f}%。")
+        L.append("")
+
+    # ---- スループット相関（ストールフリー性）の解釈 ----
+    L.append("## スループット平坦性（ストールフリー性）")
+    L.append("")
+    if corr_full is not None:
+        L.append(f"- 経過時間との相関（全期間）: {corr_full:+.4f}")
+        if corr_post_warmup is not None:
+            L.append(f"- 経過時間との相関（t≥{_WARMUP_EXCLUDE_SECONDS:.0f}s, ウォームアップ除外）: {corr_post_warmup:+.4f}")
+        if corr_judge is not None and abs(corr_judge) < 0.1:
+            L.append(f"- 解釈: |相関|={abs(corr_judge):.4f} < 0.1 のため、通信中でも計算スループットがほぼ一定であり、"
+                     "P2P 通信・マージ処理が学習計算をブロックしていない（stall-free 設計が機能している）と判断できる。")
+        elif corr_judge is not None:
+            L.append(f"- 解釈: |相関|={abs(corr_judge):.4f} ≥ 0.1 であり、経過時間とスループットに無視できない相関がある"
+                     "（通信・マージ処理によるストールの可能性がある）。")
+    else:
+        L.append("- データ不足のため相関を算出できなかった。")
+    L.append("")
+
+    # ---- グラフ（末尾に集約、1画像1グラフ） ----
+    L.append("## グラフ")
+    L.append("")
+    L.append("### 図1: スループット平坦性（Token/s vs 経過時間）")
+    L.append("各ノードのステップ毎スループット（薄線）と時間ビン平均（赤線）。水平に平坦なら stall-free。")
+    L.append("")
+    L.append(f"![Throughput Flatness]({throughput_path.name})")
+    L.append("")
+    L.append("### 図1b: 累積トークン数 vs 経過時間")
+    L.append("各ノードが処理した累積トークン数。傾きがスループット、直線的なら安定した学習進行を意味する。")
+    L.append("")
+    L.append(f"![Cumulative Tokens]({cumulative_path.name})")
+    L.append("")
+    L.append("### 図2: ノード別 損失曲線（Loss vs 経過時間）")
+    L.append("各ノードの学習損失の推移（薄線）と全体の時間ビン平均（赤線）。")
+    L.append("")
+    L.append(f"![Loss Curves]({loss_path.name})")
+    L.append("")
+    L.append("### 図3: 損失 vs スループット 散布図")
+    L.append("ノード別（色分け）の損失とスループットの関係。スループットが損失値に依らず一定域にあれば stall-free。")
+    L.append("")
+    L.append(f"![Loss vs Throughput]({scatter_path.name})")
+    L.append("")
+    if convergence_path != Path("N/A"):
+        L.append("### 図4: 全ノード平均マージモデルの accuracy 収束")
+        L.append("実験中にサーバーが評価した、全ノード平均マージモデルの GSM8K accuracy の時間推移。")
+        L.append("")
+        L.append(f"![Merged Convergence]({convergence_path.name})")
+        L.append("")
+    if per_peer_acc_path != Path("N/A"):
+        L.append("### 図5: ノード別モデルの accuracy 推移（各ノード単体）")
+        L.append("実験終了後に各ノードが自分のチェックポイント履歴を評価した、ノード単体モデルの accuracy 推移。"
+                 "**各ノードの性能が着実に向上したかを直接示す図**。")
+        L.append("")
+        L.append(f"![Per-Peer Accuracy]({per_peer_acc_path.name})")
+        L.append("")
 
     report_path = OUTPUT_DIR / "analysis_report.md"
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text("\n".join(report_lines))
+    report_path.write_text("\n".join(L))
     print(f"  Saved: {report_path}")
     return report_path
 
@@ -667,8 +728,9 @@ def main() -> None:
         sys.exit(0)
     print(f"Loaded metrics from {len(all_metrics)} peers")
 
-    # グラフ生成（GPU不要 — メトリクスログのみから作図）
+    # グラフ生成（GPU不要 — メトリクスログのみから作図）。1画像1グラフ
     throughput_path = plot_throughput(all_metrics)
+    cumulative_path = plot_cumulative_tokens(all_metrics)
     loss_path = plot_loss_curves(all_metrics)
     scatter_path = plot_per_peer_scatter(all_metrics)
 
@@ -698,13 +760,14 @@ def main() -> None:
 
     # レポート生成
     report_path = generate_report(
-        all_metrics, throughput_path, loss_path, scatter_path, convergence_path,
+        all_metrics, throughput_path, cumulative_path, loss_path, scatter_path, convergence_path,
         time_steps, accuracies, per_peer_acc, per_peer_acc_path,
     )
 
     print("\n" + "=" * 60)
     print("Analysis complete.")
     print(f"  Throughput plot: {throughput_path}")
+    print(f"  Cumulative tokens plot: {cumulative_path}")
     print(f"  Loss curves plot: {loss_path}")
     print(f"  Per-peer scatter plot: {scatter_path}")
     print(f"  Convergence plot: {convergence_path}")

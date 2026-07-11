@@ -5,8 +5,9 @@
   "training": {
     "learning_rate": 2e-4,
     "batch_size": 1,
-    "grad_accum_steps": 8,
+    "grad_accum_steps": 4,
     "lr_warmup_steps": 20,
+    "lr_min_ratio": 1.0,
     "max_seq_len": 256,
     "lora_rank": 16,
     "lora_alpha": 32,
