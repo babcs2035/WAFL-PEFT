@@ -12,7 +12,6 @@ import re
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import datasets
@@ -128,21 +127,6 @@ def main() -> None:
     """メインエントリポイント。"""
     base_dir = get_base_dir()
 
-    # 実験ディレクトリ名を確定し、results/.experiment_meta.json（直下）に保存する。
-    # deploy_distribute.py / collect_logs.py / start_clients.py / analyze.py は
-    # いずれもこの固定パスを読むため、ここで書き込み先を揃える
-    # （以前はタイムスタンプ付きサブディレクトリの中に書いており、読み込み側と食い違っていた）。
-    exp_name = _get("experiment", "experiment_name", "default")
-    timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
-    meta = {
-        "experiment_name": exp_name,
-        "timestamp": timestamp,
-        "dir_name": f"{exp_name}_{timestamp}",
-    }
-    meta_path = base_dir / "results" / ".experiment_meta.json"
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
-
     # hosts.txtの読み込み
     hosts = []
     for line in get_hosts_path().read_text().strip().splitlines():
@@ -228,8 +212,52 @@ def main() -> None:
     for peer_id in sharded:
         rng.shuffle(sharded[peer_id])
 
+    # 均等化リバランス（disjoint 維持）。カテゴリサイズの偏りにより peer サイズが
+    # 極端に不均衡（実測で 335〜2606）になり、小さい peer は同じ少数データを何度も
+    # 周回して過学習しやすい。各ノードの学習データ量を底上げしつつ均等化するため、
+    # 全 peer を target（=総数/peer数）へ揃える。超過 peer からは Non-IID 特性の核である
+    # specialty サンプルを優先的に残し、非 specialty サンプルを先に抜いてプールへ移し、
+    # 不足 peer へ配る（サンプルの重複・欠落は起こさない）。
+    target = len(train_data) // num_peers
+    pool: list[dict] = []
+    for peer_id in range(num_peers):
+        shard = sharded[peer_id]
+        excess = len(shard) - target
+        if excess <= 0:
+            continue
+        specialty = peer_categories[peer_id]
+        specialty_items: list[dict] = []
+        non_specialty: list[dict] = []
+        for item in shard:
+            if classify_problem(item["question"]) == specialty:
+                specialty_items.append(item)
+            else:
+                non_specialty.append(item)
+        rng.shuffle(non_specialty)
+        rng.shuffle(specialty_items)
+        # 非 specialty を先頭に並べ、先頭から excess 個を抜く（specialty を優先保持）
+        reordered = non_specialty + specialty_items
+        pool.extend(reordered[:excess])
+        sharded[peer_id] = reordered[excess:]
+
+    # 不足 peer をプールから補充して target へ底上げ
+    rng.shuffle(pool)
+    for peer_id in range(num_peers):
+        deficit = target - len(sharded[peer_id])
+        if deficit <= 0:
+            continue
+        sharded[peer_id].extend(pool[:deficit])
+        pool = pool[deficit:]
+
+    # 端数（target で割り切れない余り）は順に配って全サンプルを使い切る
+    while pool:
+        sharded[len(pool) % num_peers].append(pool.pop())
+
+    for peer_id in sharded:
+        rng.shuffle(sharded[peer_id])
+
     # カテゴリ分布の統計を出力
-    ok("Non-IID shard assignment done")
+    ok("Non-IID shard assignment done (rebalanced)")
     for peer_id in sorted(sharded.keys()):
         cat_counts: dict[str, int] = {}
         for item in sharded[peer_id]:

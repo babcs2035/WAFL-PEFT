@@ -5,46 +5,39 @@
 LoRA重みチェックポイントを管理サーバーへ一括回収する。
 """
 
-import json
 import os
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from utils import get_base_dir, get_hosts_path, _get, _get_int, _get_str
+from utils import get_base_dir, get_hosts_path, get_latest_experiment_dir, _get, _get_str
+
+# クライアントコンテナ終了待ちの最大秒数。experiment_stop受信後もThread 5
+# （非同期評価）の完了待ちでThread 4のログrename（.log -> _final.log）が
+# 最大87秒程度（実測のmodel.generate()所要時間）遅れることがあるため、
+# それより十分長い余裕を持たせる
+_CONTAINER_EXIT_TIMEOUT_SECONDS = 180
+_CONTAINER_EXIT_POLL_INTERVAL_SECONDS = 3
 
 BASE_DIR = get_base_dir()
 
-
-# 実験ディレクトリ名の取得（.experiment_meta.json を優先）
-def _load_experiment_dir_name() -> str:
-    """実験ディレクトリ名を .experiment_meta.json から読み込み、なければ生成する。"""
-    meta_path = BASE_DIR / "results" / ".experiment_meta.json"
-    if meta_path.exists():
-        try:
-            with open(meta_path) as f:
-                meta = json.load(f)
-            name = meta.get("dir_name")
-            if name:
-                return name
-        except (json.JSONDecodeError, Exception):
-            pass
-
-    exp_name = _get("experiment", "experiment_name", "default")
-    timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
-    return f"{exp_name}_{timestamp}"
-
+# collect_logs.py は管理サーバー上で実行される想定であり、server.py が実験開始時に
+# results/ 直下へ一度だけ作成した実験ディレクトリ（{experiment_name}_{timestamp}）が
+# ここから見えるはず。存在しなければ実験が一度も開始していないため回収できない
+_experiment_dir = get_latest_experiment_dir()
+if _experiment_dir is None:
+    print(
+        "[collect_logs] No experiment directory found under results/. "
+        "`mise run start` で実験が開始されていることを確認してください。",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 SSH_USER = _get_str("deployment", "ssh_user")
 DEPLOY_DIR = os.path.expanduser(_get_str("deployment", "deploy_dir"))
-EXPERIMENT_DIR_NAME = _load_experiment_dir_name()
-COLLECT_DIR = BASE_DIR / "results" / EXPERIMENT_DIR_NAME
-COLLECT_DIR.mkdir(parents=True, exist_ok=True)
-
-# 管理サーバー上の実験ディレクトリ名（collect_logs.py 上で管理）
-SERVER_EXPERIMENT_DIR_NAME = EXPERIMENT_DIR_NAME
+EXPERIMENT_DIR_NAME = _experiment_dir.name
+COLLECT_DIR = _experiment_dir
 
 # 管理サーバー上かローカルかでSSH接続方法を変える
 import socket
@@ -70,6 +63,30 @@ def load_hosts() -> list[str]:
     return ips
 
 
+def _wait_for_client_container_exit(ip: str, peer_id: int, jump_flag: str) -> bool:
+    """クライアントコンテナ（wafl-peft-client-{peer_id}）が終了するまで待つ。
+
+    experiment_stop受信直後はThread 4がまだログをmetrics_peer_X.logから
+    metrics_peer_X_final.logへrenameし終えていない可能性があり、この状態で
+    回収すると前回実験の古い_final.logをそのまま取得してしまう
+    （実機テストで実際に発生し、2回の実験結果が同一データになった）。
+    コンテナ自体の終了（プロセス終了）をもって、ログ書き出しが完了した
+    signalとして扱う。
+    """
+    container_name = f"wafl-peft-client-{peer_id}"
+    deadline = time.time() + _CONTAINER_EXIT_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        check = subprocess.run(
+            f"ssh -o StrictHostKeyChecking=no {jump_flag}{SSH_USER}@{ip} "
+            f"\"docker ps --format '{{{{.Names}}}}' | grep -qx {container_name} && echo running || echo stopped\"",
+            shell=True, capture_output=True, text=True,
+        )
+        if check.stdout.strip() == "stopped":
+            return True
+        time.sleep(_CONTAINER_EXIT_POLL_INTERVAL_SECONDS)
+    return False
+
+
 def collect_from_device(ip: str, peer_id: int) -> str:
     """1デバイスからログと重みをrsyncで回収。
 
@@ -83,6 +100,12 @@ def collect_from_device(ip: str, peer_id: int) -> str:
 
     # SSHオプション（管理サーバー上かローカルかで動的）
     jump_flag = f"-J {SSH_USER}@{_get_str('server', 'server_host')} " if _JUMP else ""
+
+    if not _wait_for_client_container_exit(ip, peer_id, jump_flag):
+        return (
+            f"FAILED logs (peer={peer_id}): container wafl-peft-client-{peer_id} "
+            f"still running after {_CONTAINER_EXIT_TIMEOUT_SECONDS}s wait, skipping collection"
+        )
 
     # ログファイル回収（rsyncでコンテンツのみ同期）
     cmd_logs = (
@@ -105,26 +128,15 @@ def collect_from_device(ip: str, peer_id: int) -> str:
     return f"OK (peer={peer_id}, ip={ip})"
 
 
-def save_experiment_meta() -> None:
-    """実験ディレクトリ名をメタファイルへ保存。"""
-    meta_path = BASE_DIR / "results" / ".experiment_meta.json"
-    meta_path.write_text(json.dumps({"dir_name": EXPERIMENT_DIR_NAME}))
-
-
 def main() -> None:
     """メインエントリポイント。"""
     print("[collect_logs] Starting log collection...")
-
-    # EXPERIMENT_DIR_NAME をメタファイルへ保存。setup_data.py 実行済みなら
-    # 既存ファイルと同じ内容を書き戻すだけだが、setup_data.py を経ずに
-    # deploy/start した場合はここで初めて確定するフォールバック名を
-    # analyze.py などの後続スクリプトが読めるようにする
-    save_experiment_meta()
+    print(f"[collect_logs] Experiment directory: {EXPERIMENT_DIR_NAME}")
 
     hosts = load_hosts()
     print(f"[collect_logs] Target devices: {len(hosts)}")
 
-    max_workers = 10
+    max_workers = len(hosts)  # hosts.txtのノード数だけ並列実行
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {

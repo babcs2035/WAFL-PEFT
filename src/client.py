@@ -1,18 +1,37 @@
 #!/usr/bin/env python3
 """WAFL-PEFT学習デバイスクライアント。
 
-5スレッド並列アーキテクチャ:
+4スレッド並列アーキテクチャ:
   Thread 1: 管理サーバー交信リスナー（制御プレーン）
   Thread 2: P2P生TCP交換・マージ層（データプレーン）
   Thread 3: LoRA訓練ループ（計算プレーン）
   Thread 4: 非同期ディスク書き出し層（ロギングプレーン）
-  Thread 5: 非同期評価スレッド（評価プレーン）。train/testスコア計算
-            （model.generate()、実測で数十秒かかる）をThread 3から分離し、
-            訓練ループを長時間ブロックしないようにする
+
+train/testの評価（accuracy算出）は実験中は一切行わない。各クライアントは実験中は
+訓練・P2Pマージ・チェックポイント保存に専念する（学習中モデルはgradient_checkpointing
+によりuse_cache=Falseのため、model.generate()を使う評価を行うとGPU/GILを長時間
+占有し訓練ループを巻き込むストールを引き起こすことが実機テストで確認されたため）。
+実験中の収束傾向は管理サーバー（server.pyのGlobalEvalスレッド）がマージモデルの
+みを一定間隔で評価して監視する。
+
+実験終了（experiment_stop受信・全訓練スレッド停止）後、このクライアントは自分の
+GPU上で自分のチェックポイント履歴を評価し（run_post_experiment_evaluation）、
+結果をメトリクスログへ記録した上で、管理サーバーへ完了を通知する
+（notify_server_evaluation_complete）。訓練が既に止まっているためGPU/GILの
+競合を気にする必要がなく、5台が並列に実行するため1台分の評価時間で
+全ノードの収束曲線が得られる。
 
 メトリクスは訓練ループ内でキューへputし、ロガスレッドが非同期にファイルへ書き出す。
-各ステップで loss, throughput をログ出力し、train/test スコアは非同期評価スレッドが
-別途 "eval" タイプのレコードとしてログ出力する。
+各ステップで loss, throughput をログ出力する。
+
+ログのprefixは "[HH:MM:SS][Peer {peer_id}][<スレッド識別子>]" の形式で、
+実時刻とどのスレッドの出力かを一目で判別できるようにする（本アプリケーションは
+実時間ベースで実験終了を判定するため、ログ上でも実時刻を追えることが重要）。
+  [Main]        : メインスレッド（モデル・データ初期化，起動/終了ログ）
+  [T1:Listener] : Thread 1（管理サーバー交信リスナー）
+  [T2:P2P]      : Thread 2（P2P重み交換・マージ）
+  [T3:Train]    : Thread 3（LoRA訓練ループ）
+  [T4:Logger]   : Thread 4（非同期ディスク書き出し）
 """
 
 import json
@@ -54,6 +73,11 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 WEIGHT_DIR = LOG_DIR / "weights"
 WEIGHT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _now() -> str:
+    """現在時刻をHH:MM:SS形式で返す（ログの実時刻prefix用）。"""
+    return time.strftime("%H:%M:%S")
 
 
 def _eta_str(seconds: float) -> str:
@@ -99,26 +123,31 @@ def set_deterministic_seed(peer_id: int) -> int:
 
 
 class SharedState:
-    """5スレッド間で共有される状態。
+    """4スレッド間で共有される状態。
 
-    - peer_whitelist: Thread 1が更新、Thread 2が参照
-    - peer_whitelist_expiry: Thread 1が更新、Thread 2が参照（peer_idごとの接続失効時刻）
+    - peer_whitelist: Thread 1が更新、Thread 2が参照。現在接触中のpeer_idの集合。
+      サーバーからstart/endイベントを受信するたびに増減する（remaining_timeに
+      基づく自動失効の仕組みは廃止し、接触の終了は必ずサーバーからの明示的な
+      endイベントで制御される）
     - shadow_weights: Thread 2・Thread 3の双方が読み取り専用で参照するCPU上のコピー。
-      実体の更新は常にThread 3が行う（Thread 2はマージ計算のみでmodelには触れない）
+      実体の更新は常にThread 3が行う（Thread 2はマージ計算のみでmodelには触れない）。
+      管理サーバーのGlobalEvalスレッドがSSH+rsyncで収集するのもこのディスク上の
+      チェックポイント（Thread 3が定期保存する重み）であり、評価はクライアント側では
+      一切行わない
     - merge_queue: Thread 2がマージ済み重みを書き込み、Thread 3がステップ境界で消費して
       model本体に反映する（Thread 2がmodel.load_state_dict()を直接呼ぶと、Thread 3の
       forward/backward/optimizer.stepの実行中にパラメータが書き換わるデータ競合が
       発生するため、反映は必ずThread 3側で行う）
-    - eval_request_queue: Thread 3が評価すべきstep番号を書き込み、Thread 5が消費して
-      train/testスコアを計算する（model.generate()は数十秒かかることがあり、
-      Thread 3内で直列に行うと訓練が長時間完全停止するストールを引き起こすため、
-      評価専用スレッドに分離した）
-    - metrics_queue: Thread 3・Thread 5が書き込み、Thread 4が消費（キュー満杯時はブロック）
+    - metrics_queue: Thread 3が書き込み、Thread 4が消費（キュー満杯時はブロック）
+    - checkpoint_elapsed: Thread 3がチェックポイント保存時に書き込む
+      {step: elapsed_time} の対応表。実験終了後にmain()（訓練スレッド join 後、
+      他スレッドと並行実行されない）が読み取り、実験後評価の結果を元の
+      経過時間軸に正しく紐づけるために使う（Thread 3は既に終了しているため
+      ロック不要）
     """
 
     def __init__(self) -> None:
-        self.peer_whitelist: dict[int, float] = {}
-        self.peer_whitelist_expiry: dict[int, float] = {}
+        self.peer_whitelist: set[int] = set()
         self.whitelist_lock = threading.Lock()
 
         self.shadow_weights: dict[str, torch.Tensor] | None = None
@@ -126,31 +155,20 @@ class SharedState:
 
         self.merge_queue: queue.Queue[dict[str, torch.Tensor]] = queue.Queue(maxsize=32)
 
-        # maxsize=1: evaluate_batch()は約87秒かかり、eval_freq間隔（実測で
-        # 数十秒程度）より遅くなりうる。複数積むと古い評価要求のために
-        # Thread 5が延々と処理を続け、実験終了後もいつまでも終わらなくなる
-        # ため、常に最新のステップだけを評価対象として保持する
-        self.eval_request_queue: queue.Queue[int] = queue.Queue(maxsize=1)
-
         self.metrics_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8192)
+
+        self.checkpoint_elapsed: dict[int, float] = {}
 
         self.step_lock = threading.Lock()
         self.current_step: int = 0
 
         self.experiment_running = threading.Event()
         self.experiment_start_time: float = 0.0
+        self.experiment_duration: float = 0.0
         self.elapsed_time: float = 0.0
 
         # サーバーへのReady送信を同期
         self.ready_to_send = threading.Event()
-
-        # Thread 5（非同期評価）が完全に終了したことをThread 4へ伝える。
-        # Thread 4は「runningがFalse かつ metrics_queueが空」だけで自発的に
-        # シャットダウンする経路を持つため、running=False になった直後に
-        # 評価処理中でキューが一時的に空のタイミングを迎えると、Thread 5が
-        # 後から送るeval結果を誰も受信しなくなる（実機テストで実際に発生した）。
-        # これを防ぐため、Thread 5が完全に終わるまではシャットダウンを待たせる。
-        self.eval_thread_done = threading.Event()
 
         self.running = True
 
@@ -200,9 +218,9 @@ def initialize_model() -> tuple[Any, Any]:
     local_model_path = BASE_DIR / "cache" / "models" / model_path_parts[0] / model_path_parts[1]
 
     if local_model_path.exists() and (local_model_path / "config.json").exists():
-        print(f"[Peer {PEER_ID}]   Using local model from {local_model_path}", flush=True)
+        print(f"[{_now()}][Peer {PEER_ID}][Main]   Using local model from {local_model_path}", flush=True)
     else:
-        print(f"[Peer {PEER_ID}]   Local model not found, downloading from {model_id}...", flush=True)
+        print(f"[{_now()}][Peer {PEER_ID}][Main]   Local model not found, downloading from {model_id}...", flush=True)
         sys.stdout.flush()
 
     # GPU が存在する場合は 4-bit QLoRA (NF4) でモデルを量子化してロードする。
@@ -218,11 +236,11 @@ def initialize_model() -> tuple[Any, Any]:
         )
         _device_map = "auto"
         _quantization_config = bnb_config
-        print(f"[Peer {PEER_ID}]   Using 4-bit NF4 quantization (QLoRA)", flush=True)
+        print(f"[{_now()}][Peer {PEER_ID}][Main]   Using 4-bit NF4 quantization (QLoRA)", flush=True)
     else:
         _device_map = "cpu"
         _quantization_config = None
-        print(f"[Peer {PEER_ID}]   No GPU found, loading in float16 on CPU", flush=True)
+        print(f"[{_now()}][Peer {PEER_ID}][Main]   No GPU found, loading in float16 on CPU", flush=True)
 
     model = AutoModelForCausalLM.from_pretrained(
         str(local_model_path) if local_model_path.exists() else model_id,
@@ -231,7 +249,7 @@ def initialize_model() -> tuple[Any, Any]:
         quantization_config=_quantization_config,
         trust_remote_code=True,
     )
-    print(f"[Peer {PEER_ID}]   Model weights loaded, device={next(model.parameters()).device}", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main]   Model weights loaded, device={next(model.parameters()).device}", flush=True)
     sys.stdout.flush()
 
     lora_config = LoraConfig(
@@ -243,7 +261,7 @@ def initialize_model() -> tuple[Any, Any]:
         task_type="CAUSAL_LM",
     )
 
-    print(f"[Peer {PEER_ID}]   Applying LoRA (rank={_get_int('training', 'lora_rank')}, alpha={_get_int('training', 'lora_alpha')})...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main]   Applying LoRA (rank={_get_int('training', 'lora_rank')}, alpha={_get_int('training', 'lora_alpha')})...", flush=True)
     sys.stdout.flush()
     # 4-bit 量子化モデルでは学習前の準備（ベースモデル凍結・gradient checkpointing）が必須。
     if _quantization_config is not None:
@@ -273,14 +291,14 @@ def initialize_model() -> tuple[Any, Any]:
             else:
                 torch.nn.init.kaiming_uniform_(new_data, a=math.sqrt(5))
             setattr(module, pname, torch.nn.Parameter(new_data, requires_grad=param.requires_grad))
-    print(f"[Peer {PEER_ID}]   LoRA applied, target_device={_fallback_device}", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main]   LoRA applied, target_device={_fallback_device}", flush=True)
 
-    print(f"[Peer {PEER_ID}]   Loading tokenizer...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main]   Loading tokenizer...", flush=True)
     sys.stdout.flush()
     tokenizer = AutoTokenizer.from_pretrained(
         str(local_model_path) if local_model_path.exists() else model_id,
     )
-    print(f"[Peer {PEER_ID}]   Tokenizer loaded", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main]   Tokenizer loaded", flush=True)
     sys.stdout.flush()
 
     return model, tokenizer
@@ -301,19 +319,34 @@ def tokenize_dataset(
     tokenizer: Any,
     max_seq_len: int,
 ) -> list[dict[str, torch.Tensor]]:
-    """データセットをトークン化し、入力・ラベルペアに変換。"""
+    """データセットをトークン化し、入力・ラベルペアに変換。
+
+    Question部分のラベルは-100（ignore_index）でマスクし、損失計算から
+    除外する。Question全体をラベルに含めたまま学習すると、モデルが
+    「質問文の再構成」という無関係なタスクにも学習容量を割いてしまい、
+    本来の目的である「Answer部分の生成」の学習効率が下がる（実機テストで
+    accuracyが向上/低下を繰り返すだけで着実な収束が見られなかった一因）。
+    """
     tokenized: list[dict[str, torch.Tensor]] = []
     for item in dataset:
-        text = f"Question: {item['question']}\nAnswer: {item['answer']}"
+        prompt = f"Question: {item['question']}\nAnswer:"
+        full_text = f"{prompt} {item['answer']}"
+
+        prompt_ids = tokenizer(prompt, truncation=False)["input_ids"]
         tokens = tokenizer(
-            text,
+            full_text,
             truncation=True,
             max_length=max_seq_len,
             padding=False,
         )
-        if len(tokens["input_ids"]) > 1:
-            input_ids = torch.tensor(tokens["input_ids"], dtype=torch.long)
+        full_ids = tokens["input_ids"]
+        if len(full_ids) > 1:
+            input_ids = torch.tensor(full_ids, dtype=torch.long)
             labels = input_ids.clone()
+            # promptがtruncationで欠けている場合に備え、full_idsの長さを超えない
+            # 範囲でマスクする（トークナイザーの結合時の境界ズレにも安全）
+            prompt_len = min(len(prompt_ids), len(full_ids))
+            labels[:prompt_len] = -100
             tokenized.append({"input_ids": input_ids, "labels": labels})
     return tokenized
 
@@ -365,28 +398,28 @@ def server_listener_thread(state: SharedState, model: Any) -> None:
     接続時にpeer_idを登録し、以降は1秒周期のシグナルを待受。
     切断された場合は自動再接続する。
     """
-    print(f"[Peer {PEER_ID}] Thread 1 (Server Listener) started. Connecting to {SERVER_HOST}:{SERVER_PORT}...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Thread 1 (Server Listener) started. Connecting to {SERVER_HOST}:{SERVER_PORT}...", flush=True)
 
     while state.running:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(2.0)
-                print(f"[Peer {PEER_ID}]   Connecting to server...", flush=True)
+                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Connecting to server...", flush=True)
                 s.connect((SERVER_HOST, SERVER_PORT))
-                print(f"[Peer {PEER_ID}]   Connected to server", flush=True)
+                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Connected to server", flush=True)
 
                 # ペアID登録
                 if not _send_json(s, {"type": "register", "peer_id": PEER_ID}):
-                    print(f"[Peer {PEER_ID}]   Failed to send registration, retrying...", flush=True)
+                    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Failed to send registration, retrying...", flush=True)
                     time.sleep(1.0)
                     continue
-                print(f"[Peer {PEER_ID}]   Registration sent (peer_id={PEER_ID})", flush=True)
+                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Registration sent (peer_id={PEER_ID})", flush=True)
 
                 # モデルロード完了を待ってReadyを送信
-                print(f"[Peer {PEER_ID}]   Waiting for model load to complete (timeout=60s)...", flush=True)
+                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Waiting for model load to complete (timeout=60s)...", flush=True)
                 state.ready_to_send.wait(timeout=60.0)
                 _send_json(s, {"type": "ready", "peer_id": PEER_ID})
-                print(f"[Peer {PEER_ID}]   Ready signal sent. Waiting for signals...", flush=True)
+                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener]   Ready signal sent. Waiting for signals...", flush=True)
 
                 while state.running:
                     # サーバーは全peerがreadyになるまでsignalを一切送信しないため
@@ -403,69 +436,75 @@ def server_listener_thread(state: SharedState, model: Any) -> None:
                     msg_type = data.get("type")
 
                     if msg_type == "signal":
-                        # ホワイトリスト更新
-                        peers_data = data.get("peers", {})
-                        new_whitelist: dict[int, float] = {}
-                        if str(PEER_ID) in peers_data:
-                            allowed = peers_data[str(PEER_ID)].get("allowed_peers", [])
-                            for entry in allowed:
-                                pid = entry["peer_id"]
-                                rt = entry["remaining_time"]
-                                new_whitelist[pid] = rt
+                        # サーバーから配信された，未配信のstart/endイベントを処理する。
+                        # 自分のpeer_idが関わるイベントのみホワイトリストへ反映する
+                        events = data.get("events", [])
                         now = time.time()
+                        changed_events: list[dict[str, Any]] = []
+
                         with state.whitelist_lock:
-                            whitelist_changed = new_whitelist != state.peer_whitelist
-                            # remaining_time が前回受信時と異なるpeerのみ、新しい接触の
-                            # 開始とみなして失効時刻を再計算する。サーバーは同一の接触
-                            # イベントを1秒周期で繰り返し送信するため、値が同じ間は既存の
-                            # 失効時刻を保持しないと、受信するたびに期限が延び続けてしまう
-                            for pid, rt in new_whitelist.items():
-                                if state.peer_whitelist.get(pid) != rt:
-                                    state.peer_whitelist_expiry[pid] = now + rt
-                            for pid in list(state.peer_whitelist_expiry.keys()):
-                                if pid not in new_whitelist:
-                                    del state.peer_whitelist_expiry[pid]
-                            state.peer_whitelist = new_whitelist
+                            for event in events:
+                                peers = event.get("peers", [])
+                                if len(peers) != 2:
+                                    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Malformed event (peers must have 2 elements): {event}", flush=True)
+                                    continue
+                                if PEER_ID not in peers:
+                                    continue
+                                other_pid = peers[0] if peers[1] == PEER_ID else peers[1]
+                                event_type = event.get("event")
+                                if event_type == "start":
+                                    state.peer_whitelist.add(other_pid)
+                                elif event_type == "end":
+                                    state.peer_whitelist.discard(other_pid)
+                                else:
+                                    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Unknown event type, ignored: {event}", flush=True)
+                                    continue
+                                changed_events.append({"event": event_type, "other_peer_id": other_pid})
+                            current_whitelist_snapshot = sorted(state.peer_whitelist)
 
                         # 接触イベントのタイムスタンプ付きログ（contact_pattern.jsonとの
-                        # 実時刻整合性を事後検証できるように、変化があった時のみ記録する）
-                        if whitelist_changed:
+                        # 実時刻整合性を事後検証できるように，開始・終了それぞれを個別に記録する）
+                        if changed_events:
                             contact_elapsed = (
                                 now - state.experiment_start_time
                                 if state.experiment_start_time
                                 else 0.0
                             )
-                            contact_event = {
-                                "type": "contact_event",
-                                "peer_id": PEER_ID,
-                                "elapsed": contact_elapsed,
-                                "allowed_peers": sorted(new_whitelist.keys()),
-                            }
-                            try:
-                                state.metrics_queue.put(contact_event, timeout=1.0)
-                            except queue.Full:
-                                pass
+                            for changed in changed_events:
+                                contact_event = {
+                                    "type": "contact_event",
+                                    "event": changed["event"],
+                                    "peer_id": PEER_ID,
+                                    "other_peer_id": changed["other_peer_id"],
+                                    "elapsed": contact_elapsed,
+                                    "allowed_peers": current_whitelist_snapshot,
+                                }
+                                try:
+                                    state.metrics_queue.put(contact_event, timeout=1.0)
+                                except queue.Full:
+                                    pass
 
                     elif msg_type == "experiment_start":
                         state.experiment_start_time = time.time()
+                        state.experiment_duration = float(data.get("duration", 0.0))
                         state.experiment_running.set()
                         print(
-                            f"[Peer {PEER_ID}] Experiment STARTED. "
+                            f"[{_now()}][Peer {PEER_ID}][T1:Listener] Experiment STARTED. "
                             f"Duration: {data.get('duration')}s",
                             flush=True
                         )
 
                     elif msg_type == "experiment_stop":
-                        print(f"[Peer {PEER_ID}] Experiment STOPPED.", flush=True)
+                        print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Experiment STOPPED.", flush=True)
                         state.running = False
                         break
 
         except (OSError, ConnectionError) as e:
             if state.running:
-                print(f"[Peer {PEER_ID}] Server connection lost ({e}). Reconnecting in 1s...", flush=True)
+                print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Server connection lost ({e}). Reconnecting in 1s...", flush=True)
                 time.sleep(1.0)
 
-    print(f"[Peer {PEER_ID}] Thread 1 (Server Listener) stopped")
+    print(f"[{_now()}][Peer {PEER_ID}][T1:Listener] Thread 1 (Server Listener) stopped")
 
 
 # ============================================================
@@ -525,14 +564,14 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
     """P2P重み交換スレッド。
 
     - ホワイトリストを監視し、接続可能なpeerへ積極的に接続
-    - 失効した（remaining_time経過後の）peerとの接続は切断し、時変トポロジーの
-      ローテーションを実際に反映する
+    - サーバーからendイベントを受信し除外されたpeerとの接続は切断し、
+      時変トポロジーのローテーションを実際に反映する
     - シャドウコピーを読み出して送信
     - 受信データを一時バッファへ格納し、マージ計算のみを行う
     - マージ結果はmerge_queueに渡すだけで、model本体には触れない
       （実際の反映はThread 3がステップ境界で行う。C1/C2参照）
     """
-    print(f"[Peer {PEER_ID}] Thread 2 (P2P Exchange) started")
+    print(f"[{_now()}][Peer {PEER_ID}][T2:P2P] Thread 2 (P2P Exchange) started")
 
     # peer_id -> IP マッピング
     host_map = resolve_hosts()
@@ -638,35 +677,21 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
 
     last_merge_step: int = -1
 
-    # 期限切れとして既に切断・ログ出力済みのpid集合（Thread 2内でのみ保持する）。
-    # state.peer_whitelist / state.peer_whitelist_expiry はThread 1が「前回受信した
-    # remaining_time値」を判定するための唯一の書き込み者であり、Thread 2側から
-    # popして書き換えると、Thread 1が「値が消えた＝新しい接触」と誤認して
-    # 同じ接触のexpiryを再計算し続け、数秒おきに切断・再接続を無限に繰り返す
-    # 不具合になる（実機テストで実際に発生した）。Thread 2は読み取り専用に徹し、
-    # 「今どのpidが期限切れか」はこのローカル集合で自前管理する。
-    disconnected_expired: set[int] = set()
+    # 前回周回時点でのホワイトリスト（新たに切断すべきpidを検出するための比較用）
+    prev_whitelist: set[int] = set()
 
     while state.running:
-        # ホワイトリストと失効時刻を取得（読み取り専用）
-        now = time.time()
+        # ホワイトリストを取得（読み取り専用）
         with state.whitelist_lock:
-            raw_whitelist = dict(state.peer_whitelist)
-            expiry = dict(state.peer_whitelist_expiry)
+            whitelist = set(state.peer_whitelist)
 
-        # 失効した（remaining_time経過後の）peerを有効なホワイトリストから除外し、
-        # 既存の接続も切断する。これにより時変トポロジーのローテーションが
+        # ホワイトリストから外れた（サーバーから明示的にendイベントを受信した）
+        # peerを検出し、ログを出す。これにより時変トポロジーのローテーションが
         # 実際の接続状態に反映される
-        expired_pids = {pid for pid in raw_whitelist if now >= expiry.get(pid, float("inf"))}
-        newly_expired = expired_pids - disconnected_expired
-        for pid in newly_expired:
-            _close_peer_connections(pid)
-            print(f"[Peer {PEER_ID}] Contact with peer {pid} expired. Disconnected.", flush=True)
-        # 新たに検出したexpired pidを追跡対象へ追加し、
-        # 再接続可能になった（whitelistから消えた、または値の更新でexpiryが
-        # 未来に更新された）pidは追跡対象から外す
-        disconnected_expired = (disconnected_expired | newly_expired) & expired_pids
-        whitelist = {pid: rt for pid, rt in raw_whitelist.items() if pid not in expired_pids}
+        newly_removed = prev_whitelist - whitelist
+        for pid in newly_removed:
+            print(f"[{_now()}][Peer {PEER_ID}][T2:P2P] Contact with peer {pid} ended.", flush=True)
+        prev_whitelist = whitelist
 
         # ホワイトリストから外れた（サーバー側で明示的に除外された）peerとの
         # 既存接続も切断する
@@ -691,7 +716,7 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                 conn.settimeout(5.0)
                 # peer_idからIPを取得（hosts.txt）
                 if pid not in host_map:
-                    print(f"[Peer {PEER_ID}]   Skipping peer {pid}: not in hosts.txt", flush=True)
+                    print(f"[{_now()}][Peer {PEER_ID}][T2:P2P]   Skipping peer {pid}: not in hosts.txt", flush=True)
                     continue
                 peer_ip = host_map[pid]
                 conn.connect((peer_ip, P2P_PORT))
@@ -705,7 +730,7 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                 conn.sendall(pid_msg)
                 with conn_lock:
                     active_connections[pid] = conn
-                print(f"[Peer {PEER_ID}] P2P connected to peer {pid} ({peer_ip})")
+                print(f"[{_now()}][Peer {PEER_ID}][T2:P2P] P2P connected to peer {pid} ({peer_ip})")
             except OSError:
                 pass
 
@@ -730,9 +755,17 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
         # 受信バッファのマージ（訓練イテレーションの境界で実行）
         # ここではCPU上のテンソルを平均化するだけで、model・shadow_weightsには
         # 一切触れない。反映はThread 3がステップ境界で安全に行う
+        #
+        # ホワイトリスト外peerの重みを除外する: accept_incomingは受信専用スレッドで
+        # あり、ホワイトリスト外peerからの接続もいったん受理してバッファへ積む
+        # （除外に伴う切断は本ループのstale_pids処理が次周回で行うため）。
+        # 切断より先にこのマージ処理が走る競合が起きると、ホワイトリスト外の
+        # 重みが平均マージに混入しうるため、ここで明示的にwhitelistでフィルタする
         if current_step != last_merge_step and current_step > 0:
             with receive_lock:
-                buffers_to_merge = dict(receive_buffers)
+                buffers_to_merge = {
+                    pid: bufs for pid, bufs in receive_buffers.items() if pid in whitelist
+                }
                 receive_buffers.clear()
 
             if buffers_to_merge:
@@ -763,12 +796,12 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                         state.merge_queue.put(merged, timeout=1.0)
                         last_merge_step = current_step
                         print(
-                            f"[Peer {PEER_ID}] Queued merged weights from {count} peers "
+                            f"[{_now()}][Peer {PEER_ID}][T2:P2P] Queued merged weights from {count} peers "
                             f"at step {current_step}"
                         )
                     except queue.Full:
                         print(
-                            f"[Peer {PEER_ID}] merge_queue full, dropping merge "
+                            f"[{_now()}][Peer {PEER_ID}][T2:P2P] merge_queue full, dropping merge "
                             f"at step {current_step}",
                             flush=True,
                         )
@@ -785,104 +818,7 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
         except OSError:
             pass
 
-    print(f"[Peer {PEER_ID}] Thread 2 (P2P Exchange) stopped")
-
-
-# ============================================================
-# 簡易評価（train/test スコア）
-# ============================================================
-
-
-def evaluate_batch(
-    model: Any,
-    tokenizer: Any,
-    samples: list[dict[str, str]],
-    max_seq_len: int,
-    max_eval_samples: int = 5,
-) -> float:
-    """簡易accuracy評価（GSM8K形式のquestion/answer）。
-
-    返値: accuracy（%）
-    """
-    correct = 0
-    total = min(len(samples), max_eval_samples)
-    for item in samples[:total]:
-        text = f"Question: {item['question']}\nAnswer:"
-        tokens = tokenizer(text, return_tensors="pt").to(model.device)
-
-        with torch.no_grad():
-            generated = model.generate(
-                **tokens,
-                max_new_tokens=64,
-                do_sample=False,
-                temperature=1.0,
-            )
-
-        generated_text = tokenizer.decode(generated[0], skip_special_tokens=True)
-        expected_answer = item["answer"].split("#### ")[-1].strip()
-        if expected_answer in generated_text:
-            correct += 1
-
-    return (correct / total * 100) if total > 0 else 0.0
-
-
-# ============================================================
-# Thread 5: 非同期評価スレッド（評価プレーン）
-# ============================================================
-
-
-def async_eval_thread(
-    state: SharedState,
-    model: Any,
-    tokenizer: Any,
-    train_samples: list[dict[str, str]],
-    test_samples: list[dict[str, str]],
-) -> None:
-    """train/testスコアを非同期に評価するスレッド。
-
-    evaluate_batch()内のmodel.generate()はGPU計算を要し、実機テストでは
-    train/test合計10サンプルの評価に約87秒かかることが確認された。
-    Training Loop Thread（Thread 3）内で直列に実行すると、その間訓練が
-    完全に停止するストールを引き起こすため、専用スレッドに分離し、
-    訓練と並行して評価を進める。model・tokenizerはThread 3と共有するため
-    厳密に同期していないパラメータで評価することになるが、進捗モニタリング
-    目的の評価であり、多少のタイミングのずれは許容する。
-    """
-    print(f"[Peer {PEER_ID}] Thread 5 (Async Evaluator) started", flush=True)
-    max_seq_len = _get_int("training", "max_seq_len")
-
-    while state.running or not state.eval_request_queue.empty():
-        try:
-            step = state.eval_request_queue.get(timeout=1.0)
-        except queue.Empty:
-            continue
-
-        train_score = evaluate_batch(model, tokenizer, train_samples, max_seq_len)
-        test_score = evaluate_batch(model, tokenizer, test_samples, max_seq_len)
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        eval_metric = {
-            "type": "eval",
-            "peer_id": PEER_ID,
-            "step": step,
-            "elapsed": state.elapsed_time,
-            "train_score": train_score,
-            "test_score": test_score,
-        }
-        try:
-            state.metrics_queue.put(eval_metric, timeout=1.0)
-        except queue.Full:
-            pass
-        print(
-            f"[Peer {PEER_ID}] Async eval at step {step}: "
-            f"train={train_score:.1f}%, test={test_score:.1f}%",
-            flush=True,
-        )
-
-    state.eval_thread_done.set()
-    print(f"[Peer {PEER_ID}] Thread 5 (Async Evaluator) stopped")
+    print(f"[{_now()}][Peer {PEER_ID}][T2:P2P] Thread 2 (P2P Exchange) stopped")
 
 
 # ============================================================
@@ -900,11 +836,11 @@ def training_loop_thread(
     1バッチごとに順伝播・逆伝播・.optimizer.step()を実行。
     通信スレッドによるマージはイテレーションの境界で受け入れる。
     各ステップでメトリクスをキュー経由でロガスレッドへ送信。
-    train/testスコアの評価はThread 5（非同期評価スレッド）へ依頼するのみで、
-    このスレッド自体は行わない（evaluate_batchは重く、直列実行はストールの
-    原因になるため）。
+    train/testの評価（accuracy算出）はクライアント側では一切行わない。
+    このスレッドは一定間隔でLoRA重みをチェックポイントとして保存するのみで、
+    評価は管理サーバー（server.pyのGlobalEvalスレッド）が専用GPUで行う。
     """
-    print(f"[Peer {PEER_ID}] Thread 3 (Training Loop) started", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Thread 3 (Training Loop) started", flush=True)
 
     # LoRA パラメータを named_parameters() 経由で収集する。
     # state_dict() はディスクオフロードモデルで全重みをロードしてしまう可能性があるが、
@@ -915,12 +851,12 @@ def training_loop_thread(
         if "lora" in name.lower()
     }
     lora_keys = list(lora_param_dict.keys())
-    print(f"[Peer {PEER_ID}]   Cloning {len(lora_keys)} LoRA weight tensors to CPU...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][T3:Train]   Cloning {len(lora_keys)} LoRA weight tensors to CPU...", flush=True)
     with state.weights_lock:
         state.shadow_weights = {
             k: lora_param_dict[k].detach().cpu().clone() for k in lora_keys
         }
-    print(f"[Peer {PEER_ID}] Model loaded, shadow weights ready (LoRA keys: {len(lora_keys)})")
+    print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Model loaded, shadow weights ready (LoRA keys: {len(lora_keys)})")
     state.ready_to_send.set()
 
     # GPU 環境では LoRA パラメータがある device に inputs を置く。
@@ -929,7 +865,7 @@ def training_loop_thread(
         (p.device for p in model.parameters() if p.requires_grad and p.device.type != "meta"),
         torch.device("cpu"),
     )
-    print(f"[Peer {PEER_ID}]   Training device: {_train_device}", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][T3:Train]   Training device: {_train_device}", flush=True)
 
     optimizer = AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -937,14 +873,41 @@ def training_loop_thread(
         weight_decay=0.01,
     )
 
+    # 勾配累積: micro-batch=1 のまま grad_accum_steps 回だけ勾配を貯めてから1回
+    # optimizer.step() する。RTX 3060(12GB)+巨大vocab(262144)では真のバッチ拡大が
+    # logits テンソル([B,T,V])のメモリでOOMするため、メモリ安全なまま実効バッチを
+    # 拡大して勾配を平滑化する（単一サンプルの極めてノイジーな勾配が学習効率を
+    # 下げていた）
+    grad_accum_steps = max(1, _get_int("training", "grad_accum_steps", 1))
+    # LR warmup: optimizer ステップ単位で線形に warmup した後は定数。step0 から
+    # 定数LRだと初期が不安定なため、序盤を緩やかに立ち上げる
+    warmup_steps = max(0, _get_int("training", "lr_warmup_steps", 0))
+
+    def _lr_lambda(opt_step: int) -> float:
+        if warmup_steps > 0 and opt_step < warmup_steps:
+            return (opt_step + 1) / warmup_steps
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+    optimizer.zero_grad()
+
+    # データ走査順序。逐次巡回（step % len）だと毎エポック同じ順序で同じデータを
+    # 見て過学習を助長するため、エポック（全データ1周）ごとにシャッフルする
+    data_order = list(range(len(train_data)))
+    random.shuffle(data_order)
+    order_pos = 0
+
     # メトリクスは全ステップをログ出力。チェックポイント（LoRA全重み保存）は
-    # train/testスコア評価と同じ間隔でのみ保存する（毎ステップ保存すると長時間・
-    # 大規模実験でディスクを圧迫するため）
-    eval_freq = max(1, _get_int("training", "num_training_steps") // 10)
-    checkpoint_freq = eval_freq
+    # eval_interval_seconds間隔でのみ保存する（毎ステップ保存すると長時間・
+    # 大規模実験でディスクを圧迫するため）。実験終了は学習ステップ数の上限では
+    # なくサーバーからのexperiment_stopシグナル（contact_pattern.jsonの
+    # タイムラインに基づく時間ベース制御）でのみ判定するため、保存の間隔も
+    # 経過時間ベースで揃える
+    eval_interval_seconds = _get_float("training", "eval_interval_seconds", 60.0)
+    last_eval_time = 0.0
     step = 0
+    accum_count = 0  # 勾配累積カウンタ。grad_accum_stepsに達したら更新を1回行う
     total_tokens = 0
-    start_wait = time.time()
 
     while state.running:
         if not state.experiment_running.is_set():
@@ -953,75 +916,99 @@ def training_loop_thread(
 
         step_start_time = time.time()
 
-        print(f"[Peer {PEER_ID}] Training step {step} (train_data len={len(train_data)})", flush=True)
+        print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Training step {step} (train_data len={len(train_data)})", flush=True)
 
         # 経過時間を更新
         state.elapsed_time = time.time() - state.experiment_start_time
 
-        # データローディング（inputs を LoRA device へ）
-        idx = step % len(train_data)
+        # データローディング（inputs を LoRA device へ）。エポック（全データ1周）
+        # ごとにシャッフルした data_order を走査し、末尾に達したら再シャッフルする
+        if order_pos >= len(data_order):
+            random.shuffle(data_order)
+            order_pos = 0
+        idx = data_order[order_pos]
+        order_pos += 1
         batch = train_data[idx]
         input_ids = batch["input_ids"].unsqueeze(0).to(_train_device)
         labels = batch["labels"].unsqueeze(0).to(_train_device)
 
-        # フォワードパス（ここから optimizer.step() 完了までを「純計算時間」として計測する。
-        # EmbRace の Computation Stall 指標に倣い、この区間外（マージ反映・GPU解放・
-        # 評価など）にかかった時間を stall_duration として分離し、通信・マージ処理が
-        # 計算をブロックしていないことを事後検証できるようにする）
+        # フォワード・バックワード（ここから純計算時間を計測。この区間外＝マージ反映・
+        # GPU解放・shadow更新などにかかった時間を stall_duration として分離し、
+        # 通信・マージ処理が計算をブロックしていないことを事後検証できるようにする）。
+        # 勾配累積のため loss を grad_accum_steps で割ってから backward し、
+        # grad_accum_steps 回ぶんの勾配が .grad に加算される
         compute_start_time = time.time()
-        optimizer.zero_grad()
         outputs = model(input_ids=input_ids, labels=labels)
         loss = outputs.loss
         total_tokens += int(input_ids.numel())
 
-        # バックワードパス
-        loss.backward()
+        (loss / grad_accum_steps).backward()
 
-        # optimizerステップ
+        accum_count += 1
+        do_optim_step = accum_count % grad_accum_steps == 0
+
         with state.step_lock:
             state.current_step = step + 1
             current_step_for_merge = step + 1
 
-        optimizer.step()
+        # 累積境界でのみパラメータを更新する。累積途中で optimizer.step() や
+        # P2Pマージ反映を行うとパラメータが書き換わり、加算中の勾配と不整合になる
+        if do_optim_step:
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
         compute_duration = time.time() - compute_start_time
 
-        # P2Pマージ結果の反映。Thread 2はマージ計算のみ行いmerge_queueに積む
-        # だけなので、model本体への書き込みは常にここ（Thread 3、かつ
-        # forward/backward/optimizer.stepが完了した安全なタイミング）でのみ行う。
-        # これにより計算中にパラメータが書き換わるデータ競合を構造的に防ぐ
-        try:
-            merged_weights = state.merge_queue.get_nowait()
-        except queue.Empty:
-            merged_weights = None
-
-        if merged_weights is not None:
-            with torch.no_grad():
-                for name, param in model.named_parameters():
-                    if name in merged_weights:
-                        param.copy_(merged_weights[name].to(param.dtype).to(param.device))
-
-        # GPUメモリ解放（断片化防止。evaluate_batch後の解放と合わせて重要）
+        # GPUメモリ解放（断片化防止）は毎micro-stepで行う。巨大vocab(262144)の
+        # backward は一時的に数百MiBのスパイクを要し、PyTorchのキャッシュアロケータは
+        # empty_cache()を呼ばないと解放済みブロックをGPUへ返さないため、累積境界
+        # （8ステップ毎）だけの解放ではreservedが膨らみ、次のスパイクで空きが枯渇して
+        # OOMする（実機で4/5ノードが「303MiB free / 320MiB要求」でクラッシュした）。
+        # gc.collect()はPython側の循環参照回収で、毎ステップ呼んでも実測で
+        # スループットに影響しないことをbaselineで確認済み
         import gc
         gc.collect()
         torch.cuda.empty_cache()
 
-        # シャドウコピー更新（named_parameters 経由で LoRA のみ更新）
-        with state.weights_lock:
-            if state.shadow_weights is not None:
-                for name, param in model.named_parameters():
-                    if name in state.shadow_weights:
-                        state.shadow_weights[name].copy_(param.detach().cpu())
+        # P2Pマージ結果の反映と shadow_weights 更新は、パラメータが実際に変化した
+        # 累積境界でのみ行う。Thread 2はマージ計算のみ行いmerge_queueに積むだけなので、
+        # model本体への書き込みは常にここ（Thread 3、かつ optimizer.step() が完了した
+        # 安全なタイミング）でのみ行い、計算中のデータ競合を構造的に防ぐ
+        if do_optim_step:
+            try:
+                merged_weights = state.merge_queue.get_nowait()
+            except queue.Empty:
+                merged_weights = None
 
-        # メトリクス計算
+            if merged_weights is not None:
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if name in merged_weights:
+                            param.copy_(merged_weights[name].to(param.dtype).to(param.device))
+
+            # シャドウコピー更新（named_parameters 経由で LoRA のみ更新）。
+            # Thread 2 が P2P 送信するのはこの shadow なので、パラメータ更新後に反映する
+            with state.weights_lock:
+                if state.shadow_weights is not None:
+                    for name, param in model.named_parameters():
+                        if name in state.shadow_weights:
+                            state.shadow_weights[name].copy_(param.detach().cpu())
+
+        # メトリクス計算。ログには未スケールの loss を用いる（backward には
+        # grad_accum_steps で割った値を渡しているが、監視指標としては元の損失が自然）
         loss_value = loss.item()
         step_duration = time.time() - step_start_time
         # stall_duration: ステップ全体からforward/backward/optimizer.stepの
         # 純計算時間を除いた残り（マージ反映・GPU解放・評価などのオーバーヘッド）。
         # 通信・マージが計算をブロックしていないかを事後検証するための指標
         stall_duration = max(0.0, step_duration - compute_duration)
-        tokens_per_sec = (
-            total_tokens / (time.time() - start_wait) if time.time() > start_wait else 0
-        )
+        # このステップのトークン数 / このステップの所要時間（瞬間スループット）。
+        # 旧実装は total_tokens（累積）/ 訓練開始からの累積経過時間 だったため、
+        # 通信起因のストールの有無に関わらず、累積平均が定義上下から漸近的に
+        # 立ち上がる（実測で経過時間との相関係数0.95という結果になり、真の
+        # ストールフリー性とは無関係な見かけ上の上昇トレンドを生んでいた）
+        step_tokens = int(input_ids.numel())
+        tokens_per_sec = step_tokens / step_duration if step_duration > 0 else 0.0
         state.elapsed_time = time.time() - state.experiment_start_time
 
         # GPU使用率（SM utilization %）。CPU環境やNVML未対応環境では取得できない
@@ -1033,38 +1020,27 @@ def training_loop_thread(
             except Exception:
                 gpu_util_percent = None
 
-        # 平均ステップ時間と残り推定
-        max_steps = _get_int("training", "num_training_steps", 10000)
-        avg_step_sec = state.elapsed_time / current_step_for_merge if current_step_for_merge > 0 else 0
-        remaining_steps = max_steps - current_step_for_merge
-        eta_sec = avg_step_sec * remaining_steps
-
-        eta_str = _eta_str(eta_sec)
+        # 実験全体の残り時間（サーバーから通知されたdurationベース）。
+        # ステップ数の上限を設けないため、「残りステップ数」ではなく
+        # 「残り時間」で進捗を見積もる
+        remaining_time = max(0.0, state.experiment_duration - state.elapsed_time)
         print(
-            f"[Peer {PEER_ID}] Step {current_step_for_merge}: "
+            f"[{_now()}][Peer {PEER_ID}][T3:Train] Step {current_step_for_merge}: "
             f"loss={loss_value:.4f}, tok/s={tokens_per_sec:.1f}, "
             f"step={step_duration:.1f}s, elapsed={state.elapsed_time:.0f}s "
             f"({_eta_str(state.elapsed_time)}), "
-            f"ETA={eta_str} ({remaining_steps}steps left)",
+            f"remaining={_eta_str(remaining_time)}",
             flush=True,
         )
 
-        # 定期的にtrain/testスコアの評価をリクエストする。評価自体（model.generate()）は
-        # 数十秒かかることがあり、ここで直列に実行すると訓練が長時間完全停止する
-        # ストールを引き起こすことが実機テストで確認されたため、Thread 5（非同期評価
-        # スレッド）へ依頼するだけにとどめる。結果は別途"eval"タイプのレコードとして
-        # 記録されるため、ここでは常にtrain_score=test_score=0.0を記録する
-        if current_step_for_merge % eval_freq == 0 and current_step_for_merge > 0:
-            # キュー（maxsize=1）が満杯なら、Thread 5がまだ古い要求を処理中
-            # ということ。古い要求を待たず、常に最新のステップを優先する
-            try:
-                state.eval_request_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                state.eval_request_queue.put_nowait(current_step_for_merge)
-            except queue.Full:
-                pass
+        # 一定時間間隔でチェックポイントを保存する。実験中の評価（accuracy算出）は
+        # クライアント側では行わない。保存したチェックポイントは、実験中は管理サーバーの
+        # GlobalEvalスレッドがSSH+rsyncで収集してマージモデルを評価するのに使われ、
+        # 実験終了後は各クライアント自身が run_post_experiment_evaluation で
+        # 自分の履歴を評価するのに使われる
+        should_checkpoint = state.elapsed_time - last_eval_time >= eval_interval_seconds
+        if should_checkpoint:
+            last_eval_time = state.elapsed_time
 
         metric = {
             "type": "metric",
@@ -1078,17 +1054,14 @@ def training_loop_thread(
             "compute_duration": compute_duration,
             "stall_duration": stall_duration,
             "gpu_util_percent": gpu_util_percent,
-            "train_score": 0.0,
-            "test_score": 0.0,
         }
         try:
             state.metrics_queue.put(metric, timeout=1.0)
         except queue.Full:
             pass
 
-        # チェックポイント保存（checkpoint_freq間隔 + 最終ステップ）
-        is_last_step = current_step_for_merge >= max_steps
-        if current_step_for_merge > 0 and (current_step_for_merge % checkpoint_freq == 0 or is_last_step):
+        # チェックポイント保存（eval_interval_seconds間隔）
+        if should_checkpoint:
             ckpt_metric = {**metric, "type": "checkpoint"}
             try:
                 state.metrics_queue.put(ckpt_metric, timeout=1.0)
@@ -1100,8 +1073,9 @@ def training_loop_thread(
             with state.weights_lock:
                 if state.shadow_weights is not None:
                     torch.save(state.shadow_weights, str(ckpt_path))
+            state.checkpoint_elapsed[current_step_for_merge] = state.elapsed_time
             print(
-                f"[Peer {PEER_ID}] Step {current_step_for_merge}: "
+                f"[{_now()}][Peer {PEER_ID}][T3:Train] Step {current_step_for_merge}: "
                 f"loss={loss_value:.4f}, tok/s={tokens_per_sec:.1f}, "
                 f"elapsed={state.elapsed_time:.0f}s, "
                 f"saved {ckpt_path}", flush=True
@@ -1109,14 +1083,19 @@ def training_loop_thread(
 
         step += 1
 
-        # 訓練ステップ数制限
-        max_steps = _get_int("training", "num_training_steps", 10000)
-        if step >= max_steps:
-            print(f"[Peer {PEER_ID}] Reached max steps ({max_steps}). Stopping.", flush=True)
-            state.running = False
-            break
+    # ループはサーバーからのexperiment_stopシグナル（state.running=False）でのみ
+    # 終了する。時間ベース制御では「最終ステップ」が事前に定まらないため、
+    # 実験終了時点のシャドウ重みを最終チェックポイントとして明示的に残す
+    # （analyze.pyの収束性能評価が最新の学習状態を参照できるようにするため）
+    if step > 0:
+        with state.weights_lock:
+            if state.shadow_weights is not None:
+                final_ckpt_path = WEIGHT_DIR / f"weights_step_{step:06d}.pt"
+                torch.save(state.shadow_weights, str(final_ckpt_path))
+        state.checkpoint_elapsed[step] = state.elapsed_time
+        print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Final checkpoint saved at step {step}", flush=True)
 
-    print(f"[Peer {PEER_ID}] Thread 3 (Training Loop) stopped")
+    print(f"[{_now()}][Peer {PEER_ID}][T3:Train] Thread 3 (Training Loop) stopped")
 
 
 # ============================================================
@@ -1127,31 +1106,29 @@ def training_loop_thread(
 def async_logging_thread(state: SharedState) -> None:
     """キュー経由でメトリクスとチェックポイントを非同期にディスクへ書き出し。
 
-    SHUTDOWN シグネル（None）を受信するまでキューから読み取り、
-    実験終了後は残りのメトリクスを全てフラッシュしてから終了する。
+    SHUTDOWN シグネル（None）を受信するまでキューから読み取り続ける。
+    state.running が False になった時点では自発的にシャットダウンしない
+    （training_loop_threadの終了直後にstate.runningはFalseになるが、その後
+    main()がrun_post_experiment_evaluation()を実行し、実験後評価の結果を
+    metrics_queueへ積む。ここで早期にシャットダウンすると、その結果を
+    誰も受信できずログに書き出されないまま失われる。実際にこの不具合が
+    発生し、実験後評価の結果が0件になる事象が確認された）。
+    main()はrun_post_experiment_evaluation()完了後、全プロデューサーが
+    仕事を終えたことを確認したうえで明示的にNoneを送るため、シャットダウンの
+    判定はこのシグネル受信のみに委ねてよい。
     """
-    print(f"[Peer {PEER_ID}] Thread 4 (Async Logger) started")
+    print(f"[{_now()}][Peer {PEER_ID}][T4:Logger] Thread 4 (Async Logger) started")
 
     metric_log_path = LOG_DIR / f"metrics_peer_{PEER_ID}.log"
     metric_log_path.write_text("")
 
     received_count = 0
     while True:
-        try:
-            metric = state.metrics_queue.get(timeout=1.0)
-        except queue.Empty:
-            # 実験終了 + Thread 5（評価）も完全終了 + キュー空 → シャットダウン。
-            # Thread 5の完了を待たずにrunning=Falseだけで判定すると、Thread 5が
-            # まだ評価処理中（最大87秒）でキューが一時的に空になった瞬間に
-            # 早期シャットダウンしてしまい、後から届くeval結果を誰も受信
-            # できなくなる（実機テストで実際に発生し、eval結果が0件になった）
-            if not state.running and state.eval_thread_done.is_set() and state.metrics_queue.empty():
-                print(f"[Peer {PEER_ID}] Logger: shutting down (received={received_count})", flush=True)
-                break
-            continue
+        metric = state.metrics_queue.get()
 
         # SHUTDOWN シグネル
         if metric is None:
+            print(f"[{_now()}][Peer {PEER_ID}][T4:Logger] Logger: shutting down (received={received_count})", flush=True)
             break
 
         # メトリクスをログファイルへ追記
@@ -1160,14 +1137,15 @@ def async_logging_thread(state: SharedState) -> None:
                 f.write(json.dumps(metric, default=str) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+            received_count += 1
 
             if metric.get("type") == "checkpoint":
                 print(
-                    f"[Peer {PEER_ID}] Logger: checkpoint saved at step "
+                    f"[{_now()}][Peer {PEER_ID}][T4:Logger] Logger: checkpoint saved at step "
                     f"{metric.get('step')} (loss={metric.get('loss'):.4f})"
                 )
         except OSError as e:
-            print(f"[Peer {PEER_ID}] Logger error: {e}", file=sys.stderr)
+            print(f"[{_now()}][Peer {PEER_ID}][T4:Logger] Logger error: {e}", file=sys.stderr)
 
     # 最終フラッシュ
     final_log_path = LOG_DIR / f"metrics_peer_{PEER_ID}_final.log"
@@ -1176,7 +1154,116 @@ def async_logging_thread(state: SharedState) -> None:
     except OSError:
         pass
 
-    print(f"[Peer {PEER_ID}] Thread 4 (Async Logger) stopped")
+    print(f"[{_now()}][Peer {PEER_ID}][T4:Logger] Thread 4 (Async Logger) stopped")
+
+
+# ============================================================
+# 実験後評価（訓練終了後、自分のGPUで自分のチェックポイント履歴を評価）
+# ============================================================
+
+# 評価に用いるGSM8K検証サンプル数。settings.jsonのglobal_eval.sample_limitと
+# 揃え、管理サーバーが実験中に評価するマージモデルのaccuracyと比較可能にする
+_POST_EVAL_SAMPLE_LIMIT = 20
+# 評価するチェックポイント数の上限（全期間から均等サンプリング）。
+# 全チェックポイントを評価すると時間がかかりすぎるため上限を設ける
+_POST_EVAL_MAX_CHECKPOINTS = 8
+
+
+def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: Any) -> None:
+    """実験終了後、自分のチェックポイント履歴を自分のGPUで評価する。
+
+    実験中はThread 3（訓練ループ）がGPUを占有しているため評価を行わないが、
+    training_loop_threadの終了後はGPUが空くため、ここで自分の学習経過を
+    振り返り評価する。5台の学習デバイスがそれぞれ自分のGPU上で並列に実行する
+    ため、管理サーバーが1GPUで全ノードを逐次評価する場合と異なり、ノード数に
+    比例した評価時間の増加が起きない。
+
+    結果はThread 4がすでに停止しているためmetrics_queueに積んでも書き出されない。
+    ここではメトリクスログへの直接追記ではなく、metrics_queueへ投入したうえで
+    main()側がThread 4のシャットダウン前にこの関数を呼ぶことで、既存のログ
+    書き出し・回収（collect_logs.py）・分析（analyze.py）の仕組みにそのまま乗せる。
+    """
+    import gsm8k_eval
+
+    print(f"[{_now()}][Peer {PEER_ID}][Main] Starting post-experiment evaluation...", flush=True)
+
+    # 訓練中はgradient_checkpointingによりuse_cache=Falseだったが、評価では
+    # もうbackward passを行わないため、KVキャッシュを有効化して生成を高速化する
+    model.gradient_checkpointing_disable()
+    model.config.use_cache = True
+    model.eval()
+
+    val_data = gsm8k_eval.load_gsm8k_val_data(BASE_DIR, sample_limit=_POST_EVAL_SAMPLE_LIMIT)
+    if not val_data:
+        print(f"[{_now()}][Peer {PEER_ID}][Main] GSM8K validation data not available. Skipping post-experiment evaluation.", flush=True)
+        return
+
+    all_steps = sorted(
+        int(f.stem.replace("weights_step_", ""))
+        for f in WEIGHT_DIR.glob("weights_step_*.pt")
+    )
+    if not all_steps:
+        print(f"[{_now()}][Peer {PEER_ID}][Main] No checkpoints found. Skipping post-experiment evaluation.", flush=True)
+        return
+
+    if len(all_steps) > _POST_EVAL_MAX_CHECKPOINTS:
+        idx = [
+            round(i * (len(all_steps) - 1) / (_POST_EVAL_MAX_CHECKPOINTS - 1))
+            for i in range(_POST_EVAL_MAX_CHECKPOINTS)
+        ]
+        eval_steps = [all_steps[i] for i in sorted(set(idx))]
+    else:
+        eval_steps = all_steps
+
+    print(
+        f"[{_now()}][Peer {PEER_ID}][Main] Evaluating {len(eval_steps)}/{len(all_steps)} "
+        f"checkpoints (samples={_POST_EVAL_SAMPLE_LIMIT})...", flush=True,
+    )
+
+    for step in eval_steps:
+        ckpt_path = WEIGHT_DIR / f"weights_step_{step:06d}.pt"
+        try:
+            weights = torch.load(ckpt_path, weights_only=True, map_location="cpu")
+        except (EOFError, RuntimeError) as e:
+            print(f"[{_now()}][Peer {PEER_ID}][Main]   Step {step}: failed to load checkpoint ({e}), skipping", flush=True)
+            continue
+
+        model.load_state_dict(weights, strict=False)
+        accuracy = gsm8k_eval.score_generations(model, tokenizer, val_data, max_new_tokens=256)
+        elapsed = state.checkpoint_elapsed.get(step, 0.0)
+        print(
+            f"[{_now()}][Peer {PEER_ID}][Main]   Step {step} (elapsed={elapsed:.0f}s): "
+            f"accuracy = {accuracy:.1f}%", flush=True,
+        )
+
+        eval_metric = {
+            "type": "eval", "peer_id": PEER_ID, "step": step,
+            "elapsed": elapsed, "accuracy": accuracy,
+        }
+        try:
+            state.metrics_queue.put(eval_metric, timeout=5.0)
+        except queue.Full:
+            pass
+        torch.cuda.empty_cache()
+
+    print(f"[{_now()}][Peer {PEER_ID}][Main] Post-experiment evaluation complete.", flush=True)
+
+
+def notify_server_evaluation_complete() -> None:
+    """実験後評価が完了したことを管理サーバーへ通知する。
+
+    Thread 1（サーバー交信リスナー）はexperiment_stop受信後に接続を閉じて
+    終了しているため、ここでは新規に短命なTCP接続を開いて通知のみ送る。
+    管理サーバーはこれを受けて、全デバイスの実験・評価完了を検出・ログ出力する。
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(10.0)
+            s.connect((SERVER_HOST, SERVER_PORT))
+            _send_json(s, {"type": "evaluation_complete", "peer_id": PEER_ID})
+        print(f"[{_now()}][Peer {PEER_ID}][Main] Notified server of evaluation completion.", flush=True)
+    except OSError as e:
+        print(f"[{_now()}][Peer {PEER_ID}][Main] Failed to notify server of evaluation completion: {e}", flush=True)
 
 
 # ============================================================
@@ -1198,7 +1285,7 @@ def _thread_wrapper(state: SharedState, target: Any, args: tuple) -> None:
     try:
         target(*args)
     except Exception:
-        print(f"[Peer {PEER_ID}] FATAL: thread '{target.__name__}' crashed:", flush=True)
+        print(f"[{_now()}][Peer {PEER_ID}] FATAL: thread '{target.__name__}' crashed:", flush=True)
         traceback.print_exc()
         state.running = False
         os._exit(1)
@@ -1211,13 +1298,20 @@ def main() -> None:
     PEER_ID = int(os.environ.get("PEER_ID", "0"))
 
     print(f"=" * 60, flush=True)
-    print(f"[Peer {PEER_ID}] WAFL-PEFT Client Starting", flush=True)
-    print(f"[Peer {PEER_ID}] PEER_ID={PEER_ID}", flush=True)
-    print(f"[Peer {PEER_ID}] Model ID: {_get('model', 'model_id')}", flush=True)
-    print(f"[Peer {PEER_ID}] Server: {SERVER_HOST}:{SERVER_PORT}", flush=True)
-    print(f"[Peer {PEER_ID}] P2P Port: {P2P_PORT}", flush=True)
-    print(f"[Peer {PEER_ID}] Batch Size: {_get_int('training', 'batch_size')}", flush=True)
-    print(f"[Peer {PEER_ID}] Max Steps: {_get_int('training', 'num_training_steps', 10000)}", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] WAFL-PEFT Client Starting", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] PEER_ID={PEER_ID}", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] Model ID: {_get('model', 'model_id')}", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] Server: {SERVER_HOST}:{SERVER_PORT}", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] P2P Port: {P2P_PORT}", flush=True)
+    print(
+        f"[{_now()}][Peer {PEER_ID}][Main] Micro-batch: {_get_int('training', 'batch_size')}, "
+        f"grad_accum_steps: {_get_int('training', 'grad_accum_steps', 1)} "
+        f"(effective batch = {_get_int('training', 'batch_size') * _get_int('training', 'grad_accum_steps', 1)}), "
+        f"lr: {_get_float('training', 'learning_rate')}, warmup_steps: {_get_int('training', 'lr_warmup_steps', 0)}",
+        flush=True,
+    )
+    print(f"[{_now()}][Peer {PEER_ID}][Main] Eval/Checkpoint Interval: {_get_float('training', 'eval_interval_seconds', 60.0)}s", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] Stop condition: server experiment_stop signal (time-based, no step limit)", flush=True)
     print(f"=" * 60, flush=True)
     sys.stdout.flush()
 
@@ -1227,7 +1321,7 @@ def main() -> None:
     # ログ回収・分析のたびに不要な大容量データを転送することになる
     old_ckpts = list(WEIGHT_DIR.glob("weights_step_*.pt"))
     if old_ckpts:
-        print(f"[Peer {PEER_ID}] Clearing {len(old_ckpts)} checkpoint(s) from previous run...", flush=True)
+        print(f"[{_now()}][Peer {PEER_ID}][Main] Clearing {len(old_ckpts)} checkpoint(s) from previous run...", flush=True)
         for ckpt in old_ckpts:
             ckpt.unlink(missing_ok=True)
 
@@ -1243,55 +1337,37 @@ def main() -> None:
         if f.name not in (f"metrics_peer_{PEER_ID}.log", f"metrics_peer_{PEER_ID}_final.log")
     ]
     if stale_logs:
-        print(f"[Peer {PEER_ID}] Clearing {len(stale_logs)} stale log(s) from other peer_id(s)...", flush=True)
+        print(f"[{_now()}][Peer {PEER_ID}][Main] Clearing {len(stale_logs)} stale log(s) from other peer_id(s)...", flush=True)
         for stale_log in stale_logs:
             stale_log.unlink(missing_ok=True)
 
     # 決定論的シード設定（モデル初期化・データローディング順序の再現性のため、
     # モデルロードより前に行う必要がある）
     seed = set_deterministic_seed(PEER_ID)
-    print(f"[Peer {PEER_ID}] Deterministic seed set: {seed} (data.seed + PEER_ID)", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] Deterministic seed set: {seed} (data.seed + PEER_ID)", flush=True)
 
     # モデル・データセットの初期化
     model_id = _get("model", "model_id")
     max_seq_len = _get_int("training", "max_seq_len")
-    print(f"[Peer {PEER_ID}] [1/3] Loading model from {model_id}...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] [1/3] Loading model from {model_id}...", flush=True)
     sys.stdout.flush()
     model, tokenizer = initialize_model()
-    print(f"[Peer {PEER_ID}] [1/3] Model loaded successfully", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] [1/3] Model loaded successfully", flush=True)
     sys.stdout.flush()
 
-    print(f"[Peer {PEER_ID}] [2/3] Loading dataset...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] [2/3] Loading dataset...", flush=True)
     sys.stdout.flush()
     raw_dataset = load_sharded_dataset(PEER_ID)
-    print(f"[Peer {PEER_ID}] [2/3] Dataset loaded: {len(raw_dataset)} raw samples", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] [2/3] Dataset loaded: {len(raw_dataset)} raw samples", flush=True)
     sys.stdout.flush()
 
-    print(f"[Peer {PEER_ID}] [2/3] Tokenizing {len(raw_dataset)} samples (max_seq_len={max_seq_len})...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] [2/3] Tokenizing {len(raw_dataset)} samples (max_seq_len={max_seq_len})...", flush=True)
     sys.stdout.flush()
     train_data = tokenize_dataset(raw_dataset, tokenizer, max_seq_len)
-    print(f"[Peer {PEER_ID}] [2/3] Tokenized {len(train_data)} training samples (filtered: {len(raw_dataset) - len(train_data)} dropped)", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] [2/3] Tokenized {len(train_data)} training samples (filtered: {len(raw_dataset) - len(train_data)} dropped)", flush=True)
     sys.stdout.flush()
 
-    # 訓練サンプルを辞書形式に変換（評価用）
-    train_samples: list[dict[str, str]] = [
-        {"question": item["question"], "answer": item["answer"]}
-        for item in raw_dataset
-    ]
-
-    # テストデータセット読み込み（評価用）
-    test_file = BASE_DIR / "data" / "test" / f"peer_{PEER_ID}.json"
-    if test_file.exists():
-        with open(test_file) as f:
-            test_data = json.load(f)
-        test_samples = test_data.get("samples", [])
-        print(f"[Peer {PEER_ID}] [3/3] Test samples loaded: {len(test_samples)}")
-    else:
-        test_samples = []
-        print(f"[Peer {PEER_ID}] [3/3] No test file found, evaluation skipped")
-    sys.stdout.flush()
-
-    print(f"[Peer {PEER_ID}] [4/4] Initializing shared state and threads...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] [3/3] Initializing shared state and threads...", flush=True)
     sys.stdout.flush()
 
     # 共有状態
@@ -1323,33 +1399,27 @@ def main() -> None:
     )
     training_thread.start()
 
-    # Thread 5（非同期評価）を起動
-    eval_thread = threading.Thread(
-        target=_thread_wrapper,
-        args=(state, async_eval_thread, (state, model, tokenizer, train_samples, test_samples)),
-        daemon=True,
-    )
-    eval_thread.start()
-
     # 全スレッドの終了を待機
-    print(f"[Peer {PEER_ID}] All threads started. Waiting for experiment...", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] All threads started. Waiting for experiment...", flush=True)
     sys.stdout.flush()
     for t in [listener_thread, p2p_thread, training_thread]:
         t.join()
 
-    # Thread 5はstate.runningがFalseになった後もeval_request_queueが空になるまで
-    # 動き続けてmetrics_queueへ書き込むため、Thread 4へのシャットダウン通知より
-    # 必ず先に完了を待つ（先にシャットダウンすると評価結果がファイルに書かれない）
-    eval_thread.join()
+    # 実験終了後、自分のGPUで自分のチェックポイント履歴を評価する。
+    # training_threadがすでにjoin済みでGPUを解放しているため、ここで安全に
+    # モデルを再利用できる。結果はThread 4がまだ動いているうちにmetrics_queueへ
+    # 積む必要があるため、シャットダウンシグナルより必ず先に実行する
+    run_post_experiment_evaluation(state, model, tokenizer)
+    notify_server_evaluation_complete()
 
-    # logger へシャットダウンシグナル（None = SHUTDOWN）
-    try:
-        state.metrics_queue.put_nowait(None)
-    except queue.Full:
-        pass
+    # logger へシャットダウンシグナル（None = SHUTDOWN）。Thread 4はこのシグネル
+    # のみでシャットダウンするため、put_nowait()がqueue.Fullで失敗して
+    # シグネルを取りこぼすとThread 4が永久にブロックする。ブロッキングputで
+    # 確実に届ける
+    state.metrics_queue.put(None, timeout=30.0)
     logger_thread.join()
 
-    print(f"[Peer {PEER_ID}] All threads stopped. Client exiting.", flush=True)
+    print(f"[{_now()}][Peer {PEER_ID}][Main] All threads stopped. Client exiting.", flush=True)
     sys.stdout.flush()
 
 

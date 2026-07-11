@@ -4,8 +4,6 @@
 """
 
 import json
-import os
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,19 +70,21 @@ def get_experiment_name() -> str:
     return _get_str("experiment", "experiment_name", "default")
 
 
-def get_experiment_dir() -> Path:
-    """実験固有の results ディレクトリを返す。
+def get_latest_experiment_dir() -> Path | None:
+    """results/ 下で最後に作成された実験ディレクトリを返す（なければ None）。
 
-    EXPERIMENT_DIR 環境変数が設定されていればそれを優先し、
-    なければ results/ 下に "{experiment_name}_{timestamp}" を生成する。
+    実験ディレクトリ名（"{experiment_name}_{timestamp}"）は server.py が
+    全クライアントのready確認後・実験開始時に一度だけ生成し、その場で
+    results/ 直下に空ディレクトリとして作成する（唯一のタイムスタンプ発行元）。
+    そのため、最終更新時刻が最も新しいディレクトリが直近の実験に対応する。
     """
-    exp_dir = os.environ.get("EXPERIMENT_DIR")
-    if exp_dir:
-        return Path(exp_dir)
-
-    exp_name = get_experiment_name()
-    timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
-    return get_base_dir() / "results" / f"{exp_name}_{timestamp}"
+    results_dir = get_base_dir() / "results"
+    if not results_dir.exists():
+        return None
+    candidates = [d for d in results_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda d: d.stat().st_mtime)
 
 
 def get_data_dir() -> Path:

@@ -3,12 +3,14 @@
     "model_id": "google/gemma-4-E2B"
   },
   "training": {
-    "learning_rate": 5e-5,
+    "learning_rate": 2e-4,
     "batch_size": 1,
+    "grad_accum_steps": 8,
+    "lr_warmup_steps": 20,
     "max_seq_len": 256,
     "lora_rank": 16,
     "lora_alpha": 32,
-    "num_training_steps": 200
+    "eval_interval_seconds": 60
   },
   "data": {
     "validation_split": 0.1,
@@ -28,6 +30,11 @@
     "deploy_dir": "/home/denjo/workspace/ktakahashi/WAFL-PEFT"
   },
   "experiment": {
-    "experiment_name": "default"
+    "experiment_name": "default",
+    "contact_pattern_file": "rwp_n05_a0500_r100_p10_s42.json"
+  },
+  "global_eval": {
+    "interval_seconds": 120,
+    "sample_limit": 20
   }
 }

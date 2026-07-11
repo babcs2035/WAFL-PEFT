@@ -11,40 +11,19 @@ Phase 3: 各デバイスが管理サーバーのレジストリからSSHトン�
 という重複が生じていた。デプロイ（配布）と実験実行（起動）を明確に分離する。
 """
 
-import json
 import os
 import socket
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from log import dot, fail, info, ok, phase, skip, summary
-from utils import get_base_dir, get_experiment_dir, get_hosts_path, _get, _get_int, _get_str
+from utils import get_base_dir, get_hosts_path, _get, _get_int, _get_str
 
 BASE_DIR = get_base_dir()
 DEPLOY_DIR = os.path.expanduser(_get_str("deployment", "deploy_dir"))
 SERVER_HOST = _get_str("server", "server_host")
-
-
-# 実験ディレクトリ名の取得（setup_data.py の .experiment_meta.json を優先参照）
-def _load_experiment_dir_name() -> str:
-    """実験ディレクトリ名を .experiment_meta.json から読み込み、なければ生成する。"""
-    meta_path = BASE_DIR / "results" / ".experiment_meta.json"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            meta = json.load(f)
-        name = meta.get("dir_name")
-        if name:
-            return name
-    # fallback: 自前で生成
-    exp_name = _get("experiment", "experiment_name", "default")
-    timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
-    return f"{exp_name}_{timestamp}"
-
-
-EXPERIMENT_DIR_NAME = _load_experiment_dir_name()
-EXPERIMENT_DIR_REMOTE = f"{DEPLOY_DIR}/results/{EXPERIMENT_DIR_NAME}"
 
 SSH_USER = _get_str("deployment", "ssh_user")
 REGISTRY_PORT = 5000
@@ -196,10 +175,16 @@ def rsync_to_device(ip: str, peer_id: int) -> str:
 
     各 rsync 操作で --info=progress2 により進捗バーが表示される。
     """
-    remote_path = f"{SSH_USER}@{ip}:{DEPLOY_DIR}"
+    # モデルキャッシュの転送先はHuggingFaceキャッシュ形式（org/name）でネストするため、
+    # 事前にその中間ディレクトリまでmkdirしておく必要がある（rsyncの末尾スラッシュ構文は
+    # 転送先の親ディレクトリを自動生成しないため、なければ "mkdir failed: No such file
+    # or directory" で転送自体が失敗する）
+    model_id = _get("model", "model_id", "google/gemma-4-E2B")
+    model_path_parts = model_id.split("/")
+    model_cache_dir = f"{DEPLOY_DIR}/cache/models/{model_path_parts[0]}"
 
     # リモートディレクトリ作成
-    result = _peer_ssh(ip, f"export LC_ALL=C; mkdir -p {DEPLOY_DIR}/config {DEPLOY_DIR}/data/train {DEPLOY_DIR}/data/test {DEPLOY_DIR}/logs {DEPLOY_DIR}/cache {DEPLOY_DIR}/results {DEPLOY_DIR}/src")
+    result = _peer_ssh(ip, f"export LC_ALL=C; mkdir -p {DEPLOY_DIR}/config {DEPLOY_DIR}/data/train {DEPLOY_DIR}/data/test {DEPLOY_DIR}/logs {model_cache_dir} {DEPLOY_DIR}/results {DEPLOY_DIR}/src")
     if result.returncode != 0:
         return f"FAILED mkdir (peer={peer_id}, ip={ip})"
 
@@ -232,8 +217,6 @@ def rsync_to_device(ip: str, peer_id: int) -> str:
         return f"FAILED rsync source (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
     # モデルキャッシュ転送（HuggingFaceキャッシュ形式）
-    model_id = _get("model", "model_id", "google/gemma-4-E2B")
-    model_path_parts = model_id.split("/")
     model_src = str(BASE_DIR / "cache" / "models" / model_path_parts[0] / model_path_parts[1])
     model_dst = f"{DEPLOY_DIR}/cache/models/{model_id}/"
     if Path(model_src).exists():
@@ -285,6 +268,16 @@ def pull_docker_image(ip: str, peer_id: int) -> str:
     if ensure_result.returncode != 0 or "docker_fail" in ensure_result.stdout:
         return f"FAILED docker restart (peer={peer_id}, ip={ip}): {ensure_result.stdout.strip()[-500:]}"
     info(f"peer={peer_id} Docker config updated: {ensure_result.stdout.strip()[:200]}")
+
+    # タグなし（dangling）の古いビルド中間イメージをpullの前にpruneしておく。
+    # docker buildは--cache-fromで同じタグを繰り返し上書きするため、古いレイヤーが
+    # タグなしイメージとして蓄積し続け、実機で学習デバイスのディスクが完全に
+    # 枯渇してrsync・docker pullが失敗する障害が実際に発生したため、デプロイの
+    # たびに解消する（-aは付けず、稼働中の他プロジェクトのタグ付きイメージは
+    # 対象外にする）
+    prune_result = _peer_ssh(ip, "docker image prune -f")
+    if prune_result.returncode == 0:
+        info(f"peer={peer_id} Pruned dangling images: {prune_result.stdout.strip()[-200:]}")
 
     # SSHトンネルを張って管理サーバーのregistryへ接続
     tunnel_cmd = (
@@ -358,40 +351,14 @@ def _run_parallel(
 
 
 
-def sync_experiment_meta() -> None:
-    """実験メタファイルを管理サーバーへ同期。
-
-    管理サーバー上で実行時は BASE_DIR == DEPLOY_DIR なので、
-    同じファイルの場合は何もしない。ローカルから rsync する場合は
-    SSH 経由で転送する（StrictHostKeyChecking=no 付き）。
-    """
-    meta_path = BASE_DIR / "results" / ".experiment_meta.json"
-    if not meta_path.exists():
-        return
-
-    target = Path(DEPLOY_DIR) / "results" / ".experiment_meta.json"
-    if meta_path.resolve() == target.resolve():
-        return  # 同じファイル
-
-    subprocess.run(
-        f"rsync -az -e 'ssh -o StrictHostKeyChecking=no' "
-        f"{str(meta_path)} "
-        f"{SSH_USER}@{SERVER_HOST}:{DEPLOY_DIR}/results/.experiment_meta.json",
-        shell=True, check=True,
-    )
-
-
 def main() -> None:
     """メインエントリポイント。"""
     hosts = load_hosts()
     info(f"{len(hosts)} target devices")
 
-    max_workers = 5
+    max_workers = len(hosts)  # hosts.txtのノード数だけ並列実行
 
-    # 実験メタファイルを管理サーバーへ同期
-    info("Syncing experiment metadata to management server...")
-    sync_experiment_meta()
-    info("Metadata synced.")
+    total_fail_count = 0
 
     # Phase 0: Open ufw ports
     phase("Phase 0: Open ufw ports")
@@ -405,12 +372,14 @@ def main() -> None:
         skip(result)
     else:
         fail(result)
+        total_fail_count += 1
 
     results = _run_parallel(open_ufw_on_device, hosts, max_workers, "ufw")
     ok_count = sum(1 for r in results if r is not None and r.startswith("OK"))
     skip_count = sum(1 for r in results if r is not None and (r.startswith("SKIPPED") or r.startswith("SKIP")))
     fail_count = sum(1 for r in results if r is None or (not r.startswith("OK") and not r.startswith("SKIPPED") and not r.startswith("SKIP")))
     summary("Phase 0", ok_count, fail_count, skip_count)
+    total_fail_count += fail_count
 
     # Phase 2: rsync for config and data
     phase("Phase 2: Rsync config and data")
@@ -418,6 +387,7 @@ def main() -> None:
     ok_count = sum(1 for r in results if r is not None and r.startswith("OK"))
     fail_count = sum(1 for r in results if r is None or (not r.startswith("OK")))
     summary("Phase 2", ok_count, fail_count)
+    total_fail_count += fail_count
 
     # Phase 3: Pull Docker image from management server registry
     phase("Phase 3: Pull Docker images from registry")
@@ -425,11 +395,15 @@ def main() -> None:
     ok_count = sum(1 for r in results if r is not None and r.startswith("OK"))
     fail_count = sum(1 for r in results if r is None or (not r.startswith("OK")))
     summary("Phase 3", ok_count, fail_count)
+    total_fail_count += fail_count
 
     # Final summary（コンテナ起動は行わない。mise run start が担当する）
     print()
+    if total_fail_count > 0:
+        fail(f"Distribution finished with {total_fail_count} failure(s) across all phases")
+        info("Fleet state is inconsistent — do not run `mise run start` until failures are resolved")
+        sys.exit(1)
     ok("Distribution complete")
-    info(f"Experiment dir: {EXPERIMENT_DIR_NAME}")
     info("Next: run `mise run start` to launch the server and client containers")
 
 

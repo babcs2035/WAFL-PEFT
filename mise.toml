@@ -15,6 +15,10 @@ hf download "$MODEL_ID" --local-dir "./cache/models/$MODEL_ID"
 description = "GSM8Kデータセットを読み込みNon-IIDシャードとしてdata/train/peer_X.json, data/test/peer_X.jsonに出力"
 run = "uv run python src/setup_data.py"
 
+[tasks."setup:contact-pattern"]
+description = "Random Waypoint Mobilityシミュレーションでdata/contact_pattern/に接触パターンJSONを生成"
+run = "uv run python src/generate_contact_pattern.py"
+
 [tasks."setup:build"]
 description = "Dockerイメージwafl-peft:latestをビルド"
 depends = ["setup:model", "setup:data"]
@@ -49,7 +53,11 @@ rsync -avz --info=progress2 --exclude='.venv' --exclude='.git' --exclude='__pyca
 rsync -az --info=progress2 \
   "cache/models/$MODEL_ID/" \
   "$SSH_USER@$SERVER_HOST:$DEPLOY_DIR/cache/models/$MODEL_ID/" \
-  --rsync-path="mkdir -p $DEPLOY_DIR/cache/models/$(echo $MODEL_ID | cut -d/ -f1) && rsync"
+  --rsync-path="mkdir -p $DEPLOY_DIR/cache/models/$(echo $MODEL_ID | cut -d/ -f1) && rsync" && \
+rsync -az --info=progress2 \
+  "cache/datasets/gsm8k/" \
+  "$SSH_USER@$SERVER_HOST:$DEPLOY_DIR/cache/datasets/gsm8k/" \
+  --rsync-path="mkdir -p $DEPLOY_DIR/cache/datasets/gsm8k && rsync"
 """
 
 [tasks."deploy:registry"]
@@ -99,13 +107,13 @@ run = "uv run python src/clean.py"
 # ============================================================
 
 [tasks."start:server"]
-description = "管理サーバー上でserver.pyをコンテナ起動"
+description = "管理サーバー上でserver.pyをコンテナ起動（グローバルモデル収束性能のリアルタイム評価スレッドを含む）"
 run = """\
 SSH_USER=$(python3 -c "import json; print(json.load(open('config/settings.json'))['deployment']['ssh_user'])")
 SERVER_HOST=$(python3 -c "import json; print(json.load(open('config/settings.json'))['server']['server_host'])")
 DEPLOY_DIR=$(python3 -c "import json; print(json.load(open('config/settings.json'))['deployment']['deploy_dir'])")
 ssh "$SSH_USER@$SERVER_HOST" \
-  "export LC_ALL=C && mkdir -p $DEPLOY_DIR/logs && chown $SSH_USER:$SSH_USER $DEPLOY_DIR/logs && docker rm -f wafl-peft-server 2>/dev/null || true; docker run -d --name wafl-peft-server --net=host -v $DEPLOY_DIR/src:/app/src -v $DEPLOY_DIR/config:/app/config -v $DEPLOY_DIR/data:/app/data -v $DEPLOY_DIR/logs:/app/logs 127.0.0.1:5000/wafl-peft:latest /app/.venv/bin/python src/server.py"
+  "export LC_ALL=C && mkdir -p $DEPLOY_DIR/logs $DEPLOY_DIR/results && chown $SSH_USER:$SSH_USER $DEPLOY_DIR/logs $DEPLOY_DIR/results && docker rm -f wafl-peft-server 2>/dev/null || true; docker run -d --name wafl-peft-server --gpus all --net=host -v /home/$SSH_USER/.ssh:/home/$SSH_USER/.ssh:ro -v $DEPLOY_DIR/src:/app/src -v $DEPLOY_DIR/config:/app/config -v $DEPLOY_DIR/data:/app/data -v $DEPLOY_DIR/cache:/app/cache -v $DEPLOY_DIR/logs:/app/logs -v $DEPLOY_DIR/results:/app/results 127.0.0.1:5000/wafl-peft:latest /app/.venv/bin/python src/server.py"
 """
 
 [tasks."start:clients"]
@@ -119,7 +127,7 @@ ssh "$SSH_USER@$SERVER_HOST" \
 """
 
 [tasks.start]
-description = "管理サーバーと全学習デバイスを起動し、実験を開始"
+description = "管理サーバーと全学習デバイスを起動し、実験を開始（グローバル収束性能のリアルタイム監視を含む）"
 depends = ["start:server", "start:clients"]
 
 # ============================================================
@@ -128,7 +136,25 @@ depends = ["start:server", "start:clients"]
 
 [tasks."analyze:collect"]
 description = "各学習デバイスからメトリクスログとLoRA重みチェックポイントを回収"
-run = "bash scripts/analyze_collect.sh"
+run = """\
+SETTINGS="config/settings.json"
+DEPLOY_DIR=$(python3 -c "import json; c=json.load(open('$SETTINGS')); print(c['deployment']['deploy_dir'])")
+SSH_USER=$(python3 -c "import json; c=json.load(open('$SETTINGS')); print(c['deployment']['ssh_user'])")
+SERVER_HOST=$(python3 -c "import json; c=json.load(open('$SETTINGS')); print(c['server']['server_host'])")
+mkdir -p results
+# 実験ディレクトリ名はメタファイルではなく、collect_logs.py自身の標準出力
+# （__EXPERIMENT_DIR__:プレフィックス行）から取得する。実験ディレクトリの
+# 実体はserver.pyが実験開始時に一度だけresults/下に作成したものを
+# collect_logs.pyがそのまま検出するため、ここで独自にタイムスタンプを
+# 生成・保存する必要がない
+ssh "$SSH_USER@$SERVER_HOST" "cd $DEPLOY_DIR && python3 src/collect_logs.py" | tee /tmp/collect_output.txt
+EXPERIMENT_DIR=$(grep '^__EXPERIMENT_DIR__:' /tmp/collect_output.txt | cut -d: -f2)
+if [ -z "$EXPERIMENT_DIR" ]; then
+  echo "ERROR: collect_logs.py の出力から実験ディレクトリ名を取得できませんでした" >&2
+  exit 1
+fi
+rsync -az "$SSH_USER@$SERVER_HOST:$DEPLOY_DIR/results/$EXPERIMENT_DIR/" "results/$EXPERIMENT_DIR/"
+"""
 
 [tasks."analyze:evaluate"]
 description = "回収した全データをマージし、評価グラフを自動レンダリング"

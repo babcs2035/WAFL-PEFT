@@ -5,39 +5,16 @@ hosts.txtを読み込み、各デバイスへ並列SSHを送り、Dockerコン�
 ホストネットワークモードでバックグラウンド起動する。
 """
 
-import json
 import os
 import socket
 import subprocess
-import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from utils import get_base_dir, _get, _get_int, _get_str
 
 BASE_DIR = get_base_dir()
 DEPLOY_DIR = os.path.expanduser(_get_str("deployment", "deploy_dir"))
 SERVER_HOST = _get_str("server", "server_host")
-
-
-# 実験ディレクトリ名の取得（setup_data.py の .experiment_meta.json を優先参照）
-def _load_experiment_dir_name() -> str:
-    """実験ディレクトリ名を .experiment_meta.json から読み込み、なければ生成する。"""
-    meta_path = BASE_DIR / "results" / ".experiment_meta.json"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            meta = json.load(f)
-        name = meta.get("dir_name")
-        if name:
-            return name
-    exp_name = _get("experiment", "experiment_name", "default")
-    timestamp = datetime.now(timezone(timedelta(hours=9))).strftime('%Y%m%dT%H%M%S')
-    return f"{exp_name}_{timestamp}"
-
-
-EXPERIMENT_DIR_NAME = _load_experiment_dir_name()
-EXPERIMENT_DIR_REMOTE = f"{DEPLOY_DIR}/results/{EXPERIMENT_DIR_NAME}"
 
 SSH_USER = _get_str("deployment", "ssh_user")
 _server_ip = _get("server", "server_ip")
@@ -80,12 +57,16 @@ def sync_source(ip: str, peer_id: int) -> str:
         f"-e 'ssh -o StrictHostKeyChecking=no {jump_flag}' "
         f"--exclude='__pycache__' --exclude='*.pyc' --exclude='.git' "
         f"--exclude='.venv' --exclude='data/' --exclude='logs/' --exclude='output/' "
+        f"--exclude='cache/' --exclude='results/' "
         f"{BASE_DIR}/ {SSH_USER}@{ip}:{DEPLOY_DIR}/"
     )
+    # capture_output=False（進捗バーを直接ターミナルへ流すため）なので
+    # result.stderr は常にNone。エラー内容自体は標準エラー出力にそのまま
+    # 表示されているため、ここではreturncodeのみ報告する
     result = subprocess.run(rsync_cmd, shell=True, capture_output=False, text=True, timeout=120)
     if result.returncode == 0:
         return f"OK (peer={peer_id}, ip={ip})"
-    return f"FAILED rsync (peer={peer_id}, ip={ip}): {result.stderr[:200]}"
+    return f"FAILED rsync (peer={peer_id}, ip={ip}): returncode={result.returncode}"
 
 
 def start_client_container(ip: str, peer_id: int) -> str:
@@ -133,7 +114,7 @@ def main() -> None:
     hosts = load_hosts()
     print(f"[start_clients] Target devices: {len(hosts)}")
 
-    max_workers = 10  # 同時実行数
+    max_workers = len(hosts)  # hosts.txtのノード数だけ並列実行
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {

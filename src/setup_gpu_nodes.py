@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""各学習デバイスへの nvidia-container-toolkit インストールと Docker GPU ランタイム設定。
+"""管理サーバー・各学習デバイスへの nvidia-container-toolkit インストールと
+Docker GPU ランタイム設定。
 
-hosts.txt に記載された全ピアノードに SSH し、以下の条件で処理を行う。
+hosts.txt に記載された全ピアノードに加え，管理サーバー自身（server.py が
+GlobalEval スレッドでGPUを使うため）にも SSH し，以下の条件で処理を行う。
 - NVIDIA GPU が存在しないノード: スキップ（CPU-only 環境でも正常動作）
 - GPU があるが nvidia-container-toolkit 未インストール: インストールして設定
 - GPU があり既にインストール済み: Docker ランタイム設定のみ確認して再起動
@@ -9,6 +11,7 @@ hosts.txt に記載された全ピアノードに SSH し、以下の条件で�
 
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 from utils import get_base_dir, _get_str
 
@@ -83,6 +86,15 @@ def _run_via_master(ip: str, script: str, timeout: int) -> subprocess.CompletedP
     )
 
 
+def _run_on_server(script: str, timeout: int) -> subprocess.CompletedProcess:
+    """管理サーバー自身に対して直接スクリプトを実行する（1段SSH）。"""
+    return subprocess.run(
+        f"ssh -o StrictHostKeyChecking=no {SSH_USER}@{SERVER_HOST} "
+        f"bash -s <<'GPUSETUPEOF'\n{script}\nGPUSETUPEOF",
+        shell=True, capture_output=True, text=True, timeout=timeout,
+    )
+
+
 def setup_gpu_node(ip: str, peer_id: int) -> str:
     """1 ノードに nvidia-container-toolkit をインストールして Docker を設定する。
 
@@ -108,6 +120,30 @@ def setup_gpu_node(ip: str, peer_id: int) -> str:
     return f"OK (peer={peer_id}, ip={ip}, toolkit={install_status})"
 
 
+def setup_gpu_server() -> str:
+    """管理サーバー自身に nvidia-container-toolkit をインストールして Docker を設定する。
+
+    server.py の GlobalEval スレッド（グローバルモデル収束性能のリアルタイム
+    評価）が管理サーバー自身の GPU を使うために必要。
+    """
+    result = _run_on_server(_INSTALL_SCRIPT, timeout=300)
+    if result.returncode != 0:
+        return f"FAILED install (server={SERVER_HOST}): {result.stderr[:300]}"
+
+    last_line = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+
+    if last_line == "NO_GPU":
+        return f"OK (server={SERVER_HOST}, gpu=none, skipped)"
+
+    install_status = "skipped (already installed)" if last_line == "ALREADY_INSTALLED" else "installed"
+
+    result2 = _run_on_server(_CONFIGURE_SCRIPT, timeout=60)
+    if result2.returncode != 0:
+        return f"FAILED configure (server={SERVER_HOST}): {result2.stderr[:300]}"
+
+    return f"OK (server={SERVER_HOST}, toolkit={install_status})"
+
+
 def load_hosts() -> list[str]:
     """hosts.txt からピアノードの IP 一覧を取得する。"""
     hosts_path = BASE_DIR / "config" / "hosts.txt"
@@ -121,21 +157,22 @@ def load_hosts() -> list[str]:
 
 def main() -> None:
     """メインエントリポイント。"""
-    print("[setup_gpu_nodes] Configuring GPU runtime on peer nodes...")
+    print("[setup_gpu_nodes] Configuring GPU runtime on server and peer nodes...")
 
     hosts = load_hosts()
-    print(f"[setup_gpu_nodes] Target nodes: {len(hosts)}")
+    print(f"[setup_gpu_nodes] Target nodes: {len(hosts)} peers + 1 server ({SERVER_HOST})")
 
     ok_count = 0
     fail_count = 0
 
-    with ThreadPoolExecutor(max_workers=min(len(hosts), 16)) as executor:
-        futures = {
-            executor.submit(setup_gpu_node, ip, i): i
+    with ThreadPoolExecutor(max_workers=min(len(hosts) + 1, 16)) as executor:
+        futures: dict[Any, str] = {executor.submit(setup_gpu_server): "server"}
+        futures.update({
+            executor.submit(setup_gpu_node, ip, i): f"peer={i}"
             for i, ip in enumerate(hosts)
-        }
+        })
         for future in as_completed(futures):
-            peer_id = futures[future]
+            label = futures[future]
             try:
                 result = future.result()
                 if result.startswith("OK"):
@@ -146,7 +183,7 @@ def main() -> None:
                     print(f"  [FAIL] {result}")
             except Exception as e:
                 fail_count += 1
-                print(f"  [FAIL] peer={peer_id}: {e}")
+                print(f"  [FAIL] {label}: {e}")
 
     print(f"\n[setup_gpu_nodes] {ok_count} OK, {fail_count} FAIL")
     if fail_count > 0:

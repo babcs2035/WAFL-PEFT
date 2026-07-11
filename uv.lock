@@ -2975,11 +2975,13 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "peft" },
+    { name = "pillow" },
     { name = "tensorboard" },
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchinfo" },
     { name = "torchvision" },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -2992,11 +2994,13 @@ requires-dist = [
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "peft" },
+    { name = "pillow", specifier = ">=12.2.0" },
     { name = "tensorboard" },
     { name = "torch", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchinfo" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "tqdm", specifier = ">=4.68.2" },
     { name = "transformers" },
 ]
 

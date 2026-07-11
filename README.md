@@ -51,7 +51,7 @@ Non-IID 分布下では，各 peer のローカル訓練が異なる最適解に
 
 本フレームワークの核心概念である．固定トポロジーでは，接続されていない peer 間は知識が伝わらない．時変トポロジーでは，時間とともに通信ペアが変化する．
 
-$t$ 時刻における peer $i$ の通信相手集合を $N_i(t)$ と表す． contact_pattern.json は，離散時刻 $t_1, t_2, \ldots$ における $N_i(t_j)$ を定義する．各接続には `remaining_time` が付随し，その接続が有効な残り秒数を指定する．
+$t$ 時刻における peer $i$ の通信相手集合を $N_i(t)$ と表す． contact_pattern.json は，離散時刻 $t_1, t_2, \ldots$ における $N_i(t_j)$ を定義する．各接続の開始・終了は， start/end イベントとして明示的に定義される．
 
 この設計により，すべての peer 対が最終的に通信する (グラフが時間的に連結) ，かつ，一度にすべての peer 対が通信するわけではないため，通信衝突を回避できる．
 
@@ -128,8 +128,7 @@ flowchart LR
 
 | リソース                 | 型                  | 更新スレッド | 参照スレッド    | 同期機構                   |
 | ------------------------ | ------------------- | ------------ | --------------- | -------------------------- |
-| `peer_whitelist`         | `dict[int, float]`  | Thread 1     | Thread 2        | `threading.Lock`           |
-| `peer_whitelist_expiry`  | `dict[int, float]`  | Thread 1     | Thread 2        | `threading.Lock`           |
+| `peer_whitelist`         | `set[int]`          | Thread 1     | Thread 2        | `threading.Lock`           |
 | `shadow_weights`         | `dict[str, Tensor]` | Thread 3     | Thread 2        | `threading.Lock`           |
 | `merge_queue`            | `queue.Queue`       | Thread 2     | Thread 3        | FIFO キュー (maxsize=32)   |
 | `eval_request_queue`     | `queue.Queue`       | Thread 3     | Thread 5        | キュー (maxsize=1，最新のみ保持) |
@@ -137,7 +136,7 @@ flowchart LR
 | `current_step`           | `int`               | Thread 3     | Thread 2        | `threading.Lock`           |
 | `experiment_running`     | `threading.Event`   | Thread 1     | Thread 3, 5      | Event フラグ               |
 
-`peer_whitelist_expiry` は各 peer との接触が失効する絶対時刻 (Unix time) を保持する． Thread 1 が signal 受信時に `remaining_time` から算出し， Thread 2 がこの時刻を過ぎた peer との TCP 接続を切断することで，時変トポロジーのローテーションを実際の接続状態に反映する．
+`peer_whitelist` は現在接触中の peer_id の集合を保持する． Thread 1 がサーバーから受信した `start`/`end` イベントに応じて要素を追加・削除し， Thread 2 がこの集合に基づいて TCP 接続を確立・切断することで，時変トポロジーのローテーションを実際の接続状態に反映する．接触の終了は，残り時間の推定によってではなく，必ずサーバーからの明示的な `end` イベントによってのみ判定される．
 
 #### スループット平坦性 (Stall-Free Design)
 
@@ -156,16 +155,17 @@ flowchart LR
 ```mermaid
 graph LR
     subgraph cfg["config/"]
-        S["settings.json<br/>実験設定"]
+        S["settings.json<br/>実験設定・contact_pattern_file指定"]
         H["hosts.txt<br/>IPリスト"]
-        C["contact_pattern.json<br/>時変トポロジー"]
     end
 
     subgraph src["src/"]
         SV["server.py<br/>管理サーバー"]
         CL["client.py<br/>学習クライアント"]
         SD["setup_data.py<br/>データ準備"]
+        GC["generate_contact_pattern.py<br/>接触パターン生成"]
         AN["analyze.py<br/>分析・可視化"]
+        GEV["gsm8k_eval.py<br/>GSM8K評価ロジック共通モジュール"]
         DD["deploy_distribute.py<br/>デプロイ"]
         SC["start_clients.py<br/>並列起動"]
         CLG["collect_logs.py<br/>ログ回収"]
@@ -173,40 +173,60 @@ graph LR
         UT["utils.py<br/>共通関数"]
     end
 
-    subgraph scripts["scripts/"]
-        AC["analyze_collect.sh<br/>ログ回収スクリプト"]
-    end
-
     subgraph data["data/"]
         TR["train/ peer_X.json"]
         TE["test/ peer_X.json"]
+        CP["contact_pattern/<br/>時変トポロジーJSON"]
     end
 
     cfg --> src
     src --> data
-    scripts --> data
 ```
 
 ## 時変トポロジー (contact_pattern.json)
 
-`config/contact_pattern.json` で，時間経過に伴う P2P 通信相手の遷移を定義する．キーは実験開始からの経過秒数，値は各 peer が通信可能な peer のリストである．
+`data/contact_pattern/` 配下の JSON ファイルで，時間経過に伴う P2P 接触の開始・終了を定義する．どのファイルを使うかは `config/settings.json` の `experiment.contact_pattern_file` にファイル名で指定する．キーは実験開始からの経過秒数，値はその時刻に発生したイベントのリストである．各イベントは `{"event": "start"|"end", "peers": [i, j]}` の形式で，`peers` は接触が変化する2つの peer_id を昇順で表す．
 
 ```jsonc
 {
-  "60": {
-    "0": { "allowed_peers": [{ "peer_id": 1, "remaining_time": 30.0 }] },
-    "1": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 30.0 }] },
-    "2": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 30.0 }] }
-  },
-  "90": {
-    "0": { "allowed_peers": [{ "peer_id": 1, "remaining_time": 15.0 }] },
-    "1": { "allowed_peers": [{ "peer_id": 2, "remaining_time": 15.0 }] },
-    "2": { "allowed_peers": [{ "peer_id": 0, "remaining_time": 15.0 }] }
-  }
+  "60": [
+    { "event": "start", "peers": [0, 1] }
+  ],
+  "90": [
+    { "event": "end", "peers": [0, 1] },
+    { "event": "start", "peers": [1, 2] }
+  ]
 }
 ```
 
-この例では， t=60s で peer 0-1-2 の三つ編みトポロジーが形成され， t=90s でローテーションする． `remaining_time` はその接続が有効な残り秒数を表す．
+この例では， t=60s で peer 0-1 間の接触が開始し， t=90s で peer 0-1 間の接触が終了すると同時に peer 1-2 間の接触が新たに開始する．
+
+管理サーバー (`server.py`) は，実験開始からの経過時間に応じて，まだ配信していない新規イベントのみを毎秒クライアントへ配信する．各クライアント (`client.py`) は，自身の peer_id が含まれるイベントを受信するたびに， `start` であれば相手 peer をホワイトリストへ追加し， `end` であればホワイトリストから除去する．接触の終了は必ずサーバーからの明示的な `end` イベントによって制御され，接続時間を事前に見積もる仕組みは持たない．
+
+### contact_pattern.json の生成
+
+`src/generate_contact_pattern.py` は， Random Waypoint Mobility (RWP) モデルに従ってノードを移動させ，無線到達距離内に入った区間を接触イベントへ変換して出力する．ノード数は `config/hosts.txt` の行数から自動決定される．
+
+```bash
+uv run python src/generate_contact_pattern.py \
+  --n-time 5000 --min-speed 1.0 --max-speed 5.0 \
+  --radio-range 100 --area-size 500 --pose-time 10 --seed 42
+
+# または mise 経由（引数は "--" の後に渡す）
+mise run setup:contact-pattern -- --n-time 5000 --seed 42
+```
+
+| オプション | 意味 | デフォルト |
+| --- | --- | --- |
+| `--n-time` | シミュレーション総ステップ数（=総秒数） | 5000 |
+| `--min-speed` / `--max-speed` | 移動速度の範囲 | 1.0 / 5.0 |
+| `--radio-range` | 無線到達距離 | 100 |
+| `--area-size` | 正方形エリアの一辺 | 500 |
+| `--pose-time` | ウェイポイント到達後の静止時間 | 10 |
+| `--seed` | 乱数シード | 42 |
+| `--animation` | ノード移動の GIF アニメーションも生成する | 無効 |
+
+出力先は `data/contact_pattern/` 固定であり，ファイル名はパラメータを含む形式 (`rwp_n{ノード数}_a{エリアサイズ}_r{到達距離}_p{静止時間}_s{シード}.json`) になる．生成物を確認した上で，`config/settings.json` の `experiment.contact_pattern_file` にそのファイル名を設定すると `server.py` の起動時に読み込まれる．
 
 ### トポロジーのグラフ理論的性質
 
@@ -333,6 +353,8 @@ sequenceDiagram
     C0-->>C1: 通信終了
 ```
 
+実験の終了は学習ステップ数の上限ではなく，時間のみで制御される．管理サーバーは `contact_pattern.json` のタイムライン上で最後に発生するイベント時刻に固定バッファ (60秒) を加えた時刻を `experiment_duration` として算出し，この時間が経過すると全クライアントへ `experiment_stop` を送信する．クライアントは訓練データを何周でも回し続けながら学習を継続し，`experiment_stop` を受信するまで停止しない．そのため接触パターンの総時間を変更すれば，学習ステップ数の設定を変えることなく実験時間を調整できる．
+
 ## 設定 (settings.json)
 
 ```jsonc
@@ -341,12 +363,12 @@ sequenceDiagram
     "model_id": "google/gemma-4-E2B"       // 学習対象モデル
   },
   "training": {
-    "learning_rate": 5e-5,                  // AdamW学習率
+    "learning_rate": 1e-4,                  // AdamW学習率
     "batch_size": 1,                        // バッチサイズ
-    "max_seq_len": 512,                     // 最大シーケンス長
+    "max_seq_len": 320,                     // 最大シーケンス長（vocab_sizeが262144と大きく、大きすぎるとlogitsのメモリ使用量でOOMするため注意）
     "lora_rank": 16,                        // LoRAランク
     "lora_alpha": 32,                       // LoRAアルファ
-    "num_training_steps": 10000             // 最大訓練ステップ数
+    "eval_interval_seconds": 60             // train/testスコア評価・チェックポイント保存の間隔（秒）
   },
   "data": {
     "validation_split": 0.1,                // 訓練/テスト分割比率
@@ -366,7 +388,8 @@ sequenceDiagram
     "deploy_dir": "/home/denjo/workspace/ktakahashi/WAFL-PEFT"
   },
   "experiment": {
-    "experiment_name": "default"            // 実験名
+    "experiment_name": "default",            // 実験名
+    "contact_pattern_file": "rwp_n05_a0500_r100_p10_s42.json"  // 使用する接触パターンJSON
   }
 }
 ```
@@ -395,9 +418,12 @@ mlp.gate_proj, mlp.up_proj, mlp.down_proj
 mise run setup
 
 # または個別に実行
-mise run setup:model    # HuggingFaceベースモデルをローカルキャッシュへダウンロード
-mise run setup:data     # GSM8KをNon-IIDシャードとして生成
-mise run setup:build    # Dockerイメージビルド
+mise run setup:model             # HuggingFaceベースモデルをローカルキャッシュへダウンロード
+mise run setup:data              # GSM8KをNon-IIDシャードとして生成
+mise run setup:build             # Dockerイメージビルド
+
+# 接触パターンの生成（任意，パラメータ変更時のみ実行。setup全体には含まれない）
+mise run setup:contact-pattern -- --n-time 5000 --seed 42
 ```
 
 ### 2. デプロイ
@@ -446,7 +472,7 @@ graph LR
 mise run start
 
 # 個別
-mise run start:server    # 管理サーバーコンテナ起動
+mise run start:server    # 管理サーバーコンテナ起動（グローバル収束性能のリアルタイム評価スレッドを含む）
 mise run start:clients   # 全学習デバイスコンテナ並列起動
 ```
 
@@ -469,6 +495,29 @@ mise run clean
 
 ローカル (cache/, .venv/, data/) ，管理サーバー，全学習デバイス上の Docker コンテナ・イメージ・デプロイディレクトリを削除する．
 
+## グローバルモデルのリアルタイム監視 (server.py の GlobalEval スレッド)
+
+`mise run analyze` は実験終了後にしか収束性能を評価できないため，学習中に
+フェデレーテッド学習全体としての収束傾向を追跡できるよう，`server.py` は
+実験管理と並行して GlobalEval スレッド（`_global_eval_thread`）を実行する．
+`config/settings.json` の `global_eval.interval_seconds`（デフォルト 120 秒）
+ごとに以下を行う．
+
+1. 各学習デバイスから最新の LoRA 重みチェックポイントを SSH + rsync で収集
+2. 収集した中で最新のステップ番号のチェックポイントを全 peer 間で平均マージ
+3. GSM8K バリデーションセット（`global_eval.sample_limit` 件，デフォルト 20）で
+   マージ後のグローバルモデルの accuracy を評価
+4. 結果を `results/{experiment_name}_{timestamp}/global_eval.log` に
+   JSON Lines 形式（`{"step": int, "timestamp": str, "accuracy": float, "num_devices": int}`）で追記
+
+評価ロジックは `analyze.py` の収束性能評価（評価 5）と共通のモジュール
+`gsm8k_eval.py` を利用しており，両者で評価条件（LoRA 設定・生成パラメータ）
+が一致する．学習用の GPU（各学習デバイス）とは別に，管理サーバー自身の GPU
+を使うため，学習スループットへの影響がない．そのため `start:server` タスクの
+コンテナ起動には `--gpus all` と各学習デバイスへ接続するための SSH 鍵の
+読み取り専用マウント（`-v /home/{ssh_user}/.ssh:/home/{ssh_user}/.ssh:ro`）が
+追加されている．
+
 ## 実験結果分析 (analyze.py)
 
 `analyze.py` は以下の 5 つの評価グラフを生成する．
@@ -483,25 +532,25 @@ mise run clean
 
 各 peer の訓練損失を時間軸でプロットする．赤線はビン平均， shaded area は 1 標準偏差．
 
-### 評価 3: 知識収束 (Convergence under Time-Varying Topology)
+### 評価 3: loss vs throughput 散布図
 
-回収した LoRA 重みチェックポイントを GSM8K バリデーションセットで評価し，ステップ wise の accuracy 推移を描画する．中央集約学習の上限 (推定) と既存のラウンド制フェデレーテッド学習 (推定) と比較する．
-
-評価手順は以下の通り．
-
-1. 各チェックポイント `weights_step_XXXXXX.pt` をロード
-2. GSM8K テストセットから最大 50 件サンプリング
-3. 各問題に対して `Question: {question}\nAnswer:` を入力とし，最大 64 トークン生成
-4. 生成テキストに正解数値 (`#### ` 以降) が含まれるかを判定
-5. accuracy = 正解数 / 処理件数
+各データポイントを peer ID で色分けし，スループットと損失の関係を可視化する．
 
 ### 評価 4: train/test スコア推移
 
 各 peer の訓練精度・テスト精度を時間軸でプロットする．過学習の有無を同時に確認できる．
 
-### 評価 5: loss vs throughput 散布図
+### 評価 5: 知識収束 (Convergence under Time-Varying Topology)
 
-各データポイントを peer ID で色分けし，スループットと損失の関係を可視化する．
+回収した LoRA 重みチェックポイントを GSM8K バリデーションセットで評価し，ステップ wise の accuracy 推移を描画する．中央集約学習の上限 (推定) と既存のラウンド制フェデレーテッド学習 (推定) と比較する．デフォルトで実行され，環境変数 `ANALYZE_CONVERGENCE=0` を設定するとスキップできる．
+
+評価手順は以下の通り．
+
+1. 各チェックポイント `weights_step_XXXXXX.pt` をロード
+2. GSM8K テストセットから最大 20 件サンプリング
+3. 各問題に対して `Question: {question}\nAnswer:` を入力とし，最大 64 トークン生成
+4. 生成テキストに正解数値 (`#### ` 以降) が含まれるかを判定
+5. accuracy = 正解数 / 処理件数
 
 生成されたレポートは `results/{experiment_name}_{timestamp}/output/analysis_report.md` に保存される．
 
@@ -523,12 +572,19 @@ mise run clean
 
 Dockerfile はビルドレイヤーの最適化を考慮している．変更頻度の低い層を先にビルドし，キャッシュを最大化する．
 
-1. システム依存 (curl, rsync) — ほぼ不変
+1. システム依存 (curl, rsync, openssh-client) — ほぼ不変
 2. uv インストール — 不変
 3. ユーザー作成 — 不変
-4. pyproject.toml コピー + 依存関係インストール — 稀に変更
-5. ソースコードコピー — 頻繁に変更
-6. Docker 設定 (insecure-registries) — 不変
+4. pyproject.toml コピー + 依存関係インストール（`--mount=type=cache` でuv/pipの
+   ダウンロードキャッシュを永続化．レイヤー1のようなシステム依存を変更して
+   これより上流のレイヤーキャッシュが無効になった場合でも，torch 等の
+   巨大パッケージ（合計10GB超）の再ダウンロードを避けられる）— 稀に変更
+5. 仮想環境 (.venv) の chown — この時点では src/・config/ がまだCOPYされて
+   いないため，chown -R の対象が .venv のみに確定する
+6. ソースコードコピー（`COPY --chown` で直接所有権を指定）— 頻繁に変更．
+   レイヤー5を分離しているため，ソース変更のみのリビルドで
+   chown -R の再実行（.venv 全体，数百秒）が発生しない
+7. Docker 設定 (insecure-registries) — 不変
 
 ## ネットワークポート
 

@@ -144,7 +144,7 @@ def main() -> None:
 
     # 学習デバイスのクリーン（管理サーバー経由のネストSSH）
     print("\n[clean] Cleaning learning devices...")
-    max_workers = 5
+    max_workers = len(hosts)  # hosts.txtのノード数だけ並列実行
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(clean_node, user, ip, deploy_dir, i): i
