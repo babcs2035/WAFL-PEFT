@@ -50,6 +50,12 @@ if _CURRENT_HOSTNAME == SERVER_HOST or SERVER_HOST_IP in _CURRENT_HOSTNAME:
 else:
     _JUMP = f"-J {SSH_USER}@{SERVER_HOST}"
 
+# eval モード: `python3 deploy_distribute.py eval` で評価専用ホスト（hosts.eval.txt）へ
+# 配布する。学習ノードと同じ Phase（ufw / rsync / registry pull）を再利用し、配布先と
+# 同期対象だけを評価ワーカー向けに切り替える。image は学習ノードと同じく registry から
+# pull する（save/load は使わない）
+_EVAL_MODE = len(sys.argv) > 1 and sys.argv[1] == "eval"
+
 
 def _peer_ssh(ip: str, cmd: str, stdin_data: str | None = None) -> subprocess.CompletedProcess[str]:
     """ピアノードへSSHしコマンドを実行。
@@ -84,8 +90,9 @@ json.dump(d, open(p, "w"), indent=2)
 
 
 def load_hosts() -> list[str]:
-    """hosts.txtからIPリストを読み込み。"""
-    hosts_path = BASE_DIR / "config" / "hosts.txt"
+    """配布対象の IP リストを読み込む（eval モードなら hosts.eval.txt）。"""
+    fname = "hosts.eval.txt" if _EVAL_MODE else "hosts.txt"
+    hosts_path = BASE_DIR / "config" / fname
     ips = []
     for line in hosts_path.read_text().strip().splitlines():
         ip = line.strip()
@@ -184,7 +191,7 @@ def rsync_to_device(ip: str, peer_id: int) -> str:
     model_cache_dir = f"{DEPLOY_DIR}/cache/models/{model_path_parts[0]}"
 
     # リモートディレクトリ作成
-    result = _peer_ssh(ip, f"export LC_ALL=C; mkdir -p {DEPLOY_DIR}/config {DEPLOY_DIR}/data/train {DEPLOY_DIR}/data/test {DEPLOY_DIR}/logs {model_cache_dir} {DEPLOY_DIR}/results {DEPLOY_DIR}/src")
+    result = _peer_ssh(ip, f"export LC_ALL=C; mkdir -p {DEPLOY_DIR}/config {DEPLOY_DIR}/data/train {DEPLOY_DIR}/data/test {DEPLOY_DIR}/logs {model_cache_dir} {DEPLOY_DIR}/cache/datasets {DEPLOY_DIR}/results {DEPLOY_DIR}/src")
     if result.returncode != 0:
         return f"FAILED mkdir (peer={peer_id}, ip={ip})"
 
@@ -193,19 +200,29 @@ def rsync_to_device(ip: str, peer_id: int) -> str:
     if r.returncode != 0:
         return f"FAILED rsync settings.json (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
-    # peer固有の訓練データ転送（deploy_dir/data/ 下を参照）
-    train_file = Path(DEPLOY_DIR) / "data" / "train" / f"peer_{peer_id}.json"
-    if train_file.exists():
-        r = _rsync_to_peer(ip, str(train_file), f"{DEPLOY_DIR}/data/train/peer_{peer_id}.json")
-        if r.returncode != 0:
-            return f"FAILED rsync train data (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
+    if _EVAL_MODE:
+        # 評価ホストは学習しないため peer 固有の訓練/テストデータは不要。代わりに
+        # 評価の検証セット（GSM8K データセットキャッシュ）を配る。学習ノード向けの
+        # deploy では datasets を配らないので、評価モードでのみ明示的に転送する
+        ds_src = str(BASE_DIR / "cache" / "datasets" / "gsm8k")
+        if Path(ds_src).exists():
+            r = _rsync_to_peer(ip, ds_src + "/", f"{DEPLOY_DIR}/cache/datasets/gsm8k/")
+            if r.returncode != 0:
+                return f"FAILED rsync datasets (eval_host={peer_id}, ip={ip}): {r.stderr[:300]}"
+    else:
+        # peer固有の訓練データ転送（deploy_dir/data/ 下を参照）
+        train_file = Path(DEPLOY_DIR) / "data" / "train" / f"peer_{peer_id}.json"
+        if train_file.exists():
+            r = _rsync_to_peer(ip, str(train_file), f"{DEPLOY_DIR}/data/train/peer_{peer_id}.json")
+            if r.returncode != 0:
+                return f"FAILED rsync train data (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
-    # peer固有のテストデータ転送（deploy_dir/data/ 下を参照）
-    test_file = Path(DEPLOY_DIR) / "data" / "test" / f"peer_{peer_id}.json"
-    if test_file.exists():
-        r = _rsync_to_peer(ip, str(test_file), f"{DEPLOY_DIR}/data/test/peer_{peer_id}.json")
-        if r.returncode != 0:
-            return f"FAILED rsync test data (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
+        # peer固有のテストデータ転送（deploy_dir/data/ 下を参照）
+        test_file = Path(DEPLOY_DIR) / "data" / "test" / f"peer_{peer_id}.json"
+        if test_file.exists():
+            r = _rsync_to_peer(ip, str(test_file), f"{DEPLOY_DIR}/data/test/peer_{peer_id}.json")
+            if r.returncode != 0:
+                return f"FAILED rsync test data (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
     # ソースコード転送（data/・cache/・results/ は別途転送または不要のため除外）
     r = _rsync_to_peer(

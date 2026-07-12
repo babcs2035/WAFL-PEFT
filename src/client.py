@@ -7,19 +7,21 @@
   Thread 3: LoRA訓練ループ（計算プレーン）
   Thread 4: 非同期ディスク書き出し層（ロギングプレーン）
 
-train/testの評価（accuracy算出）は実験中は一切行わない。各クライアントは実験中は
-訓練・P2Pマージ・チェックポイント保存に専念する（学習中モデルはgradient_checkpointing
-によりuse_cache=Falseのため、model.generate()を使う評価を行うとGPU/GILを長時間
-占有し訓練ループを巻き込むストールを引き起こすことが実機テストで確認されたため）。
-実験中の収束傾向は管理サーバー（server.pyのGlobalEvalスレッド）がマージモデルの
-みを一定間隔で評価して監視する。
+accuracy 評価は学習ノードでは一切行わない（実験中も実験後も）。学習ノードは訓練・
+P2Pマージ・チェックポイント保存に専念する。これは (1) 学習中モデルは
+gradient_checkpointing により use_cache=False で generate() 評価が GPU/GIL を長時間
+占有し訓練を巻き込むストールを起こすこと、(2) 実験後評価も学習ノードの VRAM を消費し、
+外部 GPU 競合下では OOM や逼迫を招くこと、の 2 点を避けるためである。
 
-実験終了（experiment_stop受信・全訓練スレッド停止）後、このクライアントは自分の
-GPU上で自分のチェックポイント履歴を評価し（run_post_experiment_evaluation）、
-結果をメトリクスログへ記録した上で、管理サーバーへ完了を通知する
-（notify_server_evaluation_complete）。訓練が既に止まっているためGPU/GILの
-競合を気にする必要がなく、5台が並列に実行するため1台分の評価時間で
-全ノードの収束曲線が得られる。
+代わりに評価は「学習と別のハードウェア」に分離する:
+  - 実験中の収束傾向: 管理サーバー（server.py の GlobalEval スレッド）がマージモデルを
+    一定間隔で評価する。
+  - 各 peer の checkpoint 別 accuracy: config/hosts.eval.txt の評価専用ホストで動く
+    eval_worker.py が、担当 peer の logs/weights/ を rsync で随時取得し評価する。
+このクライアントは実験終了時に logs/weights/.training_done マーカーを書くだけで、
+評価ワーカーがそれを検出して残りを評価し、管理サーバーへ完了を通知する。
+（run_post_experiment_evaluation / notify_server_evaluation_complete は旧アーキテクチャの
+自己評価用関数で、現在は呼び出されない。評価を学習ノード側へ戻す場合の参照用に残置。）
 
 メトリクスは訓練ループ内でキューへputし、ロガスレッドが非同期にファイルへ書き出す。
 各ステップで loss, throughput をログ出力する。
@@ -51,9 +53,10 @@ from typing import Any
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
+import torch.nn.functional as F
+import bitsandbytes as bnb
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model
-from torch.optim import AdamW
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from utils import get_base_dir, get_hosts_path, get_log_dir, _get, _get_float, _get_int, _get_str
@@ -61,6 +64,43 @@ from utils import get_base_dir, get_hosts_path, get_log_dir, _get, _get_float, _
 # ============================================================
 # グローバル設定
 # ============================================================
+
+# chunked cross-entropy のトークン分割サイズ。巨大 vocab (262144) の logits を
+# fp32 で全 materialize すると 1 サンプルでも数百 MB の transient になり、外部 GPU
+# 競合下で OOM を誘発する。トークン次元をこのサイズで分割して逐次に CE を計算し、
+# fp32 化・log_softmax のピークを chunk 分に抑える（保存すべき勾配は logits 全体の
+# fp16 のみ）。値が小さいほど省メモリ・iteration 増、大きいほど逆
+_CE_CHUNK_TOKENS = 64
+
+
+def _memory_efficient_causal_lm_loss(
+    logits: "torch.Tensor", labels: "torch.Tensor", ignore_index: int = -100
+) -> "torch.Tensor":
+    """巨大 vocab 向けの省メモリ Causal LM 損失。
+
+    transformers の ForCausalLMLoss と同一の値を返す（1 トークンぶん右シフトし、
+    ignore_index を除いた answer トークンでの平均 cross-entropy）。ただし logits を
+    fp32 で一括 materialize せず、トークン次元を _CE_CHUNK_TOKENS ごとに分割して
+    逐次に sum を積み上げ、最後に非マスクトークン数で割る。autograd は各 chunk を
+    通して logits へ勾配を流すため、学習結果は一括計算と一致する。
+    """
+    # 標準的な causal shift: 位置 t の logits で t+1 のラベルを予測する
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    vocab_size = shift_logits.size(-1)
+    flat_logits = shift_logits.reshape(-1, vocab_size)
+    flat_labels = shift_labels.reshape(-1)
+
+    loss_sum = flat_logits.new_zeros((), dtype=torch.float32)
+    token_count = (flat_labels != ignore_index).sum()
+    for start in range(0, flat_logits.size(0), _CE_CHUNK_TOKENS):
+        chunk_logits = flat_logits[start : start + _CE_CHUNK_TOKENS].float()
+        chunk_labels = flat_labels[start : start + _CE_CHUNK_TOKENS]
+        loss_sum = loss_sum + F.cross_entropy(
+            chunk_logits, chunk_labels, ignore_index=ignore_index, reduction="sum"
+        )
+    # 非マスクトークンが 0 の異常系でのゼロ除算を避ける
+    return loss_sum / token_count.clamp(min=1).to(loss_sum.dtype)
 
 # コンテナ内では /app がプロジェクトルート（ホストの DEPLOY_DIR にマッピング）
 BASE_DIR = Path("/app")
@@ -277,7 +317,9 @@ def initialize_model() -> tuple[Any, Any]:
         r=_get_int("training", "lora_rank"),
         lora_alpha=_get_int("training", "lora_alpha"),
         target_modules=r"model\.language_model.*(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|mlp\.(?:gate_proj|up_proj|down_proj))",
-        lora_dropout=0.05,
+        # 過学習抑制の正則化レバー。gentle LR 減衰（lr_min 0.5）でも一部ノードで last≪peak の
+        # 過学習が残ったため 0.10→0.15 に引き上げる（VRAM 中立で外部競合下でも安全）
+        lora_dropout=0.15,
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -349,6 +391,7 @@ def tokenize_dataset(
     accuracyが向上/低下を繰り返すだけで着実な収束が見られなかった一因）。
     """
     tokenized: list[dict[str, torch.Tensor]] = []
+    skipped_fully_truncated = 0
     for item in dataset:
         prompt = f"Question: {item['question']}\nAnswer:"
         full_text = f"{prompt} {item['answer']}"
@@ -361,14 +404,28 @@ def tokenize_dataset(
             padding=False,
         )
         full_ids = tokens["input_ids"]
-        if len(full_ids) > 1:
-            input_ids = torch.tensor(full_ids, dtype=torch.long)
-            labels = input_ids.clone()
-            # promptがtruncationで欠けている場合に備え、full_idsの長さを超えない
-            # 範囲でマスクする（トークナイザーの結合時の境界ズレにも安全）
-            prompt_len = min(len(prompt_ids), len(full_ids))
-            labels[:prompt_len] = -100
-            tokenized.append({"input_ids": input_ids, "labels": labels})
+        if len(full_ids) <= 1:
+            continue
+        prompt_len = min(len(prompt_ids), len(full_ids))
+        # 解答トークンが truncation で全て失われた例（prompt_len が系列長以上）は、
+        # 全ラベルが -100 になり損失 0・勾配 0 の無駄なステップになる。さらに
+        # 「解答形式（#### N）を一切含まない」ため学習に寄与しないので除外する
+        # （max_seq_len を下げた際に長い解答の末尾が切れて発生しうる）
+        if prompt_len >= len(full_ids):
+            skipped_fully_truncated += 1
+            continue
+        input_ids = torch.tensor(full_ids, dtype=torch.long)
+        labels = input_ids.clone()
+        # promptがtruncationで欠けている場合に備え、full_idsの長さを超えない
+        # 範囲でマスクする（トークナイザーの結合時の境界ズレにも安全）
+        labels[:prompt_len] = -100
+        tokenized.append({"input_ids": input_ids, "labels": labels})
+    if skipped_fully_truncated > 0:
+        print(
+            f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\t"
+            f"Skipped {skipped_fully_truncated} fully-truncated samples "
+            f"(answer lost at max_seq_len={max_seq_len})", flush=True,
+        )
     return tokenized
 
 
@@ -600,8 +657,13 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
     # peer_id -> IP マッピング
     host_map = resolve_hosts()
 
-    # 受信バッファ: peer_id -> list of serialized weights
-    receive_buffers: dict[int, list[bytes]] = {}
+    # 受信バッファ: peer_id -> 最新のシリアライズ済み重み（1つだけ保持）。
+    # 以前は list で受信の度に全バージョンを溜め、マージ時に全ブロブを deserialize
+    # して平均に加算していた。これには (1) 新接触時に溜まった多数のバージョンを
+    # 一括 deserialize して Thread 3 を数十秒ブロックする性能問題、(2) 多く送ってきた
+    # peer が平均で過大重みになる正確性バグ、があった。マージで意味を持つのは各 peer の
+    # 最新の重みだけなので、peer ごとに最新の1つだけを上書き保持する
+    receive_buffers: dict[int, bytes] = {}
     receive_lock = threading.Lock()
 
     # P2Pソケット（複数接続をaccept）
@@ -669,9 +731,8 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                         break
 
                     with receive_lock:
-                        if incoming_peer_id not in receive_buffers:
-                            receive_buffers[incoming_peer_id] = []
-                        receive_buffers[incoming_peer_id].append(weight_data)
+                        # 最新の重みだけを保持（古い版は上書きで破棄）
+                        receive_buffers[incoming_peer_id] = weight_data
 
                 # 受信完了（自分がaccept_incomingで登録した接続のみを取り除く）
                 with conn_lock:
@@ -812,22 +873,21 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
             if buffers_to_merge:
                 merged: dict[str, torch.Tensor] | None = None
                 count = 0
-                for buf_data in buffers_to_merge.values():
-                    for weight_bytes in buf_data:
-                        try:
-                            remote_weights = _deserialize_weights(weight_bytes)
-                            if merged is None:
-                                merged = {
-                                    k: v.float() for k, v in remote_weights.items()
-                                }
-                                count = 1
-                            else:
-                                for k in merged:
-                                    if k in remote_weights:
-                                        merged[k] += remote_weights[k].float()
-                                count += 1
-                        except (EOFError, RuntimeError, KeyError):
-                            continue
+                # peer ごとに最新の重み1つだけを deserialize して平均する
+                # （各 peer が1票。多く送ってきた peer に過大重みが乗らない）
+                for weight_bytes in buffers_to_merge.values():
+                    try:
+                        remote_weights = _deserialize_weights(weight_bytes)
+                        if merged is None:
+                            merged = {k: v.float() for k, v in remote_weights.items()}
+                            count = 1
+                        else:
+                            for k in merged:
+                                if k in remote_weights:
+                                    merged[k] += remote_weights[k].float()
+                            count += 1
+                    except (EOFError, RuntimeError, KeyError):
+                        continue
 
                 if merged is not None and count > 0:
                     for k in merged:
@@ -908,7 +968,10 @@ def training_loop_thread(
     )
     print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\t  Training device: {_train_device}", flush=True)
 
-    optimizer = AdamW(
+    # VRAM 削減: paged 8-bit AdamW（QLoRA 標準）。optimizer 状態を 8-bit 化して
+    # メモリを節約し、さらに GPU 逼迫時に状態を CPU へページングして OOM スパイクを
+    # 吸収する。外部 GPU 競合（~2.6GB）下で 12GB に収めるための主要な削減策の一つ
+    optimizer = bnb.optim.PagedAdamW8bit(
         [p for p in model.parameters() if p.requires_grad],
         lr=_get_float("training", "learning_rate"),
         weight_decay=0.01,
@@ -986,8 +1049,10 @@ def training_loop_thread(
         # 勾配累積のため loss を grad_accum_steps で割ってから backward し、
         # grad_accum_steps 回ぶんの勾配が .grad に加算される
         compute_start_time = time.time()
-        outputs = model(input_ids=input_ids, labels=labels)
-        loss = outputs.loss
+        # labels を渡さず logits のみ取得し、省メモリ chunked CE で損失を計算する
+        # （モデル内蔵の損失は logits 全体を fp32 化するため巨大 vocab で OOM 源になる）
+        outputs = model(input_ids=input_ids)
+        loss = _memory_efficient_causal_lm_loss(outputs.logits, labels)
         total_tokens += int(input_ids.numel())
 
         (loss / grad_accum_steps).backward()
@@ -1214,15 +1279,15 @@ def async_logging_thread(state: SharedState) -> None:
 # 実験後評価（訓練終了後、自分のGPUで自分のチェックポイント履歴を評価）
 # ============================================================
 
-# 評価に用いるGSM8K検証サンプル数。20だとaccuracyが5%刻みでノイズが大きく
-# （±10pt程度）、イテレーション間の学習効率の差を確実に判別できないため40に増やす。
-# 生成評価はKVキャッシュ有効（実験後はgradient_checkpointing無効化）で高速なため、
-# サンプル倍増でも実機で許容範囲（checkpoints数を8→6に減らして時間を相殺）
-_POST_EVAL_SAMPLE_LIMIT = 40
-# 評価するチェックポイント数の上限（全期間から均等サンプリング）。
-# 40サンプル×外部GPU競合で1チェックポイント約4分かかり、6個だと1ノード~27分と
-# cycleが長くなりすぎるため4個に絞る（学習序盤→終盤の推移は4点でも十分追える）
-_POST_EVAL_MAX_CHECKPOINTS = 4
+# 評価に用いるGSM8K検証サンプル数。accuracy のノイズは √(p(1-p)/n) に従い、
+# 40サンプルでは ±7% 程度残り学習成果の判別が不明瞭だった。80サンプルで ±5% に
+# 下げて向上を明確にする（生成が逐次で重いぶん時間は伸びるが、学習成果を
+# 明瞭にすることを優先する方針）。生成バッチは増やさない（eval時のKVキャッシュ
+# 拡大は VRAM 固定制約下で OOM リスクがあるため）
+_POST_EVAL_SAMPLE_LIMIT = 80
+# 評価するチェックポイント数の上限（全期間から均等サンプリング）。6点にして
+# 学習序盤→終盤の accuracy 上昇軌跡を滑らかに示す
+_POST_EVAL_MAX_CHECKPOINTS = 6
 
 
 def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: Any) -> None:
@@ -1465,12 +1530,25 @@ def main() -> None:
     for t in [listener_thread, p2p_thread, training_thread]:
         t.join()
 
-    # 実験終了後、自分のGPUで自分のチェックポイント履歴を評価する。
-    # training_threadがすでにjoin済みでGPUを解放しているため、ここで安全に
-    # モデルを再利用できる。結果はThread 4がまだ動いているうちにmetrics_queueへ
-    # 積む必要があるため、シャットダウンシグナルより必ず先に実行する
-    run_post_experiment_evaluation(state, model, tokenizer)
-    notify_server_evaluation_complete()
+    # 評価アーキテクチャは 2 系統を用意している:
+    #   (A) 評価専用ホスト（config/hosts.eval.txt の eval_worker.py）が checkpoint を随時評価。
+    #   (B) 学習ノード自身が実験後に自己評価（run_post_experiment_evaluation）。
+    # 環境（評価ホストの provisioning 可否）に応じて WAFL_SELF_EVAL で切り替える。
+    # 既定は自己評価（B）＝評価ホストの disk 制約下でも学習ループを止めないため。
+    # 評価ホスト運用時（A）は起動側で WAFL_SELF_EVAL=0 を渡して自己評価を無効化する。
+    # いずれの場合も .training_done マーカーは書く（評価ワーカーが完了検出に使う）。
+    try:
+        (WEIGHT_DIR / ".training_done").write_text(f"peer={PEER_ID}\n")
+    except OSError as e:
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tFailed to write training-done marker: {e}", flush=True)
+
+    if os.environ.get("WAFL_SELF_EVAL", "1") != "0":
+        # 学習ノードで自己評価（GPU は訓練終了で空いている）。結果は Thread 4 がまだ
+        # 動いているうちに metrics_queue へ積む必要があるため、シャットダウン前に実行する
+        run_post_experiment_evaluation(state, model, tokenizer)
+        notify_server_evaluation_complete()
+    else:
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tSelf-eval disabled (WAFL_SELF_EVAL=0); evaluation offloaded to eval hosts.", flush=True)
 
     # logger へシャットダウンシグナル（None = SHUTDOWN）。Thread 4はこのシグネル
     # のみでシャットダウンするため、put_nowait()がqueue.Fullで失敗して

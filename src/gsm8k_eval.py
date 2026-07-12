@@ -202,7 +202,9 @@ def build_lora_model(
         r=lora_rank,
         lora_alpha=lora_alpha,
         target_modules=LORA_TARGET_MODULES,
-        lora_dropout=0.05,
+        # 学習側（client.py）と揃える。eval は model.eval() で dropout 無効なため
+        # accuracy には影響しないが、LoRA 構成の一貫性のため同値にする
+        lora_dropout=0.15,
         bias="none",
         task_type="CAUSAL_LM",
     )

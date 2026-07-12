@@ -63,16 +63,17 @@ from utils import (
 _EXPERIMENT_END_BUFFER_SECONDS = 60.0
 
 # 実験終了後、各クライアントが自分のチェックポイント履歴の評価
-# （evaluation_complete通知）を送ってくるのを待つ最大秒数。5台が並列に
-# 実行するため通常はもっと早く終わるが、応答がないクライアントのために
-# _accept_clientsが無期限に待ち続けないよう上限を設ける。
-# client.pyのrun_post_experiment_evaluationは最大8チェックポイントを
-# 評価し、実機テストで1チェックポイントあたり約2〜2.5分（1問256トークン
-# まで生成・20問）かかることを確認済み（8チェックポイントで実測17〜18分）。
-# 900秒（15分）では実際にこのタイムアウトが評価完了より先に発生し、
-# 完了通知を静かに取りこぼす不具合が実機で発生したため、十分な安全マージンを
-# 見て2400秒（40分）とする
-_POST_EXPERIMENT_EVAL_GRACE_SECONDS = 2400.0
+# 完了通知（evaluation_complete）の受付を諦めるまでの「無応答許容秒数」。
+# 実験終了からの固定時間ではなく、最後に評価関連の活動（実験終了 or いずれかの
+# peer からの完了通知受信）があってからの経過時間で判定する（idle ベース）。
+# 固定 grace は post-eval の総所要時間が延びるたびに破綻してきた（900→2400 と
+# 引き上げても、評価サンプルを 20→80 問に増やした結果 1 チェックポイントあたりが
+# 4 倍になり、遅いノードの通知が +4700s 台＝実験終了 +1560s から 3200s 超で到着し、
+# 2400s の固定 grace を超えて再び取りこぼした）。idle ベースなら、ノードが順次
+# 完了している限り待ち続け、本当にハングしたノードだけを長い沈黙で検出できる。
+# 実測の最大ギャップは「実験終了→最初の完了」の約 1800s（80問×6ckpt で ~30 分）
+# なので、外部 GPU 競合による変動も見込んで 3600s（60 分の沈黙）を上限とする。
+_POST_EXPERIMENT_EVAL_IDLE_GRACE_SECONDS = 3600.0
 
 
 # 実験開始のwall-clock時刻（time.time()）。全クライアントreadyで実験開始した時に
@@ -215,6 +216,11 @@ class WAFLServer:
         self.evaluation_done: set[int] = set()
         self.evaluation_done_lock = threading.Lock()
         self._all_evaluations_logged = False
+        # 完了通知の受付を諦める判定は「最後に評価関連の活動（実験終了 or
+        # 完了通知受信）があってからの無応答時間」で行う（_accept_clients参照）。
+        # experiment_end からの固定 grace では post-eval が重くなるたびに破綻した
+        # ため、活動起点をずらす idle ベースへ変更した
+        self._last_eval_activity: float | None = None
 
         # ソケット
         self.server_socket: socket.socket | None = None
@@ -280,13 +286,25 @@ class WAFLServer:
 
         実験開始前は登録（register）・Ready待受を、実験終了後は各クライアントの
         実験後評価の完了通知（evaluation_complete）を受け付ける。全peerの評価
-        完了を検出した時点、またはグレース期間（_POST_EXPERIMENT_EVAL_GRACE_SECONDS）
-        が過ぎた時点でループを終える。
+        完了を検出した時点、または完了通知が
+        _POST_EXPERIMENT_EVAL_IDLE_GRACE_SECONDS の間まったく届かなくなった
+        （＝残りのノードがハングしたとみなせる）時点でループを終える。
         """
         while self.server_socket:
             if self.experiment_end_time is not None:
-                elapsed_since_end = time.time() - self.experiment_end_time
-                if self._all_evaluations_done() or elapsed_since_end > _POST_EXPERIMENT_EVAL_GRACE_SECONDS:
+                if self._all_evaluations_done():
+                    break
+                # 無応答時間の起点は「最後の完了通知」、まだ 1 件も来ていなければ
+                # 「実験終了時刻」。ここを超える沈黙が続いたときだけ諦める
+                idle_since = self._last_eval_activity or self.experiment_end_time
+                if time.time() - idle_since > _POST_EXPERIMENT_EVAL_IDLE_GRACE_SECONDS:
+                    with self.evaluation_done_lock:
+                        missing = sorted(set(self._collect_all_peers()) - self.evaluation_done)
+                    print(
+                        f"[{_now()}]\t[SERVER]\t[Accept    ]\tGiving up on evaluation_complete after "
+                        f"{_POST_EXPERIMENT_EVAL_IDLE_GRACE_SECONDS:.0f}s of silence. "
+                        f"Missing peers: {missing}", flush=True,
+                    )
                     break
 
             try:
@@ -301,8 +319,33 @@ class WAFLServer:
                     session.close()
                     continue
 
+                if msg.get("type") == "eval_result":
+                    # 評価専用ホスト（eval_worker.py）から届く 1 checkpoint 分の accuracy。
+                    # results/<exp>/device_eval.log に JSON Lines で集約する（analyze.py が
+                    # per-device accuracy として読む）。評価が続いている間は idle grace を
+                    # リセットして、完了通知前にタイムアウトしないようにする
+                    self._last_eval_activity = time.time()
+                    if self.experiment_dir_name is not None:
+                        log_path = (
+                            get_base_dir() / "results" / self.experiment_dir_name / "device_eval.log"
+                        )
+                        record = {
+                            "peer_id": msg.get("peer_id"),
+                            "step": msg.get("step"),
+                            "accuracy": msg.get("accuracy"),
+                        }
+                        try:
+                            with open(log_path, "a") as f:
+                                f.write(json.dumps(record) + "\n")
+                        except OSError as e:
+                            print(f"[{_now()}]\t[SERVER]\t[Accept    ]\tFailed to write device_eval.log: {e}", flush=True)
+                    session.close()
+                    continue
+
                 if msg.get("type") == "evaluation_complete":
                     peer_id = msg["peer_id"]
+                    # 活動時刻を更新して idle grace のタイマーをリセットする
+                    self._last_eval_activity = time.time()
                     with self.evaluation_done_lock:
                         self.evaluation_done.add(peer_id)
                         done_count = len(self.evaluation_done)

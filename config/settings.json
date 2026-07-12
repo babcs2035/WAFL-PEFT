@@ -5,10 +5,10 @@
   "training": {
     "learning_rate": 2e-4,
     "batch_size": 1,
-    "grad_accum_steps": 4,
+    "grad_accum_steps": 8,
     "lr_warmup_steps": 20,
-    "lr_min_ratio": 1.0,
-    "max_seq_len": 256,
+    "lr_min_ratio": 0.5,
+    "max_seq_len": 208,
     "lora_rank": 16,
     "lora_alpha": 32,
     "eval_interval_seconds": 60
@@ -31,11 +31,11 @@
     "deploy_dir": "/home/denjo/workspace/ktakahashi/WAFL-PEFT"
   },
   "experiment": {
-    "experiment_name": "default",
+    "experiment_name": "Iter12_best",
     "contact_pattern_file": "rwp_n05_a0500_r100_p10_s42.json"
   },
   "global_eval": {
     "interval_seconds": 120,
-    "sample_limit": 20
+    "sample_limit": 40
   }
 }

@@ -396,28 +396,44 @@ def load_global_eval_log(
 
 
 def load_device_eval_log(
+    experiment_dir: Path,
     all_metrics: dict[int, list[dict[str, Any]]],
 ) -> dict[int, tuple[list[float], list[float]]]:
-    """各クライアントが実験終了後に自分のGPUで記録した"eval"レコード
-    （accuracyフィールド付き）をノードごとの時系列に整形する。
+    """各学習 peer の checkpoint 別 accuracy をノードごとの時系列に整形する。
 
-    client.py の run_post_experiment_evaluation が、自分のチェックポイント
-    履歴を評価してmetrics_queue経由でmetrics_peer_X_final.logへ記録した
-    ものであり、collect_logs.pyの既存rsync機構ですでにresults/{exp}/logs/
-    peer_X/ 配下に回収済みのため、ここでは再評価せずload_metrics()が読み
-    込んだall_metricsから該当レコードを抽出するだけでよい。
+    現行アーキテクチャ: 評価専用ホスト（eval_worker.py）が学習中から随時
+    checkpoint を評価し、結果をサーバーが results/{exp}/device_eval.log に
+    集約する（{"peer_id","step","accuracy"} の JSON Lines）。step から経過時間は
+    global_eval と同様に _get_avg_elapsed_at_step で復元する。
+
+    後方互換: device_eval.log が無い古い実験では、学習ノードが自己評価して
+    metrics_peer_X_final.log へ記録した "eval" レコードにフォールバックする。
     """
     results: dict[int, tuple[list[float], list[float]]] = {}
+
+    records = _read_jsonl(experiment_dir / "device_eval.log")
+    if records:
+        by_peer: dict[int, list[dict[str, Any]]] = {}
+        for r in records:
+            pid = r.get("peer_id")
+            if pid is None or "accuracy" not in r:
+                continue
+            by_peer.setdefault(int(pid), []).append(r)
+        for pid, recs in by_peer.items():
+            recs.sort(key=lambda m: m.get("step", 0))
+            times = [_get_avg_elapsed_at_step(all_metrics, m.get("step", 0)) for m in recs]
+            accs = [m["accuracy"] for m in recs]
+            results[pid] = (times, accs)
+        return results
+
+    # フォールバック（旧: 学習ノード自己評価の "eval" レコード）
     for pid, metrics in all_metrics.items():
-        records = [
-            m for m in metrics
-            if m.get("type") == "eval" and "accuracy" in m
-        ]
-        if not records:
+        recs = [m for m in metrics if m.get("type") == "eval" and "accuracy" in m]
+        if not recs:
             continue
-        records.sort(key=lambda m: m.get("step", 0))
-        times = [m.get("elapsed", 0.0) for m in records]
-        accs = [m["accuracy"] for m in records]
+        recs.sort(key=lambda m: m.get("step", 0))
+        times = [m.get("elapsed", 0.0) for m in recs]
+        accs = [m["accuracy"] for m in recs]
         results[pid] = (times, accs)
     return results
 
@@ -750,7 +766,7 @@ def main() -> None:
         else:
             print("\nNo global_eval.log records found. Skipping merged-model convergence.")
 
-        per_peer_acc = load_device_eval_log(all_metrics)
+        per_peer_acc = load_device_eval_log(EXPERIMENT_DIR, all_metrics)
         if per_peer_acc:
             per_peer_acc_path = plot_per_peer_accuracy(per_peer_acc)
         else:

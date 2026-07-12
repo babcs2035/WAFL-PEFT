@@ -92,6 +92,11 @@ def start_client_container(ip: str, peer_id: int) -> str:
         f"--net=host "
         f"--add-host {SERVER_HOST}:{SERVER_HOST_IP} "
         f"-e PEER_ID={peer_id} "
+        # 断片化由来の OOM を抑える。巨大 vocab(262144) の logits transient と外部 GPU 競合
+        # (~2GB, 可変)で reserved が膨らみ、total 12GB 近傍で 256MB 級の割当が断片化により
+        # 失敗する事例が発生したため、expandable_segments で予約領域を伸縮可能にする
+        # （seq_len を削らずに済むので truncation による学習劣化を招かない）
+        f"-e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
         f"-v {DEPLOY_DIR}/src:/app/src "
         f"-v {DEPLOY_DIR}/config:/app/config "
         f"-v {DEPLOY_DIR}/data:/app/data "

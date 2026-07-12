@@ -98,6 +98,16 @@ ssh "$SSH_USER@$SERVER_HOST" \
 description = "ローカル->管理サーバー->各学習デバイスへの階層的デプロイ"
 depends = ["deploy:distribute"]
 
+[tasks."deploy:eval"]
+description = "評価専用ホスト(hosts.eval.txt)へregistry pullでimageを配布し、ベースモデル・GSM8Kデータセットも同期する（mise deploy 実行後に行う。registryが起動済みである必要がある）"
+run = """\
+SSH_USER=$(python3 -c "import json; print(json.load(open('config/settings.json'))['deployment']['ssh_user'])")
+SERVER_HOST=$(python3 -c "import json; print(json.load(open('config/settings.json'))['server']['server_host'])")
+DEPLOY_DIR=$(python3 -c "import json; print(json.load(open('config/settings.json'))['deployment']['deploy_dir'])")
+ssh "$SSH_USER@$SERVER_HOST" \
+  "cd $DEPLOY_DIR && python3 src/deploy_distribute.py eval"
+"""
+
 [tasks.clean]
 description = "ローカル(cache,.venv,data)+全ノードのDockerコンテナ・イメージ・デプロイディレクトリを削除"
 run = "uv run python src/clean.py"
@@ -129,6 +139,16 @@ ssh "$SSH_USER@$SERVER_HOST" \
 [tasks.start]
 description = "管理サーバーと全学習デバイスを起動し、実験を開始（グローバル収束性能のリアルタイム監視を含む）"
 depends = ["start:server", "start:clients"]
+
+[tasks."start:eval"]
+description = "評価専用ホスト(hosts.eval.txt)でeval_workerコンテナを起動し、学習中からcheckpointを随時評価する"
+run = """\
+SSH_USER=$(python3 -c "import json; print(json.load(open('config/settings.json'))['deployment']['ssh_user'])")
+SERVER_HOST=$(python3 -c "import json; print(json.load(open('config/settings.json'))['server']['server_host'])")
+DEPLOY_DIR=$(python3 -c "import json; print(json.load(open('config/settings.json'))['deployment']['deploy_dir'])")
+ssh "$SSH_USER@$SERVER_HOST" \
+  "cd $DEPLOY_DIR && python3 src/start_eval_workers.py"
+"""
 
 # ============================================================
 # analyze: データ回収と評価
