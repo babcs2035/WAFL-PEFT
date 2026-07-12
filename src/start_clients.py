@@ -25,6 +25,12 @@ else:
 REGISTRY_PORT = 5000
 IMAGE_NAME = f"127.0.0.1:{REGISTRY_PORT}/wafl-peft:latest"
 
+# ベースライン実験用のクライアント挙動フラグ。起動時の環境変数をコンテナへそのまま渡す。
+# WAFL_P2P_ENABLED=0 で P2P 重み交換を無効化（self-training / 孤立訓練ベースライン）。
+# WAFL_SELF_EVAL=0 で学習ノードの自己評価を無効化（評価専用ホストへ評価を委譲する場合）。
+_P2P_ENABLED = os.environ.get("WAFL_P2P_ENABLED", "1")
+_SELF_EVAL = os.environ.get("WAFL_SELF_EVAL", "1")
+
 # 管理サーバー上かローカルかでSSH接続方法を変える
 _CURRENT_HOSTNAME = socket.gethostname()
 if _CURRENT_HOSTNAME == SERVER_HOST or SERVER_HOST_IP in _CURRENT_HOSTNAME:
@@ -92,6 +98,8 @@ def start_client_container(ip: str, peer_id: int) -> str:
         f"--net=host "
         f"--add-host {SERVER_HOST}:{SERVER_HOST_IP} "
         f"-e PEER_ID={peer_id} "
+        f"-e WAFL_P2P_ENABLED={_P2P_ENABLED} "
+        f"-e WAFL_SELF_EVAL={_SELF_EVAL} "
         # 断片化由来の OOM を抑える。巨大 vocab(262144) の logits transient と外部 GPU 競合
         # (~2GB, 可変)で reserved が膨らみ、total 12GB 近傍で 256MB 級の割当が断片化により
         # 失敗する事例が発生したため、expandable_segments で予約領域を伸縮可能にする

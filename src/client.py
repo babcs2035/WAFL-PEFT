@@ -651,7 +651,15 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
     - 受信データを一時バッファへ格納し、マージ計算のみを行う
     - マージ結果はmerge_queueに渡すだけで、model本体には触れない
       （実際の反映はThread 3がステップ境界で行う。C1/C2参照）
+
+    ベースライン実験用: 環境変数 WAFL_P2P_ENABLED=0 のとき、このスレッドは何もせず終了する。
+    送信もマージも行われず merge_queue は空のままなので、各ノードは知識共有なしで自シャードのみを
+    学習する（self-training / 孤立訓練ベースライン）。WAFL-PEFT の P2P 協調学習との比較に用いる。
     """
+    if os.environ.get("WAFL_P2P_ENABLED", "1") == "0":
+        print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tP2P disabled (WAFL_P2P_ENABLED=0): self-training baseline (no weight exchange).", flush=True)
+        return
+
     print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tThread 2 (P2P Exchange) started")
 
     # peer_id -> IP マッピング
