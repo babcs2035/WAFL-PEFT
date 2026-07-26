@@ -1,0 +1,15 @@
+{
+  "repo": "WAFL-PEFT",
+  "iteration": "Iter12",
+  "iteration_name": "逐次（同期バリア）方式との throughput 比較",
+  "phase": "experiment",
+  "status": "running",
+  "current_lever": "sequential_throughput_comparison",
+  "experiment_dir": null,
+  "experiment_deadline": null,
+  "updated_at": 1785033600,
+  "last_slack_ts": "1784347974.896029",
+  "iteration_thread_ts": null,
+  "notion_toggle_created": false,
+  "last_commit": null
+}

@@ -1,0 +1,197 @@
+# research-cycle 設定: WAFL-PEFT
+# サイクル全体の手順はグローバル skill（~/.claude/skills/research-cycle/SKILL.md）が規定する．
+# ここにはこのリポジトリ固有の差分だけを書く．
+
+repo_name: WAFL-PEFT
+
+# 実験の起動系（実機 5 ノード + 管理サーバ，Docker + ローカル registry，mise タスク）
+tasks:
+  setup:   "mise run setup"
+  deploy:  "mise run deploy"
+  run:     "mise run start"
+  analyze: "mise run analyze"
+  clean:   "mise run clean"        # 破壊的．自動実行しない（backlog 経由で人間判断）
+
+experiment:
+  name_scheme: "Iter{n}"           # results/Iter{n}_<timestamp>/ で識別
+  results_glob: "results/*/output/analysis_report.md"
+  metrics_cmd: "uv run python src/compare_runs.py"   # 反復集計（平均±標準偏差）
+  timeout_min: 80                  # 学習 ~26 分 + 実験後評価（self-eval）で最大 ~80 分
+  poll_interval_sec: 120
+
+# journal.md に残す直近イテレーション数．超過分は自動で journal_archive.md へ移す
+# （reflector が rotate_journal.sh を呼ぶ）．journal.md の肥大化・毎フェーズの Read コストを抑えるため．
+journal_retention: 3
+
+# 単一レバー原則で振る候補（順序＝優先度）．1 イテレーションで動かすのは 1 つだけ．
+#
+# 2026-07-26 全面改訂（詳細と出典は plans/p0001_research_direction_2026-07.md）．
+# 「約 22% が固定制約下の上限で収束済み」という Iter11 時点の判定は保留とした．理由は，評価が
+# 40〜80 問しかなく，p≈0.225 における二項 SE が 4.67〜6.60pt，80% power で検出可能な最小差が
+# 18.5〜26.2pt であるのに対し，成功条件が「+2pt 以上」だったためである（+2pt の検出には対比較でも
+# 約 1,962 問が必要で，GSM8K test 全 1319 問でも足りない）．rank32 の「大幅悪化」(z≈1.0) を含め，
+# +14pt の全体効果を除くほぼすべての判定が測定ノイズの範囲内だった．
+# したがって W1・W2（測定系の立て直し）を最優先とし，これを終えるまで accuracy 系の判定は行わない．
+levers:
+  # --- W1: 最優先．これ以前に accuracy 系のレバーを振っても判定できない ---
+  - {name: eval_resolution, values: [500, 1319],
+     note: "[2026-07-26 p0001 F1] 評価問題数を 40〜80 から 500 以上（可能なら GSM8K test 全 1319 問）へ
+            拡大する．併せて (a) 全条件で同一問題集合を使い McNemar で対比較，(b) Wilson 95% CI を必ず併記，
+            の 2 点を src/compare_runs.py に導入すること．ノード 10 台の accuracy を平均しても問題
+            サンプリング誤差は減らない（同一問題を使うため）ので代替にならない．
+            参考: Bowyer+ ICML2025 Spotlight (arXiv:2503.01747) は n<数百 で CLT ベースの誤差棒が
+            不確実性を大幅に過小評価すると示している"}
+
+  # --- W2: ベースラインの健全性確認．どの研究方向よりも優先度が高い ---
+  - {name: max_seq_len, values: [512, 320],
+     note: "[2026-07-26 p0001 F5・実測確認済み] **現行の 208 は GSM8K 学習例 7473 件のうち 2428 件
+            (32.5%) で回答末尾を切り落としている**（トークナイザー実測．full_text 長は平均 188.1・
+            中央値 175・p90 282・最大 543）．src/client.py:414 は回答が『完全に』失われた例のみ除外する
+            ため（該当 1 件），部分切り詰めの 32.5% はそのまま学習される．GSM8K の採点は末尾の
+            `#### N` を抽出して行うので，学習例の約 1/3 が最終回答を含まない CoT になっている．
+            これはベースライン 8.5%・頭打ち 22.5% を説明する最有力の機序であり，**W1 と並んで最優先**．
+            512 で切り詰めはほぼ解消（残り 3 件）．320 なら 4.9%．
+            注意: 208→512 は系列長 2.46 倍で活性化メモリが増える．空き VRAM は約 6〜8.4GB/台で
+            Iter8 当時（12GB）より少ないため，OOM したら 320 を中間案とする．
+            **このレバーは accuracy の絶対水準を大きく動かす可能性があるため，W1（評価解像度）と
+            同時に実施し，以降の全比較のベースラインを取り直すこと**"}
+
+  # --- W3: WAFL 原典との乖離の解消．改善策ではなく仮説の切り分けとして位置付ける ---
+  - {name: merge_include_self, values: [true],
+     note: "[2026-07-26 p0001 F2] src/client.py:882-902 の merged は受信した remote peer のみを平均し
+            （count に自ノードが入らない），:1151-1155 で param.copy_() によりローカル重みを完全上書き
+            する．接触相手が 1 台のとき（RWP のペア接触では通常こうなる）これは平均ではなく
+            『相手の重みへの置換』であり，直前のマージ以降の自ノードの学習が全て破棄される．
+            WAFL 原典 (Ochiai+ arXiv:2205.11779) の定式化は自ノードを含む平均であり，本実装は
+            別アルゴリズムになっている．接触窓 3000s の悪化(Iter6)・rank32 の悪化(Iter11) を統一的に
+            説明しうる．ただし現行方式でも +14pt は出ているため改善は保証されない"}
+
+  # --- W4: WAFL 原典が明示的に規定している過学習対策 ---
+  - {name: skip_local_train_when_isolated, values: [true],
+     note: "[2026-07-26 p0001] WAFL 原典 Eq.(4) 直後に『If |nbr(n)| = 0, this minibatch-based adjustment
+            process should be skipped because it causes over-fitting to the local dataset』と明記されている．
+            現行実装が孤立時も局所学習を続けているなら，『小シャード由来の過学習』という既存の判定は
+            この未実装に起因する可能性がある．接触窓 1500s→3000s の悪化とも整合する"}
+
+  # --- W5/W6: LoRA 集約の改良．W1 完了後に着手する ---
+  - {name: lora_exchange_scope, values: [lora_A_only],
+     note: "[2026-07-26 p0001] FedSA-LoRA (Guo+ ICLR2025, arXiv:2410.01463)．A=汎用知識・B=クライアント
+            固有知識という非対称性に基づき A のみ共有する．merge のキーフィルタ 10 行未満で実装できる．
+            per-node accuracy を指標とする現行の評価系と相性が良い．
+            反証: 報告改善幅は GSM8K で +0.40pt（LLaMA3-8B・3client・IID）と小さい．また RoLoRA
+            (NeurIPS2025) は非 IID 下で FFA-LoRA が素の LoRA を下回る例を報告 (MNLI 81.19→75.60)．
+            前提: W3 の初期化・集約の整合を先に確認すること（lora_A の初期値がノード毎に異なる．
+            src/client.py:1523 の set_deterministic_seed(PEER_ID) 由来．p0001 F3）"}
+  - {name: alternating_merge_interval, values: [1, 5, 10, 20],
+     note: "[2026-07-26 p0001] ADF-LoRA (arXiv:2511.18291)．学習は T ラウンド毎に A 相/B 相を切り替えるが，
+            マージは常に A・B 両方行う．10 client・ペア接触確率 0.1 という WAFL 相当の設定での唯一の
+            実測値がある（LoRA 0.8458 / FFA 0.8268 / RoLoRA 0.8284 / ADF(T=5) 0.8505）．
+            反証: DFL 特化手法の改善幅は小さく（平均 +0.47pt），既存の測定ノイズに埋もれる可能性がある．
+            また RoLoRA の +15pt は分散環境では再現せず劣化する（サーバが凍結ブロックの同一性を強制
+            できる前提に依存）．TAD-LoRA (arXiv:2602.00451) は接続が疎なほど効くと報告しており，
+            先に接触パターンの実効的な接続密度を測るべき"}
+
+  # --- W2b: W2 が VRAM で詰まった場合の前提条件．F6 の根本原因に直接対処する ---
+  - {name: ple_device, values: [cpu],
+     note: "[2026-07-26 p0001 F6・実測確認済み] model.safetensors のヘッダ実測により，
+            embed_tokens_per_layer [262144,8960] BF16 が 4.375 GiB，embed_tokens が 0.750 GiB で，
+            **embed 系 5.162 GiB が全体 9.543 GiB の 54% を占める**ことを確認した．bitsandbytes は
+            nn.Linear のみ量子化し nn.Embedding は量子化しないため，この 54% は 4-bit 化されず
+            fp16 で常駐する（src/client.py:289 の『4-bit で約 2.5GiB』というコメントは PLE を
+            勘定していない）．これが VRAM 制約の本体であり，max_seq_len=208 への削減（Iter8）と
+            F5 の 32.5% 欠落を引き起こした根本原因である．
+            Per-Layer Embedding は本来 CPU/高速ストレージに置いて必要分だけ読み出す設計であり
+            （E2B の『実効 2B』という呼称もこれが前提），device_map で embed_tokens_per_layer を
+            CPU へオフロードすれば VRAM を 4.4GiB 前後解放できる可能性がある．
+            W2（seq_len 拡大）が OOM する場合はこれを先に実施すること．
+            反証: オフロードによる速度低下は未測定であり，学習時間 26 分/ラウンドが伸びる可能性がある"}
+
+  # --- W7〜W9: 実験規模の拡大．W1〜W3 を終えてから，1 イテレーションに 1 つずつ ---
+  - {name: train_dataset, values: [MetaMathQA],
+     note: "[2026-07-26 p0001 2b] 10 ノード × シャード 1345 を維持するには 13,450 問以上が必要だが
+            GSM8K train は 7,473 問しかない．MetaMathQA (395K) は GSM8K を rephrase/FOBAR/
+            self-verification で拡張したもので**問題分布が現行と連続**し，比較可能性を最も保てる
+            （LLaMA-2-7B で 66.5 / Mistral-7B で 77.7 を報告．公式 SFT 設定は max length 512 で
+            F5 の実測と一致）．代替: Orca-Math-200K (Mistral-7B で 86.81)，OpenMathInstruct-2 (14M)，
+            MathInstruct (225K，OpenFedLLM が採用)．
+            注意: MetaMathQA/Orca-Math は GPT 生成派生のため商用可否を要確認．
+            なお OpenFedLLM(KDD'24) は各クライアント 5K サンプルで実験しており，現状の 1,345 は
+            その 1/4 未満．タスクを分類問題に変える必要はない（GSM8K は FL 文献でも標準的な評価軸）"}
+  - {name: node_count, values: [10],
+     note: "[2026-07-26 p0001 2b] **WAFL 原典 (arXiv:2205.11779) は n=10 固定**であり，RWP 設定
+            rwp0500(一辺500m/到達100m/pose10) も現行の a0500_r100_p10 と一致する．つまり 10 ノード化は
+            『精度を上げるレバー』ではなく『原典と同じ土俵に戻して比較可能性を得る』という論文上の
+            正当化として位置付けるのが妥当．
+            交絡: 総データ量固定なら 1 ノード 1345→747 に半減し，過学習という既存の診断を悪化させる
+            方向（文献は総データ量固定が主流．arXiv:2503.20768 は『By maintaining the total dataset
+            size and varying the number of clients』と明記）．シャードサイズ固定にするには
+            上記 train_dataset の変更が前提になる．
+            RWP のペア接触率は n に依存しない（β≈2wd·E[V*]/A）ため面積等を固定すればペア接触率は不変，
+            ノードあたり接触機会は約 2 倍．ただし実測で『600step 中一度も会わないペア』が
+            0-10%(n=5) → 4-16%(n=10) に悪化する．
+            **反証: 文献で有意な n 効果が出るのは 10→100→1000 の桁スケールで，5→10 の 2 倍程度で
+            明確な差を報告した例は見つからなかった．評価を 1319 問に直しても最小検出差は約 4.5pt で，
+            5→10 の効果がこれを超える保証はない．優先度は W1・W2 より低い．**
+            比較可能にする条件: n=5 側も seed 42/43/44 の 3 本で測り直す（現状 1 seed でトポロジー由来の
+            分散が不明）．接触パターンは RWP パラメータを完全固定して n だけ変えて再生成する"}
+  - {name: base_model, values: [Qwen2.5-1.5B-Instruct, Qwen2.5-3B-Instruct],
+     note: "[2026-07-26 p0001 F6/2b] Gemma 4 E2B は PLE のため 4-bit でも重み約 6.4GiB で 6GB に収まらない．
+            代替は Qwen2.5-1.5B-Instruct(重み約1.1GiB, GSM8K 73.2) / Qwen2.5-3B-Instruct(約2.0GiB, 86.7) /
+            Llama-3.2-3B-Instruct(約2.1GiB, 77.7)．RTX4060 8GB の外部プロファイリングでは
+            3B級+4bit+gradient checkpointing で seq_len 2048 まで実行可能と報告 (arXiv:2509.12229)．
+            **反証: Qwen2.5-3B の 86.7 のような強いベースは天井効果を生み『協調学習の上積み』が
+            見えなくなる．協調の効果を測るなら 1.5B(73.2) に留め Non-IID を強めにする方が妥当．**
+            また F7 の PT/IT 問題（chat_template が無く PT 版だが README は -it を 4 箇所で参照）を
+            先に解決すること．IT 版に差し替えるだけでベースラインが跳ね上がるなら，
+            『協調学習の効果』という主張自体が組み替えになる．
+            **最大の反証: モデル変更は Iter1〜12 の accuracy 系列との比較を完全に切断する．
+            変更するなら最後に回し，固定するもの（Non-IID 分割の seed とアルゴリズム，接触パターン，
+            評価プロトコルの #### 抽出と max_new_tokens=256，LoRA rank16/alpha32）を明示すること**"}
+
+  # --- 以下は Iter1〜11 で試行済み（履歴．判定は W1 完了後に再評価が必要） ---
+  - {name: eval_max_new_tokens, values: [200, 256], note: "cycle 短縮（accuracy には中立）"}
+  - {name: lora_dropout,        values: [0.10, 0.15, 0.20], note: "0.15 が僅かに最良とされたが，n=80 では有意差なし（p0001 F1）"}
+  - {name: lr_min_ratio,        values: [0.3, 0.5, 0.7], note: "0.5 が最良とされたが，n=80 では有意差なし（p0001 F1）"}
+
+# 研究フロンティア（paper.tex の展望．いずれも新規実装 or ノード確保を伴うため
+# planner が着手前に backlog へ登録し，可逆な範囲で進める / 不可逆はエスカレーション）
+research_frontier:
+  - "逐次方式（P2P を訓練ループ内で同期実行）との throughput 直接比較（client.py に同期フラグ）"
+  - "実機ノード数のスケール（数十規模）でネットワーク層の課題を検証（要ノード確保→人間判断）"
+  - "無線アドホック模擬（帯域制限・パケットロス・急な切断）下の通信頑健化"
+  - "不均一な計算進捗が知識収束に与える偏りの検証（Koloskova 理論の実機検証）"
+
+baselines:
+  - {name: self_training, env: {WAFL_P2P_ENABLED: "0"}}   # 孤立学習（P2P 無効）
+  # 評価経路の切替: WAFL_SELF_EVAL=0/1（既定 self-eval ON）
+
+# 最良構成（固定点）: rank16 / alpha32 / lr2e-4 / lr_min_ratio0.5 / dropout0.15 / grad_accum8 / seq208
+# 変更対象は config/settings.json の training セクション
+# 2026-07-26 改訂（p0001 F1）．旧基準「ノイズ（±5pt）を超えて +2pt 以上」は，n=40〜80 では
+# 80% power で検出可能な最小差が 18.5〜26.2pt であり，原理的に判定不能だった．
+success_criteria: "【W1 完了までの暫定】評価が 500 問未満の間は accuracy の増減を採否根拠にしない
+  （throughput・通信量・wall-clock など，サンプリング誤差の影響を受けない指標は対象外＝従来どおり判定してよい）．
+  W1 完了後に以下を適用する:
+  (1) 主基準は，全条件で同一問題集合を用いた McNemar 対比較（α=0.05）で有意差があること．
+  (2) 効果量は Wilson 95% CI を必ず併記し，CI が重なる変化は『判定不能』として採用も棄却もしない．
+  (3) 事前に power analysis を行い，狙う効果量が現在の n で検出可能かを計画フェーズで明示すること．
+      検出不能な効果量しか見込めないレバーは，実験せずに『測定不能』として backlog へ回す．"
+
+slack:
+  channel: "#research-cycle"
+  channel_id: "C0BJHRL037B"
+  mention_user_id: "U055AN8LWF6"
+
+notion:
+  parent_page: "Lab/Research"
+  database_id: "12c71cc0-c905-49b4-810f-247c230b3964"   # data_source_id（Research Cycle Log）
+  repo_page_id: "3a15abda-e3f1-8126-869e-d3af0af7f771"  # WAFL-PEFT 行のページ ID
+
+git:
+  enabled: true
+  branch: "main"
+  commit_per_iteration: true
+  push: true
+
+autonomy:
+  destructive_requires_human: true

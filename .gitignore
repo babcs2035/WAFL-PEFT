@@ -32,3 +32,10 @@ Thumbs.db
 
 # Model cache
 cache/
+
+# research-cycle の実行時メタデータ（セッション固有・共有しない）
+# journal.md / state.json / backlog.md / config.yml は研究の一次記録なので追跡する
+.claude/settings.local.json
+.claude/research/agent.json
+.claude/research/model_mode
+.claude/research/.watchdog_*
