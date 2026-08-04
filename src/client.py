@@ -690,6 +690,47 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
     incoming_connections: dict[int, socket.socket] = {}
     conn_lock = threading.Lock()
 
+    def _recv_peer_info(conn: socket.socket) -> int | None:
+        """接続からpeer_idを受信し、active_connectionsへ登録する。
+
+        着信接続（accept_incoming内）とoutgoing接続の両方で再利用する。
+        戻り値: peer_id（成功時）または None（失敗時）
+        """
+        # peer_idを受信
+        header = _recv_exact(conn, 4)
+        if header is None:
+            return None
+        length = int.from_bytes(header, "big")
+        pid_bytes = _recv_exact(conn, length)
+        if pid_bytes is None:
+            return None
+        peer_info = json.loads(pid_bytes.decode("utf-8"))
+        peer_id = peer_info.get("peer_id", -1)
+        if peer_id < 0:
+            return None
+        with conn_lock:
+            active_connections[peer_id] = conn
+
+        # 重みデータを受信
+        while state.running:
+            with conn_lock:
+                if active_connections.get(peer_id) is not conn:
+                    break
+            wh = _recv_exact(conn, 4)
+            if wh is None:
+                break
+            wlen = int.from_bytes(wh, "big")
+            if wlen == 0 or wlen > 100 * 1024 * 1024:
+                break
+            weight_data = _recv_exact(conn, wlen)
+            if weight_data is None:
+                break
+
+            with receive_lock:
+                receive_buffers[peer_id] = weight_data
+
+        return peer_id
+
     # 受信ハンドラスレッド
     def accept_incoming() -> None:
         """着信P2P接続を受付け。"""
@@ -835,6 +876,8 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                 with conn_lock:
                     active_connections[pid] = conn
                 print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tP2P connected to peer {pid} ({peer_ip})")
+                # outgoing 接続からも相手の重みを受信
+                _recv_peer_info(conn)
             except OSError:
                 pass
 
