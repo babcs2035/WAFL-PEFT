@@ -1,3 +1,23 @@
+
+## B9 [auto-decided 2026-08-05] Iter16: merge_includes_self動的値化 + W3再評価
+
+- 状況: Iter15でmerge JSONLメトリクス化は成功（248/246件記録）。W3対比実験でloss改善（-4.0%）
+  を観測したが、accuracy比較はTreatmentのglobal_eval.log未生成で未取得。
+  `merge_includes_self`が`src/client.py:1027`で`False`にハードコードされており、
+  W3適用有無をメトリクスから判定できない計測バグがある。
+- 自動選択: Iter16で以下の2点を行う。
+  (1) `merge_includes_self`の動的値化: W3適用時は`true`、未適用時は`false`を出力。
+      これにより次実験でW3適用有無をメトリクスから判定可能になる。
+  (2) W3再評価実験: `merge_includes_self`を動的値にした上で、W3あり/なしの対比実験を
+      再実行。global_eval.logの保存を確認した上でaccuracy比較を行う。
+- 根拠: merge JSONLメトリクス化は完了したが、W3のaccuracyへの独自効果は判定不能。
+  `merge_includes_self`のハードコードを修正しないと、次実験でもW3適用有無が不明。
+  loss改善傾向（-4.0%）は有意なシグナルなので、accuracyでも確認する必要がある。
+- 要レビュー: `merge_includes_self`の動的値化は計測系の変更。W3修正（self重み追加）の有無を
+  コードで制御する仕組みが必要。plannerが実装計画を立てること。
+- 補足: self-evalスキップ（GSM8K validation data not available）はIter16でも解消しない可能性
+  が高い。per-peer accuracyは次イテレーション以降に回す。
+
 # backlog: WAFL-PEFT — 人間判断待ち事項 / 自動判断の記録
 
 新しいものを常に先頭に追記する（逆時系列）．
