@@ -732,13 +732,50 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
         return peer_id
 
     def _recv_peer_info_bg(conn: socket.socket) -> None:
-        """outgoing接続からの重み受信をバックグラウンドスレッドで実行する。
+        """outgoing接続からpeer_idを受信し、重み受信スレッドを起動する。
 
-        _recv_peer_info を同期的に呼ぶと P2P ループがブロックし、
-        重み送信コードが実行されなくなる（双方向デッドロック）。
-        そのため、peer_id受信後の重みデータ受信を別スレッドに委ねる。
+        _recv_peer_info をそのまま呼ぶと重みデータ受信ループで永久ブロックし、
+        メインループの重み送信コードが実行されなくなる（双方向デッドロック）。
+        そのため、peer_id受信のみをここで行い、重みデータ受信は
+        _receive_weights_loop で別スレッドに委ねる。
         """
-        _recv_peer_info(conn)
+        # peer_idを受信
+        header = _recv_exact(conn, 4)
+        if header is None:
+            return
+        length = int.from_bytes(header, "big")
+        pid_bytes = _recv_exact(conn, length)
+        if pid_bytes is None:
+            return
+        peer_info = json.loads(pid_bytes.decode("utf-8"))
+        peer_id = peer_info.get("peer_id", -1)
+        if peer_id < 0:
+            return
+        with conn_lock:
+            active_connections[peer_id] = conn
+
+        # 重みデータ受信スレッドを起動（メインループの重み送信と並列動作）
+        threading.Thread(
+            target=_receive_weights_loop, args=(conn, peer_id), daemon=True
+        ).start()
+
+    def _receive_weights_loop(conn: socket.socket, peer_id: int) -> None:
+        """接続から重みデータを非同期で受信し、receive_buffersへ格納する。"""
+        while state.running:
+            with conn_lock:
+                if active_connections.get(peer_id) is not conn:
+                    break
+            wh = _recv_exact(conn, 4)
+            if wh is None:
+                break
+            wlen = int.from_bytes(wh, "big")
+            if wlen == 0 or wlen > 100 * 1024 * 1024:
+                break
+            weight_data = _recv_exact(conn, wlen)
+            if weight_data is None:
+                break
+            with receive_lock:
+                receive_buffers[peer_id] = weight_data
 
     # 受信ハンドラスレッド
     def accept_incoming() -> None:
