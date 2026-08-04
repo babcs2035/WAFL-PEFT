@@ -6,6 +6,22 @@
 
 ---
 
+## B5 [auto-decided 2026-08-04] Iter13: control 再測定 + treatment 再実験（ログ永続化・peer 状態確認）
+
+- 状況: Iter12 の両条件で accuracy 5.0%（baseline 8.5% 以下）の異常値．treatment で peer 欠落（4/5），
+  クライアントログ消失により `WAFL_P2P_SYNC=1` の有効性検証不能．本次目的（同期 vs 非同期 throughput 比較）は不成立．
+- 自動選択: Iter13 で以下の 3 点を先に行う．
+  (1) control 再測定: 既存最良構成（rank16/alpha32/lr2e-4/dropout0.15/grad_accum8/seq208/window1500s）で
+      baseline 再現を確認し，peer 5 台が正常動作するか検証する．
+  (2) treatment 再実験: (a) 全 peer の GPU 状態を事前確認，(b) クライアントログをコンテナ削除後も残る場所へ
+      永続化，(c) `client.py` 起動時に `p2p_sync_enabled` をログ出力する処理を追加．
+  (3) `settings.json` の `experiment_name` を control/treatment で区別する値に切り替える．
+- 根拠: Iter12 のデータ不備を解消しないと同期バリアの有効性検証ができない．control の再測定で
+  環境全体の問題か Iter12 固有の問題か切り分ける必要がある．
+- 要レビュー: `client.py` への `p2p_sync_enabled` ログ出力追加は実装変更を含む．planner が実装計画を立てる．
+- 補足: levers の W1（評価解像度）は最優先だが，本次は Iter12 の後処理（再測定）を最優先とする．
+  W1 へは Iter14 以降に着手する予定．
+
 ## B4 [auto-decided 2026-07-26] Iter12 の実験ブロッカー解消（GPU 競合の解消を確認）
 
 - 状況: B2 で人間が選択した B1 案「5 台構成のまま GPU 競合の解消を待つ」の待機条件が満たされたかを確認した．

@@ -1,15 +1,29 @@
 {
   "repo": "WAFL-PEFT",
-  "iteration": "Iter12",
-  "iteration_name": "逐次（同期バリア）方式との throughput 比較",
-  "phase": "experiment",
+  "iteration": "Iter13",
+  "iteration_name": "control 再測定 + treatment 再実験（ログ永続化・peer 状態確認）",
+  "phase": "plan",
   "status": "running",
   "current_lever": "sequential_throughput_comparison",
   "experiment_dir": null,
-  "experiment_deadline": null,
-  "updated_at": 1785033600,
+  "experiment_deadline": 1785814904,
+  "updated_at": 1785815147,
   "last_slack_ts": "1784347974.896029",
-  "iteration_thread_ts": null,
-  "notion_toggle_created": false,
-  "last_commit": null
+  "iteration_thread_ts": "1785390000.223339",
+  "notion_toggle_created": true,
+  "last_commit": null,
+  "iter12_results": {
+    "control": {
+      "name": "非同期P2P（既定）",
+      "dir": "results/Iter12ctrl_20260804T113545",
+      "accuracy": 5.0,
+      "experiment_duration_sec": 1560.0
+    },
+    "treatment": {
+      "name": "同期バリア(WAFL_P2P_SYNC=1)",
+      "dir": "results/Iter12ctrl_20260804T121723",
+      "accuracy": 5.0,
+      "experiment_duration_sec": 1560.0
+    }
+  }
 }
