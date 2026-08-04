@@ -731,6 +731,15 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
 
         return peer_id
 
+    def _recv_peer_info_bg(conn: socket.socket) -> None:
+        """outgoing接続からの重み受信をバックグラウンドスレッドで実行する。
+
+        _recv_peer_info を同期的に呼ぶと P2P ループがブロックし、
+        重み送信コードが実行されなくなる（双方向デッドロック）。
+        そのため、peer_id受信後の重みデータ受信を別スレッドに委ねる。
+        """
+        _recv_peer_info(conn)
+
     # 受信ハンドラスレッド
     def accept_incoming() -> None:
         """着信P2P接続を受付け。"""
@@ -876,8 +885,8 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                 with conn_lock:
                     active_connections[pid] = conn
                 print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tP2P connected to peer {pid} ({peer_ip})")
-                # outgoing 接続からも相手の重みを受信
-                _recv_peer_info(conn)
+                # outgoing 接続からも相手の重みを受信（別スレッドでブロック防止）
+                threading.Thread(target=_recv_peer_info_bg, args=(conn,), daemon=True).start()
             except OSError:
                 pass
 
@@ -930,6 +939,15 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                     if pid in prev_whitelist_for_merge
                 }
                 receive_buffers.clear()
+
+            # DEBUG: マージチェックの状況を確認
+            if current_step % 100 == 0:
+                print(
+                    f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tDEBUG merge: step={current_step} "
+                    f"prev_wl={prev_whitelist_for_merge} recv_buf_keys={list(receive_buffers.keys())} "
+                    f"buffers_to_merge={list(buffers_to_merge.keys())}",
+                    flush=True
+                )
 
             if buffers_to_merge:
                 merged: dict[str, torch.Tensor] | None = None
