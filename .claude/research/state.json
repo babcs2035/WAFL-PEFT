@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
   "iteration": "Iter15",
-  "iteration_name": null,
-  "phase": "investigate",
+  "iteration_name": "merge JSONLメトリクス化 + W3対比実験準備",
+  "phase": "experiment",
   "status": "running",
-  "current_lever": null,
-  "experiment_dir": null,
-  "experiment_deadline": null,
-  "updated_at": 1785869500,
-  "last_slack_ts": null,
-  "iteration_thread_ts": "1785833535.381809",
+  "current_lever": "merge_jsonl_metrics",
+  "experiment_dir": "results/Iter15ctrl_20260805T045026",
+  "experiment_deadline": 1785877438,
+  "updated_at": 1785874800,
+  "last_slack_ts": "1785872484.137039",
+  "iteration_thread_ts": "1785871736.158709",
   "notion_toggle_created": true,
-  "last_commit": "182f46b"
+  "last_commit": "de47192"
 }
