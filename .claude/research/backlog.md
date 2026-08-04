@@ -6,6 +6,20 @@
 
 ---
 
+## B7 [auto-decided 2026-08-04] Iter14: W3（merge_include_self）着手 + per-peer ログ収集不具合修正
+
+- 状況: Iter13 で同期バリアが accuracy 改善（20.0% vs 7.5%）を確認．ただし control の baseline 未達成（7.5% < 8.5%）．
+  F2 で特定された「マージが自ノードを含まない」実装乖離が低 accuracy の主因である可能性が高い．
+  また per-peer ログ収集の 50% 欠落（peer 0,2,3,8,9）と `_final.log` 欠落（peers 2,3,8,9）も修正必要．
+- 自動選択: Iter14 で以下の 2 点を行う．
+  (1) W3（`merge_include_self`）: `src/client.py` の merge ロジックに自ノードを含める修正．
+      接触相手 1 台の場合でも「相手の重みへの置換」ではなく「自ノードを含む平均」へ．
+  (2) per-peer ログ収集不具合修正: `_final.log` の欠落と per-peer ログ収集失敗の原因を調査・修正．
+      `analyze.py` のログ収集ロジックまたは `start_clients.py` の rsync 設定に問題がある可能性．
+- 根拠: W3 が control の低 accuracy の主因であれば、同期バリアの有効性評価も再検証が必要．
+  per-peer データが欠落すると統計解析が不可能になるため、必須修正．
+- 要レビュー: W3 の実装計画は planner が立案．5 ノード構成での再測定も併せて検討する．
+
 ## B6 [auto-decided 2026-08-04] Iter13 結果: 同期バリアは accuracy 改善（20.0% vs 7.5%）・W3 着手へ
 
 - 状況: Iter13 で control（非同期 P2P）と treatment（同期バリア `WAFL_P2P_SYNC=1`）を
