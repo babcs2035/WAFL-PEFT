@@ -784,6 +784,11 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
         with state.whitelist_lock:
             whitelist = set(state.peer_whitelist)
 
+        # 直前のwhitelistを保存（マージチェックで接触終了peerのバッファを
+        # 処理するために必要。接触終了peerの重みはwhitelistから外れる前に
+        # 受信済みなので、マージしても安全）
+        prev_whitelist_for_merge = prev_whitelist
+
         # ホワイトリストから外れた（サーバーから明示的にendイベントを受信した）
         # peerを検出し、ログを出す。これにより時変トポロジーのローテーションが
         # 実際の接続状態に反映される
@@ -875,8 +880,11 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
         # 重みが平均マージに混入しうるため、ここで明示的にwhitelistでフィルタする
         if current_step != last_merge_step and current_step > 0:
             with receive_lock:
+                # prev_whitelist_for_mergeを使う: 接触終了peerのバッファも
+                # 含める（そのpeerはwhitelistから外れる前に重みを送信済み）
                 buffers_to_merge = {
-                    pid: bufs for pid, bufs in receive_buffers.items() if pid in whitelist
+                    pid: bufs for pid, bufs in receive_buffers.items()
+                    if pid in prev_whitelist_for_merge
                 }
                 receive_buffers.clear()
 
