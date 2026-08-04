@@ -755,7 +755,11 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
     acceptor.start()
 
     def _close_peer_connections(pid: int) -> None:
-        """指定peerとの送信用・受信用接続を両方クローズする。"""
+        """指定peerとの送信用・受信用接続を両方クローズする。
+
+        NOTE: receive_buffers はここで消さない。マージチェック（本ループの later）
+        が受信バッファを処理する必要があるため。接続切断は送受信用socketのみ。
+        """
         with conn_lock:
             out_conn = active_connections.pop(pid, None)
             in_conn = incoming_connections.pop(pid, None)
@@ -765,8 +769,6 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                     c.close()
                 except OSError:
                     pass
-        with receive_lock:
-            receive_buffers.pop(pid, None)
 
     last_merge_step: int = -1
     # 前回シリアライズ・送信した shadow_weights の版番号。重みが変わった時
