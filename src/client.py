@@ -1006,20 +1006,22 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                         continue
 
                 if merged is not None and count > 0:
-                    # W3: 自ノードの重みを加えて平均する（WAFL 原典 Eq.3 準拠）
-                    with torch.no_grad():
-                        for name, param in model.named_parameters():
-                            if name in merged:
-                                merged[name] = merged[name].to(param.device)
-                                merged[name] = merged[name] + param.float()
-                    count += 1
-
                     for k in merged:
                         merged[k] /= count
 
                     try:
                         state.merge_queue.put(merged, timeout=1.0)
                         last_merge_step = current_step
+                        # merge イベントを JSONL メトリクスへ追記（W3 対比実験用観測）
+                        merge_event = {
+                            "type": "merge", "peer_id": PEER_ID, "step": current_step,
+                            "elapsed": state.elapsed_time, "num_peers_merged": count - 1,
+                            "merge_includes_self": False,
+                        }
+                        try:
+                            state.metrics_queue.put(merge_event, timeout=1.0)
+                        except queue.Full:
+                            pass
                         print(
                             f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tQueued merged weights from {count} peers "
                             f"at step {current_step}"
@@ -1715,10 +1717,7 @@ def main() -> None:
     if os.environ.get("WAFL_SELF_EVAL", "1") != "0":
         # 学習ノードで自己評価（GPU は訓練終了で空いている）。結果は Thread 4 がまだ
         # 動いているうちに metrics_queue へ積む必要があるため、シャットダウン前に実行する
-        try:
-            run_post_experiment_evaluation(state, model, tokenizer)
-        except Exception as e:
-            print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tPost-experiment evaluation failed: {e}", flush=True)
+        run_post_experiment_evaluation(state, model, tokenizer)
         notify_server_evaluation_complete()
     else:
         print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tSelf-eval disabled (WAFL_SELF_EVAL=0); evaluation offloaded to eval hosts.", flush=True)
