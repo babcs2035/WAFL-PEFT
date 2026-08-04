@@ -8,6 +8,75 @@ research-cycle が読み書きする実験ジャーナル．**新しいイテレ
 
 ## Iteration 15: merge JSONLメトリクス化 + W3対比実験
 
+
+### 仮説
+
+W3（`merge_include_self`）修正の独自効果を測定するには、merge イベントの発生を定量観測できる環境と、W3 あり/なしの対比実験の両方が必要である。
+
+Iter14 では W3 修正と P2P 接続修正が同時に適用された結果、accuracy 20.0% の要因が W3 由来か P2P 修正由来か分離不能だった。P2P 接続修正は完了済みなので、次は W3 のみを単一レバーとして対比実験できる。
+
+ただしその前に、merge イベントが JSONL メトリクスに記録されていないため、前実験では merge が「発生したか」さえ確認できなかった。merge JSONL 化を先に行い、観測可能性を確保してから W3 対比実験へ進む。
+
+### 単一レバー
+
+**`merge_jsonl_metrics`**: `src/client.py` の `p2p_exchange_thread`（Thread 2）merge ループで、`state.metrics_queue` へ merge イベントを JSONL 形式で追記する。
+
+- 変更箇所: 行1021 の `state.merge_queue.put(merged, timeout=1.0)` の直後
+- 追加内容: 8 行程度の merge イベント追記
+- 固定構成: W3 修正（120b4ba）は main 既定のまま、学習ハイパラ・接触パターン・settings.json は既存構成に固定
+
+### 変更内容の設計
+
+**`src/client.py` 行1021 直後への追加**:
+
+```python
+merge_event = {
+    "type": "merge", "peer_id": PEER_ID, "step": current_step,
+    "elapsed": state.elapsed_time, "num_peers_merged": count - 1,
+    "merge_includes_self": True,
+}
+try:
+    state.metrics_queue.put(merge_event, timeout=1.0)
+except queue.Full:
+    pass
+```
+
+- `num_peers_merged`: `count - 1`（self を除く remote peer 数）
+- `merge_includes_self`: `True`（W3 修正済みなので self を含む平均）
+- Thread 4（async logger）は既存のキュー読み取りロジックで JSONL へ追記。新規コード不要。
+
+**併せて行う準備作業（単一レバー原則の範囲内）**:
+
+- `git revert 120b4ba` で W3 なし版を作成（W3 対比実験用）
+- これにより W3 なし control 実験と W3 あり treatment 実験を比較可能
+
+### 比較実験の設計
+
+merge JSONL 化完了後、W3 対比実験を以下の順序で実行する:
+
+1. **W3 なし control**: `git revert 120b4ba` 適用後、10 ノードで実験
+2. **W3 あり treatment**: main（120b4ba 適用済み）のまま、10 ノードで実験
+
+両実験とも同一 contact pattern（`rwp_n10_a0500_r100_p10_s42.json`）、同一 settings.json。同日連続実行で GPU 環境差を最小化。
+
+### 成功条件（measurable）
+
+- **主成功条件**: merge イベントが JSONL メトリクスファイルに記録される（`type: "merge"` のレコードが抽出可能）
+- **副成功条件**:
+  1. W3 なし branch が `git revert 120b4ba` で正常に作成される（py_compile 通過）
+  2. merge イベントの `num_peers_merged` フィールドが 0 以上の整数として記録される
+  3. `merge_includes_self` が W3 あり/なしで異なる値（true/false）を出力
+
+### 実装計画
+
+1. `src/client.py` の merge ループ（行1021 直後）に merge イベント追記（8行追加）
+2. `git revert 120b4ba` で W3 なし版を作成（対比実験用）
+3. `python3 -m py_compile src/client.py` で構文エラーなしを確認
+4. W3 なし control 実験実行（`mise run setup&&deploy&&start`）
+5. W3 あり treatment 実験実行（main を使用）
+6. 両実験の merge JSONL メトリクスを解析し、対比結果を報告
+
+---
 ### 実装 (Iter15)
 
 **変更ファイル: `src/client.py`**

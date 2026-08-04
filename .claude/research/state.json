@@ -5,11 +5,11 @@
   "phase": "plan",
   "status": "running",
   "current_lever": "merge_include_self_dynamic",
-  "experiment_dir": "results/Iter15ctrl_20260805T045026;results/Iter15treat_20260805T070339",
+  "experiment_dir": null,
   "experiment_deadline": null,
-  "updated_at": 1785884420,
-  "last_slack_ts": "1785872484.137039",
-  "iteration_thread_ts": "1785871736.158709",
-  "notion_toggle_created": true,
+  "updated_at": 1785885648,
+  "last_slack_ts": null,
+  "iteration_thread_ts": null,
+  "notion_toggle_created": false,
   "last_commit": "42a9cfe"
 }
