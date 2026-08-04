@@ -898,6 +898,14 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                         continue
 
                 if merged is not None and count > 0:
+                    # W3: 自ノードの重みを加えて平均する（WAFL 原典 Eq.3 準拠）
+                    with torch.no_grad():
+                        for name, param in model.named_parameters():
+                            if name in merged:
+                                merged[name] = merged[name].to(param.device)
+                                merged[name] = merged[name] + param.float()
+                    count += 1
+
                     for k in merged:
                         merged[k] /= count
 
@@ -1599,7 +1607,10 @@ def main() -> None:
     if os.environ.get("WAFL_SELF_EVAL", "1") != "0":
         # 学習ノードで自己評価（GPU は訓練終了で空いている）。結果は Thread 4 がまだ
         # 動いているうちに metrics_queue へ積む必要があるため、シャットダウン前に実行する
-        run_post_experiment_evaluation(state, model, tokenizer)
+        try:
+            run_post_experiment_evaluation(state, model, tokenizer)
+        except Exception as e:
+            print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tPost-experiment evaluation failed: {e}", flush=True)
         notify_server_evaluation_complete()
     else:
         print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tSelf-eval disabled (WAFL_SELF_EVAL=0); evaluation offloaded to eval hosts.", flush=True)
