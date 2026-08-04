@@ -6,6 +6,27 @@
 
 ---
 
+## B8 [auto-decided 2026-08-05] Iter15: merge JSONL メトリクス化 + W3 対比実験
+
+- 状況: Iter14 で W3（merge_include_self）修正を実施したが、P2P 接続修正も同時に適用された
+  ため、accuracy 20.0% の要因が W3 由来か P2P 修正由来か分離不能。W3 レバーは「保留」と判定。
+  また merge イベントが print() のみで JSONL メトリクスに記録されていないため、マージの発生を
+  定量観測できない。
+- 自動選択: Iter15 で以下の 2 点を行う。
+  (1) **merge イベントの JSONL メトリクス化**: `src/client.py` の merge ループで、print() 出力
+      だけでなく JSONL メトリクスファイルにも merge イベントを書き出す。フィールド:
+      timestamp, peer_id, num_peers_merged, merge_includes_self (true/false)。
+  (2) **W3 対比実験（control x 2）**: W3 あり control 実験を 1 回、W3 なし control 実験を 1 回
+      実行。accuracy の差が W3 の独自効果。P2P 接続修正は既に完了済みなので固定。
+      ノード数: 10（既存構成継続）。接触パターン: 既存（rwp_n10_a0500_r100_p10_s42.json）。
+- 根拠: W3 修正は WAFL 原典との整合性を取るために必要だが、その効果を測定するには
+  merge の発生を定量観測できる環境が必須。また対比実験なしに W3 の採用/棄却を判定すると、
+  再度単一レバー原則に違反する。
+- 要レビュー: merge JSONL メトリクスのスキーマ設計は実装時に確認。W3 対比実験は 2 回の実行
+  が必要（約 22 分 x 2 = 約 44 分）ため、GPU 環境の確保に注意。
+- 補足: per-peer accuracy の取得も併せて行うべきだが、post-experiment evaluation の実装
+  不備が原因。まずは merge JSONL 化に集中し、per-peer accuracy は Iter16 以降に回す。
+
 ## B7 [auto-decided 2026-08-04] Iter14: W3（merge_include_self）着手 + per-peer ログ収集不具合修正
 
 - 状況: Iter13 で同期バリアが accuracy 改善（20.0% vs 7.5%）を確認．ただし control の baseline 未達成（7.5% < 8.5%）．

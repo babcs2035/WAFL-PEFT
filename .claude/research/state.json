@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
-  "iteration": "Iter13",
-  "iteration_name": "control \u518d\u6e2c\u5b9a + treatment \u518d\u5b9f\u9a13\uff08\u30ed\u30b0\u6c38\u7d9a\u5316\u30fbpeer \u72b6\u614b\u78ba\u8a8d\uff09",
-  "phase": "reflect",
+  "iteration": "Iter15",
+  "iteration_name": null,
+  "phase": "investigate",
   "status": "running",
-  "current_lever": "sequential_throughput_comparison",
-  "experiment_dir": "Iter13treat_20260804T163220",
-  "experiment_deadline": 1785834172,
-  "updated_at": 1785836800,
+  "current_lever": null,
+  "experiment_dir": null,
+  "experiment_deadline": null,
+  "updated_at": 1785869500,
   "last_slack_ts": null,
-  "iteration_thread_ts": "1785816733.010719",
+  "iteration_thread_ts": "1785833535.381809",
   "notion_toggle_created": true,
-  "last_commit": "8ca379152efe0805c39b9e892810bcc5e440fcd2"
+  "last_commit": "182f46b"
 }

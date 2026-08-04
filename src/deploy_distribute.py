@@ -364,6 +364,9 @@ def _run_parallel(
                 results[peer_id] = str(e)
             dot(peer_id)
     print()  # ドット行の改行
+    for i, r in enumerate(results):
+        if r and (r.startswith("FAILED") or r.startswith("Error")):
+            print(f"  [DEBUG] peer={i}: {r[:300]}")
     return results
 
 
