@@ -3,7 +3,7 @@
     "model_id": "google/gemma-4-E2B"
   },
   "training": {
-    "learning_rate": 2e-4,
+    "learning_rate": 0.0002,
     "batch_size": 1,
     "grad_accum_steps": 8,
     "lr_warmup_steps": 20,
@@ -18,7 +18,8 @@
     "seed": 42
   },
   "communication": {
-    "client_p2p_port": 8888
+    "client_p2p_port": 8888,
+    "p2p_sync_timeout_sec": 15.0
   },
   "server": {
     "server_host": "wafl-ctrl5",
@@ -31,8 +32,8 @@
     "deploy_dir": "/home/denjo/workspace/ktakahashi/WAFL-PEFT"
   },
   "experiment": {
-    "experiment_name": "SelfTrain",
-    "contact_pattern_file": "rwp_n05_a0500_r100_p10_s42.json"
+    "experiment_name": "Iter13treat",
+    "contact_pattern_file": "rwp_n10_a0500_r100_p10_s42.json"
   },
   "global_eval": {
     "interval_seconds": 120,

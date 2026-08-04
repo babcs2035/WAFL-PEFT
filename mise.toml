@@ -127,15 +127,17 @@ ssh "$SSH_USER@$SERVER_HOST" \
 """
 
 [tasks."start:clients"]
-description = "管理サーバーから全デバイスへ並列SSHでコンテナ起動（WAFL_P2P_ENABLED/WAFL_SELF_EVAL をサーバー側へ転送）"
+description = "管理サーバーから全デバイスへ並列SSHでコンテナ起動（WAFL_P2P_ENABLED/WAFL_SELF_EVAL/WAFL_P2P_SYNC/WAFL_P2P_SYNC_TIMEOUT_SEC をサーバー側へ転送）"
 run = """\
 SSH_USER=$(python3 -c "import json; print(json.load(open('config/settings.json'))['deployment']['ssh_user'])")
 SERVER_HOST=$(python3 -c "import json; print(json.load(open('config/settings.json'))['server']['server_host'])")
 DEPLOY_DIR=$(python3 -c "import json; print(json.load(open('config/settings.json'))['deployment']['deploy_dir'])")
-# ベースライン実験用フラグをサーバー側の start_clients.py へ明示的に転送する
-# （SSH は既定で環境変数を伝播しないため、インラインで渡す。未指定なら 1=通常動作）。
+# ベースライン実験用フラグ・Iter12同期バリアフラグをサーバー側の start_clients.py へ
+# 明示的に転送する（SSH は既定で環境変数を伝播しないため、インラインで渡す。
+# WAFL_P2P_SYNC 未指定なら 0=従来の非同期経路。WAFL_P2P_SYNC_TIMEOUT_SEC 未指定なら
+# 空文字を渡し、start_clients.py 側で config/settings.json の既定値へフォールバックする）。
 ssh "$SSH_USER@$SERVER_HOST" \
-  "cd $DEPLOY_DIR && WAFL_P2P_ENABLED=${WAFL_P2P_ENABLED:-1} WAFL_SELF_EVAL=${WAFL_SELF_EVAL:-1} python3 src/start_clients.py"
+  "cd $DEPLOY_DIR && WAFL_P2P_ENABLED=${WAFL_P2P_ENABLED:-1} WAFL_SELF_EVAL=${WAFL_SELF_EVAL:-1} WAFL_P2P_SYNC=${WAFL_P2P_SYNC:-0} WAFL_P2P_SYNC_TIMEOUT_SEC=${WAFL_P2P_SYNC_TIMEOUT_SEC:-} python3 src/start_clients.py"
 """
 
 [tasks.start]

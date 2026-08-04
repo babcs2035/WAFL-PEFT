@@ -1028,6 +1028,27 @@ def training_loop_thread(
     accum_count = 0  # 勾配累積カウンタ。grad_accum_stepsに達したら更新を1回行う
     total_tokens = 0
 
+    # 逐次（同期バリア）方式の切替（Iter12）: WAFL_P2P_SYNC=1 のときのみ、接触中の
+    # peer とのマージ完了をブロッキング待機する。既定（未設定/"0"）は従来どおり
+    # merge_queue.get_nowait() の非同期・非ブロッキング経路のみを通る（後方互換）
+    p2p_sync_enabled = os.environ.get("WAFL_P2P_SYNC", "0") == "1"
+    # タイムアウトは env > config/settings.json の優先順。時変トポロジーで接触が
+    # 交換完了前に切れた場合、待ち続けるとデッドロック・知識伝播停止になるため、
+    # タイムアウト到達時は非同期同様マージなしで前進する
+    barrier_timeout = _get_float("communication", "p2p_sync_timeout_sec", 15.0)
+    if "WAFL_P2P_SYNC_TIMEOUT_SEC" in os.environ:
+        try:
+            barrier_timeout = float(os.environ["WAFL_P2P_SYNC_TIMEOUT_SEC"])
+        except ValueError:
+            print(
+                f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tWAFL_P2P_SYNC_TIMEOUT_SEC="
+                f"{os.environ['WAFL_P2P_SYNC_TIMEOUT_SEC']!r} is not a float; "
+                f"falling back to config value {barrier_timeout}s.",
+                flush=True,
+            )
+
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tp2p_sync_enabled={p2p_sync_enabled}, barrier_timeout={barrier_timeout}s", flush=True)
+
     while state.running:
         if not state.experiment_running.is_set():
             time.sleep(0.1)
@@ -1099,11 +1120,35 @@ def training_loop_thread(
         # 累積境界でのみ行う。Thread 2はマージ計算のみ行いmerge_queueに積むだけなので、
         # model本体への書き込みは常にここ（Thread 3、かつ optimizer.step() が完了した
         # 安全なタイミング）でのみ行い、計算中のデータ競合を構造的に防ぐ
+        barrier_wait = 0.0
         if do_optim_step:
-            try:
-                merged_weights = state.merge_queue.get_nowait()
-            except queue.Empty:
-                merged_weights = None
+            # 同期バリア（Iter12, WAFL_P2P_SYNC=1）: 現在接触中の peer が居るときだけ、
+            # Thread 2 のマージ完了をブロッキング待機する。接触相手が居ない孤立区間で
+            # 待つのは無意味なので get_nowait() にフォールバックし単独前進する
+            with state.whitelist_lock:
+                has_active_peer = len(state.peer_whitelist) > 0
+            use_barrier = p2p_sync_enabled and has_active_peer
+
+            if use_barrier:
+                barrier_start_time = time.time()
+                try:
+                    merged_weights = state.merge_queue.get(timeout=barrier_timeout)
+                except queue.Empty:
+                    # 接触が交換完了前に切れた等でタイムアウト。時変トポロジー下の
+                    # デッドロック・知識伝播停止を避けるため、非同期同様マージなしで
+                    # 前進する（例外は握りつぶさずログに残す）
+                    merged_weights = None
+                    print(
+                        f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tP2P sync barrier timed out "
+                        f"after {barrier_timeout:.1f}s (WAFL_P2P_SYNC=1); proceeding without merge.",
+                        flush=True,
+                    )
+                barrier_wait = time.time() - barrier_start_time
+            else:
+                try:
+                    merged_weights = state.merge_queue.get_nowait()
+                except queue.Empty:
+                    merged_weights = None
 
             if merged_weights is not None:
                 with torch.no_grad():
@@ -1180,6 +1225,7 @@ def training_loop_thread(
             "step_duration": step_duration,
             "compute_duration": compute_duration,
             "stall_duration": stall_duration,
+            "barrier_wait": barrier_wait,
             "gpu_util_percent": gpu_util_percent,
         }
         try:

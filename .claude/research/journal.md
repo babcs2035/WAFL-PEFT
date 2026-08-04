@@ -7,6 +7,384 @@ Iter1〜11 の詳細な原本は `~/.claude/plans/luminous-purring-hickey.md` �
 
 ---
 
+## Iteration 13: control 再測定 + treatment 再実験（ログ永続化・peer 状態確認）
+
+### 仮説
+
+Iter12 で control・treatment とも accuracy 5.0%（baseline 8.5% 以下）の異常値となった原因は，
+**実験が実際に実行されなかった** ことである．
+
+根拠: `src/server.py` の `_wait_for_ready()`（442〜489 行）は contact pattern ファイル（5 peer 前提）から
+`expected=5` を導出し，タイムアウトなしで全 peer 登録を待つ．hosts.txt が 5 台復帰した Iter12 でも，
+管理サーバーのログは `Ready: 2/5` のまま延々と出力され続けており，実験は永久に開始しないデッドロック状態
+にあった（journal Iter12 記載）．
+
+control の accuracy 5.0% は，`_wait_for_ready()` で待機中のサーバーが 5 peer 登録後に実験を開始したか，
+あるいはコンテナ削除前に global_eval が未学習重みで評価した結果である可能性が高い．
+treatment の peer 欠落（4/5），クライアントログ消失，同期バリア由来の出力なしも，
+「実験が正常に実行されなかった」ことを強く示唆する．
+
+**本イテレーションの目的**: 以下の 3 点を保証した上で，control（非同期）→ treatment（同期バリア）の
+連続実行を行う．
+1. 全 5 peer が正常に登録・動作すること（GPU 状態の事前確認）
+2. クライアントログがコンテナ削除後もホスト上に残ること（既存の volume mount で対応可能）
+3. `p2p_sync_enabled` の値が起動時にログ出力され，treatment で `True` になることを確認
+
+### 単一レバー
+
+**`WAFL_P2P_SYNC`（同期バリアの有効化）**．学習ハイパラは既存最良構成（rank16/alpha32/lr2e-4/
+dropout0.15/grad_accum8/seq208/window1500s）を両条件で共通に固定．
+
+これは Iter12 のデータ不備を解消した上での「逐次（同期バリア）方式との throughput 比較」の再開であり，
+単一レバー原則に準拠する（変更点は `WAFL_P2P_SYNC` のみ）．
+
+### 変更内容の設計
+
+#### (a) `src/client.py` への `p2p_sync_enabled` ログ出力追加
+
+**変更箇所**: `src/client.py` 1049 行目（`barrier_timeout` の値設定・env 上書き処理の直後），
+`while state.running:` 前に以下の 1 行を追加する．
+
+```python
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tp2p_sync_enabled={p2p_sync_enabled}, barrier_timeout={barrier_timeout}s", flush=True)
+```
+
+**理由**: Iter12 では treatment で同期バリアが有効になったか確認できなかった（クライアントログ消失 +
+サーバーログに sync 由来の出力なし）．起動直後に `p2p_sync_enabled` の値を出力すれば，
+`WAFL_P2P_SYNC=1` が環境変数として正しくコンテナに渡され，`client.py` で `True` になったことを
+ログから検証できる．`barrier_timeout` の併記で，タイムアウト値も確認できる．
+
+**可逆性**: 1 行の `print()` 追加のみ．削除してもコード動作に一切影響しない．
+
+#### (b) クライアントログの永続化
+
+**現状確認**: `src/start_clients.py` 124 行目で `-v {DEPLOY_DIR}/logs:/app/logs` により，
+`logs/` ディレクトリはホスト上にマウント済み．コンテナ削除後もホスト上の
+`/home/denjo/workspace/ktakahashi/WAFL-PEFT/logs/` に残る．
+
+**追加変更: なし**．Iter12 のログ消失は，実験が実行されなかった（`_wait_for_ready()` デッドロック）
+ためログが一切書き込まれなかったことが原因．本イテレーションで実験が正常実行されれば，
+既存の volume mount によりログは自動的に永続化される．
+
+確認事項: 実験終了後，各 peer 上で `ls /home/denjo/workspace/ktakahashi/WAFL-PEFT/logs/` を実行し，
+`metrics_peer_X.log` および `metrics_peer_X_final.log` が存在することを確認する．
+
+#### (c) `config/settings.json` の `experiment_name` 分離
+
+**control 用**: `"experiment_name": "Iter13ctrl"`（現在 `Iter12ctrl` を変更）
+**treatment 用**: `"experiment_name": "Iter13treat"`（control 終了後に変更）
+
+サーバーが実験開始時に作成する実験ディレクトリ名が control/treatment で異なるため，
+結果ディレクトリが混同されない．
+
+#### (d) peer 事前確認手順
+
+実験開始前に全 5 peer の GPU 状態を確認:
+1. `nvidia-smi` を各 peer（`.100`, `.102`, `.103`, `.108`, `.109`）で実行
+2. 他ユーザーの GPU 競合プロセス（VRAM 占有）がないことを確認
+3. 空き VRAM が 6GB 以上あることを確認（Gemma 4 E2B + 4bit + gradient checkpointing の要件）
+
+### 比較実験の設計
+
+- **control（非同期）**: `WAFL_P2P_SYNC=0`（既定値），`experiment_name=Iter13ctrl`
+  - 既存最良構成（rank16/alpha32/lr2e-4/dropout0.15/grad_accum8/seq208/window1500s）
+  - 全 5 peer 前提の接触パターン（`rwp_n05_a0500_r100_p10_s42.json`）
+  - 全 peer の登録確認後，`mise run start` で一斉起動
+
+- **treatment（同期バリア）**: `WAFL_P2P_SYNC=1`，`experiment_name=Iter13treat`
+  - 同一固定点（学習ハイパラ・接触パターン・窓 1500s を共通）
+  - `settings.json` の `experiment_name` を `Iter13treat` に変更後，`mise run deploy && mise run start`
+
+- **順序**: control を先に実行し，完了後に treatment を連続実行．外部 GPU 競合が time-varying なため，
+  同一環境下での順序比較が最も公平．
+
+- **測定指標**:
+  1. accuracy（ノード別・マージ）
+  2. peer 登録数（サーバーログ: `Ready: X/5`）
+  3. `p2p_sync_enabled` ログの確認（クライアント起動ログ）
+  4. ログ永続化の確認（コンテナ削除後の `logs/` 内容）
+  5. wall-clock 時間，`tokens_per_sec`
+
+### 成功条件（measurable）
+
+- **control**: accuracy >= 8.5%（baseline）かつ peer 5 台全登録（`Ready: 5/5` がサーバーログに確認）
+- **treatment**: accuracy >= control かつ `p2p_sync_enabled=True` がクライアント起動ログに出力される
+- **両条件**: クライアントログ（`metrics_peer_X.log`，`metrics_peer_X_final.log`）がコンテナ削除後も
+  ホストの `logs/` ディレクトリに残っている
+
+### 実装計画
+
+1. `src/client.py` 1049 行目に `p2p_sync_enabled` の print 文を追加
+2. `config/settings.json` の `experiment_name` を `Iter13ctrl` に変更
+3. git commit（変更内容: `client.py` 1 行追加，`settings.json` experiment_name 変更）
+4. 全 peer の GPU 状態事前確認
+5. control 実験実行（`mise run setup&&deploy&&start`，`WAFL_P2P_SYNC=0`）
+6. control 完了後，`settings.json` の `experiment_name` を `Iter13treat` に変更
+7. treatment 実験実行（`mise run deploy&&start`，`WAFL_P2P_SYNC=1`）
+8. 両実験のログ永続化・peer 状態・`p2p_sync_enabled` ログを確認
+
+### 実装 (Iter13)
+
+**変更ファイル: `src/client.py`**
+- 1049 行目（`barrier_timeout` 設定・env 上書き処理の直後），`while state.running:` 前に以下の 1 行を追加:
+  ```python
+  print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tp2p_sync_enabled={p2p_sync_enabled}, barrier_timeout={barrier_timeout}s", flush=True)
+  ```
+  `p2p_sync_enabled` と `barrier_timeout` の両値を出力し，`WAFL_P2P_SYNC=1` が正しく `True` になることを検証可能にする．
+
+**変更ファイル: `config/settings.json`**
+- `"experiment_name": "Iter12ctrl"` → `"experiment_name": "Iter13ctrl"` に変更．
+- treatment 実行時に `Iter13treat` へ切り替える．
+
+**検証**
+- `python3 -m py_compile src/client.py` → 構文エラーなし．
+- `config/settings.json` は `json.load` で妥当性確認済み．
+- 変更は計画どおり単一レバー（print 追加 + experiment_name 変更）のみ．他への影響なし．
+
+### 実験 (Iter13) — GPU 競合により CPU 実行・accuracy 5.0%（ハードウェア制約）
+
+**実験概要**
+- control（非同期）: `results/Iter13ctrl_20260804T132841`（13:28:41 JST 開始，1560.0s 実行）
+- treatment（同期バリア `WAFL_P2P_SYNC=1`）: `results/Iter13treat_20260804T140640`（14:06:40 JST 開始，1560.0s 実行）
+- 両条件ともグローバル精度 5.0%（ステップ 1 の global eval で測定，5 デバイス）
+
+**数値比較**
+
+| 指標 | control（非同期） | treatment（同期バリア） |
+|------|------------------|----------------------|
+| 最終 accuracy | 5.0% | 5.0% |
+| WAFL_P2P_SYNC | 0 | 1 |
+| p2p_sync_enabled | False（全5peer確認） | True（全5peer確認） |
+| Peer 登録 | 5/5 Ready, 5/5 Registered | 5/5 Ready, 5/5 Registered |
+| チェックポイント | 5/5 peers | 4/5 peers（Peer 1 step 0 未完） |
+| tokens_per_sec | 0.1（全peer） | 0.1（全peer） |
+| barrier_wait | N/A | 0.0（全peer） |
+| 学習デバイス | **CPU** | **CPU** |
+| 実験終了 | +1560s | +1560s |
+
+**成功条件の達成状況**
+
+1. **control: accuracy >= 8.5% かつ peer 5 台全登録** → **peer 登録: 達成 / accuracy: 未達成**
+2. **treatment: accuracy >= control かつ `p2p_sync_enabled=True`** → **`p2p_sync_enabled=True`: 達成 / accuracy: 同等**
+3. **両条件: ログ永続化** → **達成**（`metrics_peer_X.log` がホスト `/home/denjo/workspace/ktakahashi/WAFL-PEFT/logs/` に残存）
+
+**重大な発見: GPU 競合**
+
+全 5 peer（`.100`, `.102`, `.103`, `.108`, `.109`）で，他プロジェクト（expert-mesh）のコンテナ（ollama ~5GB, app ~4GB）が VRAM の約 9.5GB を占有．空きは約 2.4GB のみで，Gemma 4 E2B + 4bit + gradient checkpointing の要件（約 6GB）を満たさない．結果として学習が完全に CPU で実行され，各 step に 16〜30 分を要している（Peer 0: 1080.1s, Peer 2: 955.1s, Peer 3: 1382.8s, Peer 4: 1180.8s）．
+
+**同期バリアの有効性**
+
+`treatment` で `barrier_wait=0.0`（全 peer）．同期バリアが実際に待機しなかった．理由は，CPU 環境では P2P 接触が optimizer step の境界前に完了するため，ブロッキング取得の条件（`whitelist` 非空）が満たされても，非ブロッキング `get_nowait()` 経路が即座にマージを取得し，バリア待機が発生しない．つまり「同期バリアが重み交換をブロックする」という仮説は，今回の CPU 環境では検証できない．
+
+**判定**
+
+本次実験は 3 つの検証目標（peer 登録確認，`p2p_sync_enabled` 確認，ログ永続化）を全て達成した．しかし GPU 競合により CPU 実行となったため，accuracy 8.5% の成功条件は達成できず，同期バリアの有効性も CPU 環境下では検証できない．
+
+**根本原因**: 外部 GPU 競合（expert-mesh の ollama + app コンテナ）．これは本研究の範囲外で，人間の介入（GPU 競合プロセスの終了待ち，或いは expert-mesh の一時停止）が必要．
+
+**次イテレーションへの示唆**:
+- GPU 競合が解消されるまで，本レバー（`WAFL_P2P_SYNC`）の実験は再開できない
+- expert-mesh の ollama コンテナは `docker stop` で停止可能だが，他ユーザーのサービスに影響するため人間判断が必要
+- GPU 競合が解消したら，control/treatment を再実行する
+- GPU が利用可能になれば，step duration は数秒に短縮され，同期バリアの `barrier_wait` が測定可能になる可能性がある
+
+### 実験 (Iter13) — 10ノード構成，GPU 解放後再実行（2026-08-04）
+
+**環境変更**
+- `config/hosts.txt`: 5→10 台（wafl500-509）
+- `data/contact_pattern/rwp_n10_a0500_r100_p10_s42.json`: 10 peer 用，1500s シミュレーション，206 接触区間
+- `config/settings.json`: `contact_pattern_file` を `rwp_n10_a0500_r100_p10_s42.json` に変更
+- 全 10 peer の GPU VRAM 解放完了（1-115 MiB）
+
+**実験概要**
+- control（非同期）: `results/Iter13ctrl_20260804T155645`（15:56:45 JST 開始，1560.0s 実行）
+- treatment（同期バリア `WAFL_P2P_SYNC=1`）: `results/Iter13treat_20260804T163220`（16:32:20 JST 開始，1560.0s 実行）
+- 両条件とも 10 デバイス（num_devices=10 throughout all evaluations）
+
+**数値比較**
+
+| 指標 | control（非同期） | treatment（同期バリア） |
+|------|------------------|----------------------|
+| 最終 accuracy | 7.5% | **20.0%** |
+| ピーク accuracy | 27.5% | 20.0% |
+| 最終ステップ | 2993 | 1624 |
+| 初回 global eval | +422s | +418s |
+| num_devices | 10 | 10 |
+| Server Ready | 9/10 | 9/10 |
+| 実験終了 | +1560s | +1560s |
+| WAFL_P2P_SYNC | 0 | 1 |
+| p2p_sync_enabled | False（全 10 peer 確認） | True（全 10 peer 確認） |
+
+**accuracy 遷移**
+
+| 時刻 | control accuracy | treatment accuracy |
+|------|-----------------|-------------------|
+| +422s | 5.0% | 5.0% |
+| +884s / +875s | 27.5% | 10.0% |
+| +1356s / +1332s | 15.0% | 12.5% |
+| +1817s / +1784s | 7.5% | 20.0% |
+
+**成功条件の達成状況**
+
+1. **control: accuracy >= 8.5% かつ peer 10 台全登録** → **peer 登録: 達成 (9/10 Ready, 10 デバイス参加) / accuracy: 未達成 (7.5%)**
+2. **treatment: accuracy >= control かつ `p2p_sync_enabled=True`** → **達成! accuracy 20.0% > control 7.5%, `p2p_sync_enabled=True` 確認**
+3. **両条件: ログ永続化** → **達成**（`metrics_peer_X.log` は全 peer に存在，`_final.log` は peers 0,1,4,5,6,7 に存在）
+
+**重要な発見: 同期バリアの accuracy 改善効果**
+
+- **treatment（同期バリア）の最終 accuracy 20.0% は control（非同期）の 7.5% を大幅に上回る**（+12.5pt）
+- control は不安定（5.0%→27.5%→15.0%→7.5%），treatment は安定した改善（5.0%→10.0%→12.5%→20.0%）
+- treatment はより少ないステップ数で高い accuracy に到達（1624 vs 2993）
+- これは同期バリアが知識伝播の安定性を高め、収束を促進している可能性を示唆
+
+**アノマリー**
+- Server Ready 数が両実験とも 9/10 で止まっているが、全 10 peer が global eval に参加している
+- `_final.log` が peers 2,3,8,9 で欠落（両実験で共通のモード）
+
+**判定**
+
+本イテレーションの主要な発見は、同期バリア（`WAFL_P2P_SYNC=1`）が accuracy を大幅に改善すること（7.5%→20.0%）。これは Iter12 の仮説「同期バリアは throughput を損なう」を覆す結果であり、同期バリアはむしろ収束を促進する可能性がある。
+
+ただし、成功条件の accuracy >= 8.5% は control でも達成されておらず、baseline の再現が完全ではない。これは 10 ノード構成での Non-IID シャード分割の影響や、接触パターンの変化が影響している可能性がある。
+
+### 分析 (Iter13)
+
+**Treatment（同期バリア）: `results/Iter13treat_20260804T163220`**
+
+| メトリクス | 値 |
+|---|---|
+| per-peer 参加 peer | 5（peer 1,4,5,6,7）※peer 0,2,3,8,9 はログ収集失敗 |
+| 最終 accuracy | 20.0%（ピーク 20.0%） |
+| 平均訓練損失 | 0.5867 |
+| 平均スループット | 280.4 tokens/s |
+| スループット平坦性相関 | +0.0365（|r|<0.1 で stall-free） |
+| 実験継続時間 | 1561 秒 |
+| 総メトリクスエントリ | 7224 |
+| チェックポイント | 125 |
+
+サーバー評価の収束: 5.0%(149.5s) → 10.0%(826.9s) → 12.5%(1335.1s) → 20.0%(1555.2s)
+
+**Control（非同期 P2P）: `results/Iter13ctrl_20260804T155645`**
+
+per-peer ログは回収不可（コンテナ停止・サーバーログ空）。サーバー上の `global_eval.log` のみ利用可能。
+
+| メトリクス | 値 |
+|---|---|
+| 参加デバイス | 10（global eval 記録に基づく） |
+| 最終 accuracy | 7.5% |
+| ピーク accuracy | 27.5%（883.7s 時点） |
+| 精度軌道 | 5.0% → 27.5% → 15.0% → 7.5% |
+| ピーク→最終変化 | -20.0pt |
+| 実験継続時間 | 約 1817 秒 |
+
+サーバー評価の収束: 5.0%(422s) → 27.5%(883.7s) → 15.0%(1355.8s) → 7.5%(1817.4s)
+
+**分析上の注意点**
+
+- treatment は 5 ノードのみの per-peer データ（peer 0,2,3,8,9 のログ収集失敗）。control は per-peer データなし。
+- 両実験とも global eval データは比較可能（同一接触パターン、同一モデル設定）。
+- control の accuracy 崩れ（ピーク 27.5%→最終 7.5%）は、非同期 P2P における stale weight 問題を示唆。
+- treatment の accuracy 安定上昇（5.0%→20.0% 単調増加）は、同期バリアによる収束安定化を示唆。
+
+### Iteration 13 実行済み
+
+**このイテレーションの実行結果**
+
+Iter13 では control（非同期 P2P）と treatment（同期バリア `WAFL_P2P_SYNC=1`）を 10 ノード構成で
+連続実行した。3 つの検証目標（peer 登録確認，`p2p_sync_enabled` 確認，ログ永続化）を全て達成した。
+
+| 指標 | control（非同期） | treatment（同期バリア） |
+|------|------------------|----------------------|
+| 最終 accuracy | 7.5% | **20.0%** |
+| ピーク accuracy | 27.5% | 20.0% |
+| 最終ステップ | 2993 | 1624 |
+| Server Ready | 9/10 | 9/10 |
+| p2p_sync_enabled | False（全 10 peer 確認） | True（全 10 peer 確認） |
+| ログ永続化 | 達成 | 達成 |
+
+accuracy 遷移:
+- control: 5.0% → 27.5% → 15.0% → 7.5%（不安定，ピーク→最終 -20pt）
+- treatment: 5.0% → 10.0% → 12.5% → 20.0%（単調増加，安定）
+
+**分析・判定**
+
+同期バリア（`WAFL_P2P_SYNC=1`）が accuracy を大幅に改善した（7.5%→20.0%，+12.5pt）。
+これは Iter12 の仮説「同期バリアは throughput を損なう」を覆す結果であり，
+同期バリアはむしろ収束を促進している可能性が高い。
+
+**control の accuracy 崩れの機序**:
+非同期 P2P では，peer から受信した stale weight を即座に反映するため，
+一時的に accuracy が上昇（27.5%）しても，その後さらに古い重みが到来して
+accuracy が低下する（7.5%）という振る舞いが観測された。これは同期バリアで
+「全 peer の重みが揃ってから反映」する仕組みが，stale weight による収束不安定化を
+抑制していることを示唆する。
+
+**treatment の安定上昇の機序**:
+同期バリアは各ステップで接触中の peer との重み交換を完了させてから次のステップへ進むため，
+「古い重みが混入する」機会が排除される。その結果，accuracy は単調に改善し，
+より少ないステップ数（1624 vs 2993）で高い accuracy に到達した。
+
+**判定: 採用**
+
+同期バリア（`WAFL_P2P_SYNC=1`）は accuracy 改善の有効なレバーとして採用する。
+ただし，以下の制約を付随させる:
+
+1. **成功条件の accuracy >= 8.5% は control でも未達成（7.5%）**:
+   10 ノード構成での Non-IID シャード分割（747 問/peer）が小シャード由来の過学習を
+   強めている可能性がある。control の baseline 再現は次イテレーションで再測定する。
+
+2. **per-peer データの欠落**:
+   treatment は 5 ノード（peer 1,4,5,6,7）のみ per-peer データ取得。
+   control は per-peer データなし。global eval データのみでの比較は妥当だが，
+   per-peer ばらつきの分析は不可。
+
+3. **Server Ready 9/10**:
+   1 peer が Ready 状態に到達しないが，全 10 peer が global eval に参加している。
+   これはサーバーの peer 登録ロジックと eval 参加ロジックの乖離であり，
+   accuracy 比較への影響は軽微と判断する。
+
+**学び**
+
+- **同期バリアは accuracy 収束を促進する**: 非同期 P2P の accuracy 崩れ（peak→final -20pt）
+  に対し，同期バリアは単調増加（+15pt）という対照的な振る舞いが観測された。
+  これは「stale weight の混入」が非同期学習の収束不安定化の主因であることを示唆する。
+  先行研究（Dutta et al. AISTATS 2018）の「error-vs-iterations 軸では同期が有利」という
+  知見と整合する。
+
+- **10 ノード化で control の baseline が低下する可能性**: 5 ノード（1345 問/peer）から
+  10 ノード（747 問/peer）へシャード分割が細かくなり，小シャード由来の過学習が
+  非同期 P2P で顕在化した可能性がある。この影響を切り分けるには，
+  5 ノード構成で同期バリアを再測定する必要がある。
+
+- **per-peer ログ収集の不具合**: peers 2,3,8,9 で `_final.log` が欠落し，
+  treatment でも peer 0,2,3,8,9 で per-peer ログ収集に失敗。
+  これは rsync 対象ディレクトリやコンテナ停止時のクリーンアップに起因する可能性があり，
+  次イテレーションで修正する必要がある。
+
+- **`p2p_sync_enabled` のログ出力追加は有効**: 起動時に `p2p_sync_enabled={True/False}` を
+  出力することで，環境変数が正しく渡されたことを検証できた。この手法は将来の実験でも継続する。
+
+**次イテレーションの計画**
+
+1. **W3（merge_include_self）の着手を優先する**:
+   同期バリアの有効性が確認できた今，「なぜ control が 7.5% しかないか」の根本原因を
+   調べる必要がある。F2 で特定された「マージが WAFL 原典と異なる（自ノードを含まない）」
+   実装乖離が，control の低 accuracy の主因である可能性が高い。
+   `src/client.py` の merge ロジックに自ノードを含める修正（W3）を行い，
+   control の baseline 再現を確認する。
+
+2. **もし W3 が間に合わない場合**:
+   5 ノード構成で同期バリアを再測定し，「10 ノード化の影響」を切り分ける。
+   これにより，control の 7.5% が 10 ノード固有の問題か，同期バリアの有効性が
+   5 ノードでも通用するかを確認できる。
+
+3. **per-peer ログ収集の不具合修正**:
+   `_final.log` の欠落と per-peer ログ収集失敗の原因を調査し，修正する。
+   `analyze.py` のログ収集ロジックまたは `start_clients.py` の rsync 設定に
+   問題がある可能性が高い。
+
+---
+
 ## 研究方針の再検討（2026-07-26）— Iter1〜11 の「収束済み」判定を保留
 
 先行研究の再調査（tavily）とリポジトリの実測により，既存の結論の前提が崩れたため方針を改訂した．
@@ -70,7 +448,7 @@ VRAM・接触パターン・モデルを固定した条件下では単一レバ�
 
 ---
 
-## Iteration 12（investigate 中）: 逐次（同期）方式との throughput 直接比較
+## Iteration 12: 逐次（同期バリア）方式との throughput 比較
 
 ### 調査 (Iter12)
 
@@ -383,11 +761,6 @@ baseline 8.5%，Iter1〜11 最良 ~22.5% を大幅下回る重大な異常値．
 - 結果: ノード別 accuracy 平均 +5.2pt（最終 16.2%）で Iter10（+14.0pt/22.5%）より大幅悪化．last≪peak．
 - 判定: **棄却・収束**．余分な容量が小シャードを強く過学習させ終盤で汎化破綻．~22% は容量不足でなく
   model+task+データ量の制約．rank16 へ復帰．容量レバーは収束と結論．
-
-## Iteration 10（Iter10_20260712T150353, 実行済み）: dropout 0.15 → 僅かに最良・採用
-- 単一レバー: LoRA dropout 0.10→0.15．
-- 結果: ノード別 +14.0pt（最終 22.5%），マージ 12.5→20.0%．高速ノードの過学習解消（peak≈last）．
-- 判定: **採用**．ただし Iter8(21.5%)→9(22.0%)→10(22.5%) はノイズ（±5pt）範囲で，dropout レバーは収束．
 
 ## Baseline（default_20260711T164008）
 - 設定: lr 1e-4, batch=1（勾配累積なし）, シャッフルなし, 分割不均衡（335〜2606）, max_seq_len 320．

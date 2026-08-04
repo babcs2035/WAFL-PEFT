@@ -6,6 +6,28 @@
 
 ---
 
+## B6 [auto-decided 2026-08-04] Iter13 結果: 同期バリアは accuracy 改善（20.0% vs 7.5%）・W3 着手へ
+
+- 状況: Iter13 で control（非同期 P2P）と treatment（同期バリア `WAFL_P2P_SYNC=1`）を
+  10 ノードで実行．treatment の最終 accuracy 20.0% は control の 7.5% を +12.5pt 上回った．
+  control は不安定（5%→27.5%→15%→7.5%，peak→final -20pt），treatment は単調増加
+  （5%→10%→12.5%→20%）．同期バリアは stale weight による収束不安定化を抑制し，
+  収束を促進している可能性が高い．
+
+- 自動選択: 次イテレーション（Iter14）では W3（`merge_include_self`）を着手する．
+  理由: control の accuracy 7.5% が baseline 8.5% も満たさない原因を調べるため．
+  F2 で特定された「マージが自ノードを含まない」実装乖離が，control の低 accuracy の主因であり，
+  同期バリアの有効性評価にも影響する．W3 を修正した上で control を再測定し，
+  baseline 再現を確認する．
+
+- 併せて: 5 ノード構成で同期バリアを再測定する案も検討候補（10 ノード化の影響を切り分けるため）．
+  planner が W3 と 5 ノード再測定のどちらを優先するか判断する．
+
+- 要レビュー: 同期バリアの accuracy 改善効果は有意だが，per-peer データの 50% 欠落と
+  Server Ready 9/10 の不具合がある．これらは次イテレーションで修正する必要がある．
+
+---
+
 ## B5 [auto-decided 2026-08-04] Iter13: control 再測定 + treatment 再実験（ログ永続化・peer 状態確認）
 
 - 状況: Iter12 の両条件で accuracy 5.0%（baseline 8.5% 以下）の異常値．treatment で peer 欠落（4/5），

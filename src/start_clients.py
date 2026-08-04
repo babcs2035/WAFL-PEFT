@@ -28,8 +28,13 @@ IMAGE_NAME = f"127.0.0.1:{REGISTRY_PORT}/wafl-peft:latest"
 # ベースライン実験用のクライアント挙動フラグ。起動時の環境変数をコンテナへそのまま渡す。
 # WAFL_P2P_ENABLED=0 で P2P 重み交換を無効化（self-training / 孤立訓練ベースライン）。
 # WAFL_SELF_EVAL=0 で学習ノードの自己評価を無効化（評価専用ホストへ評価を委譲する場合）。
+# WAFL_P2P_SYNC=1 で同期バリア方式（Iter12, client.py 側の切替）を有効化。
+# WAFL_P2P_SYNC_TIMEOUT_SEC はバリアのタイムアウト秒（未指定なら client.py が
+# config/settings.json の communication.p2p_sync_timeout_sec へフォールバックする）。
 _P2P_ENABLED = os.environ.get("WAFL_P2P_ENABLED", "1")
 _SELF_EVAL = os.environ.get("WAFL_SELF_EVAL", "1")
+_P2P_SYNC = os.environ.get("WAFL_P2P_SYNC", "0")
+_P2P_SYNC_TIMEOUT_SEC = os.environ.get("WAFL_P2P_SYNC_TIMEOUT_SEC", "")
 
 # 管理サーバー上かローカルかでSSH接続方法を変える
 _CURRENT_HOSTNAME = socket.gethostname()
@@ -88,6 +93,11 @@ def start_client_container(ip: str, peer_id: int) -> str:
     if not sync_result.startswith("OK"):
         return sync_result
 
+    # WAFL_P2P_SYNC_TIMEOUT_SEC は未指定（空文字）ならコンテナへ渡さず、
+    # client.py 側で config/settings.json の既定値へフォールバックさせる。
+    sync_timeout_flag = (
+        f"-e WAFL_P2P_SYNC_TIMEOUT_SEC={_P2P_SYNC_TIMEOUT_SEC} " if _P2P_SYNC_TIMEOUT_SEC else ""
+    )
     jump_flag = f"-J {SSH_USER}@{SERVER_HOST} " if _JUMP else ""
     cmd = (
         f"ssh -o StrictHostKeyChecking=no {jump_flag}{SSH_USER}@{ip} "
@@ -100,6 +110,8 @@ def start_client_container(ip: str, peer_id: int) -> str:
         f"-e PEER_ID={peer_id} "
         f"-e WAFL_P2P_ENABLED={_P2P_ENABLED} "
         f"-e WAFL_SELF_EVAL={_SELF_EVAL} "
+        f"-e WAFL_P2P_SYNC={_P2P_SYNC} "
+        f"{sync_timeout_flag}"
         # 断片化由来の OOM を抑える。巨大 vocab(262144) の logits transient と外部 GPU 競合
         # (~2GB, 可変)で reserved が膨らみ、total 12GB 近傍で 256MB 級の割当が断片化により
         # 失敗する事例が発生したため、expandable_segments で予約領域を伸縮可能にする
