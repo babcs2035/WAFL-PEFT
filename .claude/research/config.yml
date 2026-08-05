@@ -56,7 +56,8 @@ levers:
             の 2 点を src/compare_runs.py に導入すること．ノード 10 台の accuracy を平均しても問題
             サンプリング誤差は減らない（同一問題を使うため）ので代替にならない．
             参考: Bowyer+ ICML2025 Spotlight (arXiv:2503.01747) は n<数百 で CLT ベースの誤差棒が
-            不確実性を大幅に過小評価すると示している"}
+            不確実性を大幅に過小評価すると示している",
+     status: "`start:eval` timing 修正完了（Iter20 実装完了）"}
 
   # --- W2: ベースラインの健全性確認．どの研究方向よりも優先度が高い ---
   - {name: max_seq_len, values: [512, 320],

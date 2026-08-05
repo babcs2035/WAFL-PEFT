@@ -142,7 +142,7 @@ ssh "$SSH_USER@$SERVER_HOST" \
 
 [tasks.start]
 description = "管理サーバーと全学習デバイスを起動し、実験を開始（グローバル収束性能のリアルタイム監視を含む）"
-depends = ["start:server", "start:clients"]
+depends = ["start:server", "start:clients", "start:eval"]
 
 [tasks."start:eval"]
 description = "評価専用ホスト(hosts.eval.txt)でeval_workerコンテナを起動し、学習中からcheckpointを随時評価する"
