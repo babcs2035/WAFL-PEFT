@@ -7,7 +7,41 @@
 - 決着した項目には末尾に `- 決着（YYYY-MM-DD）:` 行を追記し，未決の項目と区別できるようにする．
 
 **未決（人間判断待ち）**: なし．B10 で次イテレーションの方針が人間により確定した．
-**再開時はまず B11（次セッションへの申し送り）→ B10（Iter17 の方針）の順に読むこと．**
+**再開時はまず B13（次セッションへの申し送り）→ B12（Iter18 方針）の順に読むこと．**
+
+---
+
+## B13 [auto-decided 2026-08-06] Iter19: W1 統計テスト実施（start:eval 実行 + McNemar/Wilson CI）
+
+### 状況
+
+Iter18 で `max_seq_len=320` を採用確定（全 5 peer OOM 解消）。W1 (eval_resolution) の統計テスト
+（McNemar + Wilson CI）は `global_eval.log` 未取得のため未実施。根本原因は `start:eval` の実行漏れ。
+
+### 次イテレーションの設計
+
+- **単一レバー**: `eval_resolution`（W1）— 統計テストの実施
+- **固定構成**:
+  - `max_seq_len=320`（W2 採用済み）
+  - 5 ノード: `.100/.102/.103/.108/.109`
+  - `sample_limit=500`（W1 実装済み）
+  - McNemar/Wilson CI は `src/compare_baselines.py` に実装済み
+  - `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
+- **必須手順**: 実験後、`mise run start:eval` を**明示的に実行**して global_eval.log を生成
+- **目的**: global_eval.log を取得し、McNemar 対比較 + Wilson 95% CI で W1 統計テストを実施
+
+### 根拠
+
+- W1 (eval_resolution) は config.yml で最優先レバーとして指定
+- McNemar/Wilson CI の実装は Iter17 で完了済み
+- `start:eval` 実行漏れは既知の不具合。次イテレーションで必ず実行する
+- `mise.toml` の `start` タスクに `start:eval` を depends に追加するかどうかは、planner が検討
+
+### 要レビュー
+
+- `mise.toml` の `start` タスクに `start:eval` を depends に追加すると、`start:clients` と
+  `start:eval` が並列起動される。これが問題ないか確認が必要。
+- 追加しない場合は、実験手順ドキュメントに `mise run start:eval` の実行を明記する。
 
 ---
 
