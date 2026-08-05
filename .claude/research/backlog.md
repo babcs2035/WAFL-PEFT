@@ -6,10 +6,89 @@
 - 人間が回答して決着した事項: `## B{n} [resolved-by-human YYYY-MM-DD] 題目`
 - 決着した項目には末尾に `- 決着（YYYY-MM-DD）:` 行を追記し，未決の項目と区別できるようにする．
 
-**未決（人間判断待ち）**: なし．B1 は B2 で回答済み．B3 の「W1 完了まで accuracy を採否根拠にしない」は
-現在も有効な制約であり，W1（評価解像度）・W2（`max_seq_len`）は 2026-08-05 時点で未着手である．
+**未決（人間判断待ち）**: なし．B10 で次イテレーションの方針が人間により確定した．
 
 ---
+
+## B10 [resolved-by-human 2026-08-05] Iter17 の方針: 測定系の立て直し（W1+W2）と 5 ノード + 評価専用 5 ノード構成への移行
+
+人間へ 4 点を提示し，以下の回答を得た．**Iter17 はこの決定に従って設計する**．
+
+### 決定 1: Iter16 は考察フェーズを回して正式に閉じる
+
+`state.json` は `phase=reflect / status=running`．rc-reflector が採否判定の確定・journal の
+`### Iteration 16 実行済み` 記入・Slack/Notion 報告・commit まで行う．W3 は採用（B9 の決着参照）．
+
+### 決定 2: 次のレバーは W1 + W2 を同時に振る
+
+- W1: 評価問題数を 40 → 500 以上へ（`settings.json` の `global_eval.sample_limit`，および
+  post-experiment evaluation の `_POST_EVAL_SAMPLE_LIMIT`）．併せて McNemar 対比較と
+  Wilson 95% CI を `src/compare_runs.py` に導入する．
+- W2: `training.max_seq_len` を 208 → 512 へ（GSM8K 学習例の 32.5% で回答末尾が欠落している問題の解消）．
+- **単一レバー原則を意図的に破る**．根拠は `config.yml` の W2 note が「このレバーは accuracy の絶対水準を
+  大きく動かす可能性があるため，W1（評価解像度）と同時に実施し，以降の全比較のベースラインを
+  取り直すこと」と明示的に指示しているため．**Iter17 は「ベースラインを取り直すイテレーション」として
+  位置付け，個別レバーの効果測定は行わない**．
+- OOM リスク: 系列長 2.46 倍で活性化メモリが増える．OOM した場合は 320 を中間案とし，
+  それでも詰まるなら W2b（PLE の CPU オフロード）を先に実施する．
+
+### 決定 3: 学習 5 台 + 評価専用 5 台に分割する
+
+`config/hosts.eval.txt` の 5 台（`.101/.104/.105/.106/.107`）が `config/hosts.txt`（10 台）と
+完全に重複しており，評価専用ホストが実質ゼロだった．学習ノードを 5 台へ減らし，残り 5 台を
+評価専用ホスト（`eval_worker.py`）として使う．学習ノードの VRAM を評価で圧迫せず，
+学習中から随時評価できる．
+
+- 学習ノード: `.100 / .102 / .103 / .108 / .109`（`hosts.eval.txt` の補集合．B4 の 5 ノード構成と同一）
+- 評価ホスト: `hosts.eval.txt` の現行 5 行（行順＝担当 peer_id）
+- 学習クライアントは `WAFL_SELF_EVAL=0` で自己評価を無効化する
+
+### 決定 4: watchdog を再起動して自律継続する
+
+`bash ~/.claude/skills/research-cycle/scripts/start_watchdog.sh wafl-peft` で起動する．
+不可逆・危険な判断が出たら従来どおり backlog 経由で Slack に @mention する．
+
+---
+
+### Iter17 実装の前提条件（**この順序で行わないと実験が起動しない**）
+
+1. **`config/hosts.txt` を 5 台へ縮小する**（`.100 / .102 / .103 / .108 / .109`）．
+2. **n=5 の接触パターンを生成する**: `mise run setup:contact-pattern -- --n-time 1500`．
+   `generate_contact_pattern.py` は `hosts.txt` の行数からノード数を決めるため，**必ず手順 1 の後**に実行する．
+   生成物は `data/contact_pattern/rwp_n05_a0500_r100_p10_s42.json`．
+   **現在 `data/contact_pattern/` には n=10 のパターンしか無い**．`src/server.py` の `_wait_for_ready()` は
+   接触パターンから期待 peer 数を導出しタイムアウト無しで待つため，5 台構成に n=10 パターンを
+   組み合わせると**実験が永久に開始しないデッドロックになる**（Iter12 で実際に発生．B2 参照）．
+3. **`settings.json` の `experiment.contact_pattern_file` を n=5 のファイル名へ変更する．**
+4. **`mise run setup:data` でシャードを再生成する**．5 ノードへ戻すとシャードは
+   672 → 約 1345 件/peer に戻る（下記「判明した事実」2 を参照）．
+5. **評価ホストへ配布・起動する**: `mise run deploy:eval` の後に評価ワーカーを起動する
+   （`deploy:eval` は評価ホストへ GSM8K データセットキャッシュも配る）．
+
+### 併せて修正する実装不具合（人間判断は不要．実装フェーズで対処する）
+
+**per-peer accuracy が Iter14 以降ずっと全 peer 0.0% だった原因を特定した**:
+`src/deploy_distribute.py:203-211` は `cache/datasets/gsm8k` を `_EVAL_MODE` のときだけ配布するが，
+既定は `WAFL_SELF_EVAL=1`（学習ノードが自己評価）である．学習ノードに GSM8K の parquet が無いため
+`gsm8k_eval.load_gsm8k_val_data()` が空リストを返し，self-eval が黙ってスキップされていた
+（サーバーの global eval はサーバー自身にキャッシュがあるため動いていた）．
+決定 3 で評価を専用ホストへ委譲するなら `deploy:eval` が配るので解消するが，
+**学習ノードの自己評価へフォールバックする経路（`WAFL_SELF_EVAL=1`）を残すなら，
+学習ノード向け deploy にも datasets の配布を追加する必要がある**．
+
+### 判明した事実（次の planner が前提にすべきもの）
+
+1. **比較可能な実験は Iter14 以降の 4 本のみ**（Iter14ctrl×2 / Iter15 ctrl+treat / Iter16 ctrl+treat）．
+   Iter1〜13 は P2P 重み交換が成立しておらず孤立学習と同等．
+2. **accuracy の絶対水準の低下（過去 21.5〜22.5% → Iter16 の 15.0〜17.5%）は評価系ではなく，
+   10 ノード化によるシャード半減が最有力**．実測で現行の学習シャードは 672 件/peer
+   （5 ノード時代は約 1345 件/peer．`validation_split: 0.1` を除いた 6725 件を 10 分割）．
+   `config.yml` の W8 note が「総データ量固定なら 1 ノード 1345→747 に半減し，過学習という既存の
+   診断を悪化させる方向」と事前に警告していたとおりの現象である．
+   決定 3 で 5 ノードへ戻すため，この交絡は Iter17 で解消する．
+3. **Iter17 では 3 つの条件が同時に変わる**（評価解像度・`max_seq_len`・ノード数 10→5）．
+   したがって **Iter14〜16 との accuracy 比較は成立しない**．Iter17 の結果は「新しいベースライン」
+   として扱い，以降のレバーはこれを起点に 1 つずつ振る．
 
 ## B9 [auto-decided 2026-08-05] Iter16: merge_includes_self動的値化 + W3再評価
 
