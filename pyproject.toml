@@ -19,6 +19,7 @@ dependencies = [
     "bitsandbytes",
     "tqdm>=4.68.2",
     "pillow>=12.2.0",
+    "scipy>=1.15.3",
 ]
 
 [[tool.uv.index]]
