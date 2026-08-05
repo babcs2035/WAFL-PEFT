@@ -170,7 +170,7 @@ levers:
   - {name: lora_dropout,        values: [0.10, 0.15, 0.20], note: "0.15 が僅かに最良とされたが，n=80 では有意差なし（p0001 F1）"}
   - {name: lr_min_ratio,        values: [0.3, 0.5, 0.7], note: "0.5 が最良とされたが，n=80 では有意差なし（p0001 F1）"}
 
-# 研究フロンティア（paper.tex の展望．いずれも新規実装 or ノード確保を伴うため
+# 研究フロンティア（いずれも新規実装 or ノード確保を伴うため
 # planner が着手前に backlog へ登録し，可逆な範囲で進める / 不可逆はエスカレーション）
 research_frontier:
   - "逐次方式（P2P を訓練ループ内で同期実行）との throughput 直接比較（client.py に同期フラグ）"

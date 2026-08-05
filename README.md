@@ -331,7 +331,7 @@ graph LR
     end
 
     subgraph rec["記録（コード外）"]
-        DOC["docs/<br/>調査・設計・論文原稿（索引は docs/README.md）"]
+        DOC["docs/<br/>調査・設計の記録（索引は docs/README.md）"]
         PL["plans/<br/>研究方針・大規模変更の計画"]
         RS[".claude/research/<br/>research-cycle の journal / backlog / config"]
     end
@@ -351,7 +351,7 @@ graph LR
 | `data/` | Non-IID 分割済みデータと接触パターン（`mise run setup` が生成） |
 | `results/` | 実験ごとの `logs/` と `output/`（分析レポート・図） |
 | `cache/` | モデル・データセットのダウンロードキャッシュ |
-| `docs/` | 文献調査・位置付けの調査記録，論文原稿．索引は [docs/README.md](docs/README.md) |
+| `docs/` | 文献調査・位置付けの調査記録．索引は [docs/README.md](docs/README.md) |
 | `plans/` | 研究方針の意思決定（`p0001_research_direction_2026-07.md`） |
 | `.claude/research/` | research-cycle の一次記録（`journal.md` / `backlog.md` / `config.yml` / `state.json`） |
 
