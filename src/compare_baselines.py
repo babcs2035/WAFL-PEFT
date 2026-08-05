@@ -18,9 +18,12 @@
 """
 
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
+
+from scipy import stats
 
 import matplotlib
 
@@ -62,6 +65,99 @@ def _latest_dir(prefix: str) -> Path | None:
         key=lambda d: d.name, reverse=True,
     )
     return cands[0] if cands else None
+
+
+# ============================================================
+# Wilson 信頼区間 / McNemar 対比較（W1: eval_resolution）
+# ============================================================
+
+
+def wilson_ci(correct: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson 95% 信頼区間を計算する。
+
+    二項比率 p = correct/total に対する正確な信頼区間を返す。
+    total == 0 のときは (0.0, 0.0) を返す。
+    """
+    if total == 0:
+        return (0.0, 0.0)
+    p = correct / total
+    denom = 1 + z ** 2 / total
+    centre = p + z ** 2 / (2 * total)
+    margin = z * math.sqrt((p * (1 - p) + z ** 2 / (4 * total)) / total) / denom
+    lo = max(0.0, centre - margin)
+    hi = min(1.0, centre + margin)
+    return (lo, hi)
+
+
+def mcnemar_test(results_a: list[bool], results_b: list[bool]) -> dict[str, Any]:
+    """2 つのモデルの per-question 結果から McNemar 対比較を実行する。
+
+    results_a, results_b は同一の質問順序の正解(bool)リスト。
+    戻り値: {"chi2": float, "pvalue": float, "a_only": int, "b_only": int,
+             "both": int, "neither": int, "n": int}
+    """
+    n = len(results_a)
+    a_only = b_only = both = neither = 0
+    for ra, rb in zip(results_a, results_b):
+        if ra and rb:
+            both += 1
+        elif ra and not rb:
+            a_only += 1
+        elif not ra and rb:
+            b_only += 1
+        else:
+            neither += 1
+    # 2x2 表の非対角要素 (a_only, b_only) に対する chi2 統計量（連続性補正付き）
+    if a_only + b_only > 0:
+        chi2 = ((abs(a_only - b_only) - 1) ** 2) / (a_only + b_only)
+    else:
+        chi2 = 0.0
+    pvalue = 1.0 - stats.chi2.cdf(chi2, df=1)
+    return {
+        "chi2": chi2,
+        "pvalue": pvalue,
+        "a_only": a_only,
+        "b_only": b_only,
+        "both": both,
+        "neither": neither,
+        "n": n,
+    }
+
+
+def extract_per_question_results(exp_dir: Path) -> dict[int, list[bool]]:
+    """実験ディレクトリの device_eval.log から per-question 正解情報を抽出する。
+
+    device_eval.log の各行は {"peer_id": int, "step": int,
+        "questions": [{"question": str, "correct": bool}, ...]} の形式を想定。
+    peer_id と step の最大値を持つレコードの questions を返す。
+    存在しない場合は空の辞書を返す。
+    """
+    recs = _read_jsonl(exp_dir / "device_eval.log")
+    if not recs:
+        return {}
+    # 最終ステップのレコードを選ぶ（各 peer について最大の step）
+    best: dict[int, dict] = {}
+    for r in recs:
+        pid = r.get("peer_id")
+        step = r.get("step", 0)
+        if pid is None:
+            continue
+        if pid not in best or step > best[pid].get("step", 0):
+            best[pid] = r
+    # peer ごとに質問ごとの正解をマージ（全 peer の union）
+    all_questions: dict[str, list[bool]] = {}
+    for peer_recs in best.values():
+        questions = peer_recs.get("questions", [])
+        for q in questions:
+            qtext = q.get("question", "")
+            correct = bool(q.get("correct", False))
+            all_questions.setdefault(qtext, []).append(correct)
+    # 各質問について多数決（True が半数超なら正解とみなす）
+    result: list[bool] = []
+    for qtext in sorted(all_questions.keys()):
+        votes = all_questions[qtext]
+        result.append(sum(votes) > len(votes) / 2)
+    return result
 
 
 def load_per_node_accuracy(exp_dir: Path) -> dict[int, tuple[float, float]]:

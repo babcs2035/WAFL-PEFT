@@ -22,6 +22,7 @@ compare_baselines.py が 1 条件 1 実験を比較するのに対し、本ス�
 """
 
 import glob
+import json
 import re
 import statistics
 import sys
@@ -189,6 +190,68 @@ def main() -> None:
               f"{a['gain'][0]:+.1f}±{a['gain'][1]:.1f} | "
               f"{a['merged_final'][0]:.1f}±{a['merged_final'][1]:.1f} | "
               f"{a['loss'][0]:.4f}±{a['loss'][1]:.4f} |")
+
+    # --- 統計検定出力（W1: McNemar 対比較 + Wilson CI） ---
+    print("\n### 統計検定（McNemar 対比較 + Wilson 95% CI）")
+    print("※ device_eval.log が存在する実験のみ対象。未対応の実験はスキップ。")
+
+    # 各条件・各runのper-question結果を収集
+    condition_results: dict[str, list[tuple[Path, list[bool]]]] = {}
+    for a in aggs:
+        condition_results[a["label"]] = []
+        for r in a["runs"]:
+            exp_dir = r.get("dir", "")
+            if exp_dir:
+                d = BASE_DIR / exp_dir
+            else:
+                continue
+            pq = cb.extract_per_question_results(d)
+            if pq:
+                # 多数決結果のリストを作成
+                results_list = list(pq.values()) if isinstance(list(pq.values())[0], list) else []
+                if not results_list:
+                    # 直接list[bool]の場合
+                    results_list = pq if isinstance(pq, list) else []
+                condition_results[a["label"]].append((d, results_list))
+
+    # 条件間ペアのMcNemar対比較
+    labels = [a["label"] for a in aggs]
+    for i in range(len(labels)):
+        for j in range(i + 1, len(labels)):
+            lab_a, lab_b = labels[i], labels[j]
+            res_a = condition_results[lab_a]
+            res_b = condition_results[lab_b]
+            if not res_a or not res_b:
+                continue
+            # 両方の条件でper-question結果が存在するrunペアを探す
+            for d_a, lst_a in res_a:
+                for d_b, lst_b in res_b:
+                    if len(lst_a) > 0 and len(lst_b) > 0 and len(lst_a) == len(lst_b):
+                        mcn = cb.mcnemar_test(lst_a, lst_b)
+                        # Wilson CI
+                        total = mcn["n"]
+                        a_correct = mcn["a_only"] + mcn["both"]
+                        b_correct = mcn["b_only"] + mcn["both"]
+                        ci_a = cb.wilson_ci(a_correct, total)
+                        ci_b = cb.wilson_ci(b_correct, total)
+                        print(
+                            f"\n**{lab_a} vs {lab_b}** ({d_a.name} vs {d_b.name})"
+                        )
+                        print(
+                            f"  McNemar chi2={mcn['chi2']:.3f}, p={mcn['pvalue']:.4f}"
+                        )
+                        print(
+                            f"  {lab_a}: {a_correct}/{total} = {a_correct/total*100:.1f}% "
+                            f"(Wilson 95% CI [{ci_a[0]*100:.1f}%, {ci_a[1]*100:.1f}%])"
+                        )
+                        print(
+                            f"  {lab_b}: {b_correct}/{total} = {b_correct/total*100:.1f}% "
+                            f"(Wilson 95% CI [{ci_b[0]*100:.1f}%, {ci_b[1]*100:.1f}%])"
+                        )
+                        break
+                else:
+                    continue
+                break
 
     fig = plot_comparison(aggs)
     print(f"\n比較図を保存した: {fig}")

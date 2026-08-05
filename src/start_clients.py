@@ -32,7 +32,7 @@ IMAGE_NAME = f"127.0.0.1:{REGISTRY_PORT}/wafl-peft:latest"
 # WAFL_P2P_SYNC_TIMEOUT_SEC はバリアのタイムアウト秒（未指定なら client.py が
 # config/settings.json の communication.p2p_sync_timeout_sec へフォールバックする）。
 _P2P_ENABLED = os.environ.get("WAFL_P2P_ENABLED", "1")
-_SELF_EVAL = os.environ.get("WAFL_SELF_EVAL", "1")
+_SELF_EVAL = os.environ.get("WAFL_SELF_EVAL", "0")
 _P2P_SYNC = os.environ.get("WAFL_P2P_SYNC", "0")
 _P2P_SYNC_TIMEOUT_SEC = os.environ.get("WAFL_P2P_SYNC_TIMEOUT_SEC", "")
 # W3: merge_include_self の動的値化（環境変数 WAFL_MERGE_INCLUDE_SELF で制御）
