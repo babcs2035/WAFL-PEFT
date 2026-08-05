@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
-  "iteration": "Iter18",
-  "iteration_name": "max_seq_len320へ後退とW1統計テスト",
+  "iteration": "Iter19",
+  "iteration_name": null,
   "phase": "investigate",
   "status": "running",
   "current_lever": null,
   "experiment_dir": null,
   "experiment_deadline": null,
-  "updated_at": 1785944600,
+  "updated_at": 1754448000,
   "last_slack_ts": null,
-  "iteration_thread_ts": null,
-  "notion_toggle_created": false,
+  "iteration_thread_ts": "1785945189.940869",
+  "notion_toggle_created": true,
   "last_commit": "ee362fb"
 }
