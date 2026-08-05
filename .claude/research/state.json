@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
-  "iteration": "Iter21",
-  "iteration_name": "W1 McNemar/Wilson CI動作確認とサーバーディスク清理",
-  "phase": "plan",
+  "iteration": "Iter22",
+  "iteration_name": "W1 再試行: results/ コンテナマウント修正で device_eval.log 生成",
+  "phase": "investigate",
   "status": "running",
   "current_lever": "eval_resolution",
   "experiment_dir": null,
   "experiment_deadline": null,
-  "updated_at": 1785961975,
+  "updated_at": 1785971297,
   "last_slack_ts": "1785960524.246589",
   "iteration_thread_ts": "1785960917.701189",
   "notion_toggle_created": true,
-  "last_commit": "9684d85"
+  "last_commit": "a6fad5e"
 }

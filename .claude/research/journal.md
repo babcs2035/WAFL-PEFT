@@ -51,6 +51,115 @@
 **config.yml levers 更新**:
 - W1 `eval_resolution`: status を「`start:eval` timing 修正完了（Iter20 実装完了）」のまま維持（バグ修正のみ）
 
+### 実験 (Iter21)
+
+- **コマンド**: `WAFL_SELF_EVAL=0 mise run start`（`start:eval` は depends で自動起動）
+- **開始時刻**: 2026-08-06T07:13:27+09:00
+- **終了時刻**: 1561秒後にサーバーが自動停止
+- **実験ディレクトリ**: `results/Iter19_20260806T071327`
+- **ノード数**: 5（peer 0-4: .100/.102/.103/.108/.109）
+- **評価ワーカー**: 5（eval_peer 0-4: .101/.104/.105/.106/.107）
+
+**start:eval 自動起動**: `mise run start` の `depends` に `start:eval` を追加した結果、
+`start:server`・`start:clients`・`start:eval` が逐次起動され、5つの評価ワーカーコンテナが
+すべて正常に起動した。
+
+**学習完了**: 全5ピアが1561秒間学習を完了。メトリクス12361件回収。
+平均訓練損失 0.4817、平均スループット 347.7 tokens/s。
+ストールフリー性確認（相関 +0.0041 < 0.1）。
+
+**OOM**: 全5ノードでOOMなし。学習正常終了。
+
+**device_eval.log**: **未生成**。評価ワーカーは起動したが、`results/` ディレクトリが
+コンテナにマウントされていないため、checkpoint にアクセスできず、サーバーへ
+`eval_result` を送信できなかった。
+
+**accuracy**: 0.0%（全ピア）。`device_eval.log` 未生成のため未取得。
+
+**成功条件判定**:
+- 主（`device_eval.log` 生成）: **未達成**（`results/` ディレクトリ未マウント）
+- 副1（McNemar 対比較）: **未達成**（データなし）
+- 副2（Wilson 95% CI）: **未達成**（データなし）
+- 副3（全5 peer OOMなし学習完了）: **達成**
+
+### 分析 (Iter21) — 解釈（2026-08-06）
+
+**実測メトリクス（全 5 peer）— analysis_report.md より**
+
+| Peer | ノード | GPU | 状態 | Steps | Avg Loss | Avg tok/s | Contact | Accuracy |
+|------|--------|-----|------|-------|----------|-----------|---------|----------|
+| 0 | wafl500 | RTX 3060 12GB | 完了 | 1608 | 0.4990 | 302.2 | 38 | 0.0% |
+| 1 | wafl502 | RTX 3060 12GB | 完了 | 2304 | 0.4885 | 324.7 | 36 | 0.0% |
+| 2 | wafl503 | RTX 3060 12GB | 完了 | 1816 | 0.4852 | 298.6 | 30 | 0.0% |
+| 3 | wafl508 | RTX 3060 12GB | 完了 | 3232 | 0.4506 | 403.0 | 30 | 0.0% |
+| 4 | wafl509 | RTX 3060 12GB | 完了 | 3034 | 0.4852 | 410.3 | 42 | 0.0% |
+
+**全 peer 平均**: mean_loss=0.4817, mean_tok/s=347.7, mean_stall=0.24s
+
+**単一レバー `start:eval` timing fix の成否**: **成功**（確信度: 高）
+- `depends` への追加が正しく適用され、5つの評価ワーカーが正常起動。
+- P2P 通信・マージ正常（メトリクス 12361 件回収）。
+
+**`device_eval.log` 未生成の原因**: **インフラ環境の問題**（確信度: 高）
+- 学習ノードの Docker コンテナに `results/` ディレクトリがマウントされていない。
+- 評価ワーカーは SSH で学習ノードの `results/` から checkpoint を取得しようとするが、ディレクトリが存在しないため未取得。
+
+**loss/throughput の過去反復との比較**:
+- Iter21 Avg Loss (0.4817) は Iter20 (0.4860) より -0.9% 低く、ノイズ範囲内。
+- throughput も同等（347.7 vs 348.2 tok/s）。
+
+**次イテレーションへの示唆**:
+- `results/` ディレクトリのコンテナマウント追加が必須（`start_clients.py` の変更）。
+- A: 学習ノードの Docker コンテナに `results/` をマウント（`-v {pwd}/results:/app/results`）
+- B: 評価ワーカーが `docker exec` でコンテナ内の checkpoint を取得
+
+---
+
+### Iter21 実行済み
+
+**このイテレーションの実行結果サマリー**
+
+| Peer | ノード | GPU | 状態 | Steps | Avg Loss | Avg tok/s | Contact | Accuracy |
+|------|--------|-----|------|-------|----------|-----------|---------|----------|
+| 0 | wafl500 | RTX 3060 12GB | 完了 | 1608 | 0.4990 | 302.2 | 38 | 0.0% |
+| 1 | wafl502 | RTX 3060 12GB | 完了 | 2304 | 0.4885 | 324.7 | 36 | 0.0% |
+| 2 | wafl503 | RTX 3060 12GB | 完了 | 1816 | 0.4852 | 298.6 | 30 | 0.0% |
+| 3 | wafl508 | RTX 3060 12GB | 完了 | 3232 | 0.4506 | 403.0 | 30 | 0.0% |
+| 4 | wafl509 | RTX 3060 12GB | 完了 | 3034 | 0.4852 | 410.3 | 42 | 0.0% |
+
+- 全 5 peer が OOM せずに完了（主条件合格）
+- 平均 loss: 0.4817（ノイズ範囲内）
+- `start:eval` 自動起動: **成功**（5つの評価ワーカーがすべて正常起動）
+- `device_eval.log` 未取得（`results/` ディレクトリが学習ノードの Docker コンテナにマウントされていない）
+- McNemar/Wilson CI 未テスト
+- `compare_baselines.py` の `return {}` バグ修正: **成功**（`return []` へ修正済み）
+
+**判定（各レバー毎）**:
+
+1. **W1 (eval_resolution): 追加反復要** — `start:eval` timing fix は成功したが、`device_eval.log`
+   未生成により McNemar/Wilson CI の動作確認は未達成。根本原因は `results/` ディレクトリの
+   コンテナマウント欠落。`compare_baselines.py` のバグ修正は完了。
+2. **W2 (max_seq_len): 収束** — `max_seq_len=320` の安定性は確認済み。
+3. **W3 (merge_include_self): 収束** — Iter16 で採用済み、固定。
+
+**学び**:
+
+1. **`start:eval` timing fix は正しく機能した** — `depends` への追加により、`mise run start` のみで
+   学習＋評価ワーカー起動が完結する。
+2. **`results/` ディレクトリのコンテナマウント欠落が `device_eval.log` 未生成の根本原因** —
+   評価ワーカーは SSH で学習ノードの `results/` から checkpoint を取得しようとするが、
+   学習ノードの Docker コンテナに `results/` がマウントされていないため、checkpoint が存在せず、
+   サーバーへ `eval_result` を送信できなかった。`start_clients.py` の変更で
+   `-v {pwd}/results:/app/results` のマウント追加が必要。
+3. **loss/throughput は過去反復と同等** — Iter20 (0.4860) より -0.9% 低いがノイズ範囲内。
+4. **`compare_baselines.py` の `return {}` バグは修正済み** — `return []` へ変更。
+
+**次イテレーションの方針**:
+
+- **単一レバー**: `eval_resolution`（W1）— `results/` コンテナマウント修正で `device_eval.log` 生成
+- **必須変更**: `start_clients.py` に学習ノードへの `results/` マウント追加
+- **固定構成**: `max_seq_len=320`（W2 採用済み）、5 ノード（`.100/.102/.103/.108/.109`）、`sample_limit=500`
+
 ---
 
 ### 調査 (Iter21)
@@ -812,306 +921,6 @@ W1 (eval_resolution) の McNemar データ収集側修正コードを実装し�
 - **`mise.toml` の `start` タスクに `start:eval` を `depends` に追加する案**:
   planner に委ねて検討（`start:clients` と `start:eval` の並列起動が学習に影響しないか
   確認が必要）
-
----
-
-## Iteration 18: max_seq_len320へ後退とW1統計テスト
-
-### 仮説
-
-`max_seq_len=512` は RTX 4060 8GB で OOM を引き起こす（Iter17 で 2/5 peer が OOM）．
-`max_seq_len=320` に後退することで，全 peer が正常終了し，global_eval.log が生成される．
-生成された global_eval.log に対して McNemar 対比較と Wilson 95% CI を適用可能になる．
-
-**仮説**: `max_seq_len=320` で全 5 peer が OOM せずに完了し，global_eval.log が生成される．
-W1 統計テスト（McNemar + Wilson CI）が実施可能になる．
-
-### 単一レバー
-
-**`max_seq_len` を 512 → 320 へ後退**:
-
-- `settings.json` の `training.max_seq_len` を 512 → 320 に変更
-- `settings.json` の `experiment.experiment_name` を "Iter17" → "Iter18" に変更
-- コード側の変更は不要（`max_seq_len` は settings.json から動的読み込み）
-
-**固定構成**: 5 ノード（`.100/.102/.103/.108/.109`），sample_limit=500，
-McNemar/Wilson CI 実装済み（`src/compare_baselines.py`），WAFL_SELF_EVAL=0，
-W3 既定 true，接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
-
-### 変更内容の設計
-
-**`config/settings.json`**:
-- `"training": {"max_seq_len": 320}`
-- `"experiment": {"experiment_name": "Iter18"}`
-
-### 成功条件（measurable）
-
-- **主成功条件**: 全 5 peer が OOM せずに学習を完了する
-- **副成功条件**:
-  1. `global_eval.log` が生成される（crashed peer なしでサーバーが global_eval を実行）
-  2. McNemar/Wilson CI 関数が `global_eval.log` に対して正常に動作する
-  3. `max_seq_len=320` の切り詰め率 4.9% が許容範囲内である
-
-### 期待効果
-
-`max_seq_len=320` に後退することで，RTX 4060 8GB 上の全 5 peer が OOM せずに学習を完了する．
-これによりサーバーが global_eval.log を生成可能になり，W1 統計テスト（McNemar + Wilson CI）
-を実行できる状態になる．また，seq_len=320 の切り詰め率 4.9% は許容範囲内（W2 note 記載）．
-
-### 検討・計画 (Iter18)
-
-**単一レバー**: `max_seq_len` 512 → 320 へ後退
-
-**実装計画**
-1. `config/settings.json` の変更:
-   - `training.max_seq_len`: 512 → 320
-   - `experiment.experiment_name`: "Iter17" → "Iter18"
-2. `config.yml` の levers で W2 `max_seq_len` の status を「320 へ後退（Iter18 実行中）」へ更新
-3. `uv run python -m json.tool config/settings.json > /dev/null` で JSON 妥当性確認
-4. git commit
-
-**プリ条件**
-- hosts.txt: 5 台構成（`.100/.102/.103/.108/.109`）— Iter17 で変更済み
-- 接触パターン: `rwp_n05_a0500_r100_p10_s42.json`（n=5）— Iter17 で生成済み
-- シャード: 1345 samples/peer（n=5 用）— Iter17 で再生成済み
-- 評価ホスト: deploy:eval 済み（Iter17 実施済み）
-- **注意**: settings.json を変更するとシャードは再生成不要（シャードは contact_pattern の n に依存）
-- **再デプロイ必要**: settings.json 変更は docker run 時に settings.json がマウントされるため，再デプロイで反映
-
-**実験計画**
-- コマンド: `WAFL_SELF_EVAL=0 mise run deploy` → `WAFL_SELF_EVAL=0 mise run start`
-- 実験ディレクトリ: `results/Iter18_<timestamp>`（mise 自動生成）
-- timeout: 80 分（config.yml 既定）
-- poll_interval: 120 秒（config.yml 既定）
-- **重要**: `mise.toml:140` の `WAFL_SELF_EVAL` デフォルトは `1` であるため，`mise run start` 実行時に `WAFL_SELF_EVAL=0` を明示的にシェル環境へ設定すること
-
-**成功条件**
-- **主**: 全 5 peer が OOM せずに学習を完了する
-- **副**:
-  1. `global_eval.log` が生成される（crashed peer なしでサーバーが global_eval を実行）
-  2. McNemar/Wilson CI 関数が `global_eval.log` に対して正常に動作する
-  3. `max_seq_len=320` の切り詰め率 4.9% が許容範囲内である
-
-**config.yml levers 更新**
-- W2 `max_seq_len`: status を「512 で OOM 確認（RTX 4060 8GB）．320 へ後退（Iter18 実行中）」へ更新
-
-**問い**
-1. 現 `settings.json` の値は何か（`max_seq_len`, `sample_limit`, `experiment_name`）
-2. `config/hosts.txt` は 5 台構成か
-3. 接触パターン `rwp_n05_a0500_r100_p10_s42.json` は存在するか
-4. `max_seq_len` を変更する際，コード側にも変更が必要か
-5. `WAFL_SELF_EVAL=0` のデプロイチェーンは完結しているか
-6. `experiment_name` は何にするか
-
-**分かったこと**
-
-- **`settings.json` 現値**: `max_seq_len: 512`（320 へ変更必要），`sample_limit: 500`（変更不要），`experiment_name: "Iter17"`（"Iter18" へ変更必要），`contact_pattern_file: "rwp_n05_a0500_r100_p10_s42.json"`（変更不要）
-- **`config/hosts.txt`**: 5 台（`.100/.102/.103/.108/.109`）．変更不要．
-- **接触パターンファイル**: 存在する（`data/contact_pattern/rwp_n05_a0500_r100_p10_s42.json`）．
-- **`max_seq_len` のコード側変更**: `src/client.py:1661` で `_get_int("training", "max_seq_len")` として settings.json から動的読み込み．**コード側の変更は不要**．
-- **`_POST_EVAL_SAMPLE_LIMIT`**: 既に 500（Iter17 実装分）．`WAFL_SELF_EVAL=0` で影響なし．
-- **`WAFL_SELF_EVAL` デプロイチェーン**: `start_clients.py:35` のデフォルトは `"0"`．ただし `mise.toml:140` のデフォルトは `1` であるため，`mise run start` 実行時に `WAFL_SELF_EVAL=0` を明示的に設定する必要がある．
-- **実装変更の範囲**: `settings.json` の 2 箇所のみ（`max_seq_len` 512→320，`experiment_name` "Iter17"→"Iter18"）．
-
-**次フェーズへの示唆**
-
-- 実装フェーズは `settings.json` の変更のみ．コード変更は不要．
-- 実験実行時は `WAFL_SELF_EVAL=0 mise run start` のように明示的に設定すること．
-- `config.yml` の levers で W2 `max_seq_len` の status を「320 へ後退（Iter18 実行中）」へ更新すべき．
-
-### 実装 (Iter18)
-
-**変更ファイル: `config/settings.json`**
-- `training.max_seq_len`: 512 → 320
-- `experiment.experiment_name`: "Iter17" → "Iter18"
-
-**変更ファイル: `.claude/research/config.yml`**
-- W2 `max_seq_len` の status を「320 へ後退（Iter18 実行中）」へ更新
-
-**構文チェック**
-- `uv run python -m json.tool config/settings.json` 通過
-
-**Git commit: `3710007`**
-
-### 実験 (Iter18)
-
-**環境**
-- 全 5 ノード GPU 空（使用量 1-32 MiB）
-- 実験ディレクトリ: results/Iter18_20260806T010736
-- 実験期間: 1561 秒（約 26 分）
-
-**結果**
-
-| Peer | ノード | GPU | 状態 | 最終 step | Avg Loss | Avg Token/s |
-|------|--------|-----|------|-----------|----------|-------------|
-| 0 | wafl500 | RTX 4060 8GB | 完了 | 1657 | 0.4889 | 299.7 |
-| 1 | wafl502 | RTX 4060 8GB | 完了 | 2571 | 0.4885 | 328.7 |
-| 2 | wafl503 | RTX 4060 8GB | 完了 | 1669 | 0.5061 | 294.9 |
-| 3 | wafl508 | RTX 4060 8GB | 完了 | 3214 | 0.4670 | 401.4 |
-| 4 | wafl509 | RTX 4060 8GB | 完了 | 2808 | 0.4881 | 408.5 |
-
-**判定: 主条件合格**
-- 全 5 peer が OOM せずに学習を完了した。RTX 4060 8GB の peer 0, 3 も含め、`max_seq_len=320` で OOM 問題は解消された。
-- `global_eval.log` は未生成（`WAFL_SELF_EVAL=0` により評価専用ホストへ委譲済み）。
-- McNemar/Wilson CI は `global_eval.log` 未取得のため未テスト。
-
-### 分析 (Iter18) — 解釈（2026-08-06）
-
-**本解釈の目的**: `max_seq_len=320` の OOM 解消効果と loss/throughput の意味を、Iter17（seq_len=512）と比較し、W1 統計テストの実施可能性を判定し、次イテレーションの方針を決定する。
-
-**実測メトリクス（全 5 peer）**:
-
-| Peer | ノード | GPU | 状態 | Steps | Avg Loss | Std Loss | Mean tok/s | Stall (s) | Contact |
-|------|--------|-----|------|-------|----------|----------|------------|-----------|---------|
-| 0 | wafl500 | RTX 4060 8GB | 完了 | 1657 | 0.4889 | 0.2611 | 299.7 | 0.30 | 38 |
-| 1 | wafl502 | RTX 4060 8GB | 完了 | 2571 | 0.4885 | 0.2402 | 328.7 | 0.19 | 36 |
-| 2 | wafl503 | RTX 4060 8GB | 完了 | 1669 | 0.5061 | 0.2387 | 294.9 | 0.34 | 30 |
-| 3 | wafl508 | RTX 4060 8GB | 完了 | 3214 | 0.4670 | 0.2227 | 401.4 | 0.20 | 30 |
-| 4 | wafl509 | RTX 4060 8GB | 完了 | 2808 | 0.4881 | 0.2288 | 408.5 | 0.20 | 42 |
-
-**全 peer 平均**: mean_loss=0.4877, mean_tok/s=346.7, mean_stall=0.25s
-
----
-
-**1. OOM 解消の判定**:
-
-**判定: 成功**（確信度: 高）
-
-- Iter17（seq_len=512）: RTX 4060 8GB の peer 0, 3 が OOM（2/5 peer）
-- Iter18（seq_len=320）: 全 5 peer 完了（0/5 peer OOM）
-- RTX 4060 8GB（wafl500, wafl503, wafl508）の全 3 台が正常完了。peer 3 は 3214 steps で最も多くの学習をこなした。
-- `max_seq_len=320` は RTX 4060 8GB で安全域であることが実証された。
-- 切り詰め率 4.9%（W2 note 記載）が許容範囲内か否は loss 比較で評価。
-
----
-
-**2. loss 比較（Iter18 seq_len=320 vs Iter17 seq_len=512）**:
-
-| 指標 | Iter18 (seq=320, 5 peer) | Iter17 完了 peer (seq=512, 3 peer) | 差 |
-|------|--------------------------|-----------------------------------|-----|
-| Avg Loss | 0.4877 | 0.4801 | +0.0076 (+1.6%) |
-| Final Loss | 0.4877（平均 loss 使用） | 0.2112 | - |
-| Mean tok/s | 346.7 | 345.0 | +1.7 (+0.5%) |
-
-**重要な注意点**: Iter17 の完了 peer 平均 loss 0.4801 は、per-peer の「Avg Loss（全ステップの平均 loss）」であり、final loss（最終ステップの loss）ではない。両イテレーションとも Avg Loss で比較している。
-
-**loss 差の解釈**:
-- Iter18 の Avg Loss（0.4877）は Iter17 の Avg Loss（0.4801）より +1.6% 高い。
-- この差異は非常に小さい（0.0076）。n=5 vs n=3 のサンプル差を考慮すると、**ノイズ範囲内**と判断できる。
-- seq_len=320 の切り詰め率 4.9% が loss に与える影響は、このレベル（1.6% の上昇）であれば許容範囲。
-- **ただし**: seq_len=512 で全 peer が完了する条件での直接比較は不可能（RTX 4060 8GB で OOM）。したがって「seq_len=320 の loss は seq_len=512 より有意に高い」とは言えない。
-- **loss 改善の解釈**: seq_len=512（切り詰めほぼ 0%）と seq_len=320（切り詰め 4.9%）の loss 差は 1.6% で、これは切り詰めによる学習品質の低下が微小であることを示唆する。
-
----
-
-**3. throughput 分析**:
-
-| 指標 | Iter18 | Iter17 完了 peer | 差 |
-|------|--------|-----------------|-----|
-| Mean tok/s | 346.7 | 345.0 | +1.7 (+0.5%) |
-| Mean Stall (s) | 0.25 | N/A | - |
-| Stall-free 相関 | | | |
-| - 全期間 | -0.0005 | - | - |
-| - t>=60s | +0.0062 | - | - |
-
-**判定: stall-free 設計が正常動作**（確信度: 高）
-
-- 相関 |r|=0.0062 < 0.1 で、通信中でもスループットが一定。
-- mean stall 0.25s は極めて小さく、P2P マージが計算をブロックしていない。
-- Iter17 完了 peer（345.0 tok/s）との差は +0.5% でノイズ範囲内。seq_len の違い（512→320）が throughput に与える影響は negligible。
-
----
-
-**4. global_eval.log status**:
-
-**判定: 未取得**（確信度: 高）
-
-- 全 5 peer の checkpoint が `global_eval_tmp/` にコピー済み（`.training_done` 全 peer 存在）。
-- **しかし `global_eval.log` が生成されていない**。原因は **eval ワーカーが起動されていなかった**。
-- 調査結果:
-  - 評価ホスト（wafl501, .504-.507）の Docker コンテナは `wafl-peft-client-*` として動作中（exit code 137=OOM kill）。
-  - `eval_worker.py` ではなく `client.py` が起動されていた。
-  - `mise run start` の `depends` は `["start:server", "start:clients"]` のみで、`start:eval` を含まない。
-  - `start:eval` は別タスク（`mise run start:eval`）として独立している。
-- つまり、`WAFL_SELF_EVAL=0` で自己評価を無効化しても、**`start:eval` を明示的に実行しない限り eval ワーカーは起動しない**。
-- 実験フェーズの記録には `mise run start:eval` の実行は確認できない。
-
----
-
-**5. W1 統計テスト status**:
-
-**判定: 実施不能**
-
-- McNemar 対比較と Wilson 95% CI の実装は `src/compare_baselines.py` に完了済み。
-- **ただし global_eval.log 未取得のため、per-question 結果が抽出できず、統計テストは不能**。
-- 根本原因: `start:eval` の実行漏れ。
-
----
-
-**6. 次イテレーションへの示唆**:
-
-**必須対応: `start:eval` の実行手順の修正**
-
-- 次イテレーションでは `mise run start` の後に `mise run start:eval` を実行する必要がある。
-- または、`mise.toml` の `start` タスクの `depends` に `start:eval` を追加する（ただし、これは `start:clients` と `start:eval` の並列起動に影響する可能性があるため、事前にテストが必要）。
-- 評価ホストのコンテナが `client.py` として動作していた原因は、`deploy:eval` で image が配布されたが、`start:eval` でコンテナが起動されなかったため、古い `client` コンテナが残っていた可能性。
-
-**W2 (max_seq_len) の判定**:
-
-- `max_seq_len=320` で RTX 4060 8GB の OOM が解消された。**採用確定**。
-- seq_len=320 の切り詰め率 4.9% が loss に与える影響は微小（+1.6% でノイズ範囲内）。
-- seq_len=512 で全 peer が完了する条件（例: RTX 3060 12GB のみ構成、または ple_device=cpu）での再テストは、W2 の最終判定として検討価値があるが、優先度は低い。
-
-**W1 (eval_resolution) の次のステップ**:
-
-- global_eval.log を取得するには `start:eval` の実行が必須。
-- 次イテレーションで `start:eval` を実行した上で、global_eval.log の生成を確認し、McNemar/Wilson CI をテストする。
-
----
-
-**確信度**:
-- OOM 解消: **高**（全 5 peer 完了、RTX 4060 8GB 含む）
-- loss 比較: **中**（seq_len=512 で全 peer 完了の条件がないため、直接比較は不完全。ただし +1.6% の差はノイズ範囲内と判断）
-- throughput 分析: **高**（stall-free 相関 |r|=0.0062、stall 0.25s）
-- global_eval.log 未取得原因: **高**（`start:eval` 未実行を確認）
-- W1 統計テスト: **実施不能**（根本原因の修正後、次イテレーションで再テスト）
-
-### Iteration 18 実行済み
-
-**このイテレーションの実行結果サマリー**
-
-`max_seq_len` を 512 → 320 へ後退した実験結果:
-
-| Peer | ノード | GPU | 状態 | 最終 step | Avg Loss | Avg Token/s |
-|------|--------|-----|------|-----------|----------|-------------|
-| 0 | wafl500 | RTX 4060 8GB | 完了 | 1657 | 0.4889 | 299.7 |
-| 1 | wafl502 | RTX 4060 8GB | 完了 | 2571 | 0.4885 | 328.7 |
-| 2 | wafl503 | RTX 4060 8GB | 完了 | 1669 | 0.5061 | 294.9 |
-| 3 | wafl508 | RTX 4060 8GB | 完了 | 3214 | 0.4670 | 401.4 |
-| 4 | wafl509 | RTX 4060 8GB | 完了 | 2808 | 0.4881 | 408.5 |
-
-- 全 5 peer が OOM せずに完了（主条件合格）
-- 平均 loss: 0.4877（Iter17 完了 3 peer 平均 0.4801 より +1.6%）
-- 平均 throughput: 346.7 tok/s（Iter17 完了 3 peer 平均 345.0 tok/s より +0.5%）
-- global_eval.log 未取得（`start:eval` 実行漏れ）
-- McNemar/Wilson CI 未テスト
-
-**判定（各レバー毎）**:
-
-1. **W2 (max_seq_len): 採用（収束）** — `max_seq_len=320` で RTX 4060 8GB の 2/5 peer が OOM していたのが、全 5 peer 正常動作へ完全解消。loss 差 +1.6% は切り詰め 4.9% の影響として微小。seq_len=320 を既定として採用。このレバーはこれ以上動かしても効果がない（収束）。
-2. **W1 (eval_resolution): 追加反復要** — `start:eval` を実行漏れしていた。次イテレーションでは `mise run start:eval` を明示的に実行し、global_eval.log の生成を確認してから McNemar/Wilson CI をテストする。
-
-**学び**:
-
-1. **`max_seq_len=320` は RTX 4060 8GB で安全域** — 4 年前の推算 `(320/512)^2 = 0.39` が実測で検証された。seq_len=320 の切り詰め率 4.9% が loss に与える影響は +1.6%（ノイズ範囲内）であり、実用上問題ない。
-2. **`start:eval` は `mise run start` の depends に含まれていない** — `WAFL_SELF_EVAL=0` で自己評価を無効化しても、eval ワーカーを起動するには `mise run start:eval` を明示的に実行する必要がある。これは実験手順の既知の不具合。次イテレーションでは `start:eval` を必ず実行する。
-3. **throughput は seq_len 差でノイズ範囲内** — seq_len=320 vs 512 の throughput 差は +0.5%（346.7 vs 345.0 tok/s）で、stall-free 相関 |r|=0.0062 からも、シーケンス長が throughput に与える影響は negligible。
-
-**次イテレーションの方針**:
-
-- **単一レバー**: `eval_resolution`（W1）— `mise run start:eval` を明示的に実行し、global_eval.log を生成して McNemar/Wilson CI をテストする
-- **固定構成**: `max_seq_len=320`（W2 採用済み）、5 ノード（`.100/.102/.103/.108/.109`）、sample_limit=500
-- **必須対応**: 実験後に `mise run start:eval` を実行すること。`mise.toml` の `start` タスクに `start:eval` を depends に追加するか、実験手順ドキュメントを修正するかの検討も併せて行う。
 
 ---
 

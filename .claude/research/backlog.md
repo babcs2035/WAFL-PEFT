@@ -7,9 +7,30 @@
 - 決着した項目には末尾に `- 決着（YYYY-MM-DD）:` 行を追記し，未決の項目と区別できるようにする．
 
 **未決（人間判断待ち）**: なし．B10 で次イテレーションの方針が人間により確定した．
-**再開時はまず B13（次セッションへの申し送り）→ B12（Iter18 方針）の順に読むこと．**
+**再開時はまず B16（Iter22 方針）→ B13（次セッションへの申し送り）の順に読むこと．**
 
 ---
+
+## B18 [auto-decided 2026-08-06] Iter22: W1 再試行 — results/ コンテナマウント修正で device_eval.log 生成
+
+- **状況**: Iter21 で `start:eval` timing fix は成功（評価ワーカー自動起動）したが、
+  `device_eval.log` が未生成。根本原因は学習ノードの Docker コンテナに `results/`
+  ディレクトリがマウントされていないこと。評価ワーカーは SSH で学習ノードの `results/`
+  から checkpoint を取得しようとするが、ディレクトリが存在しないため未取得。
+- **自動選択**: Iter22 で `start_clients.py` の変更を行い、学習ノードの Docker コンテナに
+  `results/` をマウントする。これにより eval_worker が checkpoint を取得し、
+  `device_eval.log` が生成されるはず。
+- **変更ファイル**: `src/start_clients.py`
+  - 学習ノードの `docker run` コマンドに `-v {pwd}/results:/app/results` を追加
+  - 既存のマウントオプション（`-v {pwd}/config:/app/config` 等）に追記
+- **根拠**: `device_eval.log` 生成は McNemar/Wilson CI 動作確認の必須プリ条件。
+  コード変更は 1 行（-v オプション追加）のみ。可逆。
+- **固定構成**: `max_seq_len=320`、5 ノード（`.100/.102/.103/.108/.109`）、
+  `sample_limit=500`、`WAFL_SELF_EVAL=0`
+- **要レビュー**: `results/` ディレクトリが既に存在し、コンテナ起動時に空ディレクトリとして
+  マウントされることで、ホスト上の `results/` 配下の既存実験ディレクトリが見えなくなる可能性。
+  既存の結果ファイルへのアクセスを維持するなら、別のマウントパス（例: `/app/experiment_results`）
+  を検討する必要がある。planner が確認すること。
 
 ## B16 [auto-decided 2026-08-06] Iter21: compare_baselines.py の McNemar extract_per_question_results バグ修正
 
@@ -37,7 +58,7 @@
   4. `ssh wafl-ctrl5 "docker system prune -a -f"`（Docker Local Volumes 約 216GB 回収）
   5. `ssh wafl-ctrl5 "df -h"` で確認
 - **Slack**: `@mention` 済み（B10 決定 4 で watchdog 起動確認済み）
-- **決着（2026-08-06）**: 人間の承認待ち
+- **決着（2026-08-06）**: 完了（100% → 84%）。ただし `device_eval.log` 未生成の根本原因は `results/` ディレクトリがコンテナにマウントされていないこと（別課題）。
 
 ## B15 [auto-decided 2026-08-06] Iter21: McNemar/Wilson CI動作確認とサーバーディスク清理
 
