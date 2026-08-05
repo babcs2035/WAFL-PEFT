@@ -2,6 +2,13 @@
 
 WAFL-PEFT は，時変 P2P (Peer-to-Peer) トポロジー下でのフェデレーテッド PEFT (Parameter-Efficient Fine-Tuning) 実験フレームワークである．複数の学習デバイス (peer) が直接重みを交換しながら大規模言語モデルを LoRA で協調学習し，管理サーバーが動的な接触パターン (contact pattern) に応じて通信トポロジーを制御する．
 
+本ファイルは**実装の入口**（アーキテクチャ・使用方法・設定・プロトコル・ログ形式）である．
+実験の経緯と現在の到達点は `.claude/research/journal.md` の「現在の状態」節，
+研究方針とその根拠は [docs/README.md](docs/README.md) から辿ること．
+**過去の accuracy を引用する際の注意**: 2026-08-05（Iter14）に，outgoing 接続の受信処理が欠けていたため
+**Iter1〜13 の全実験で P2P 重み交換が一度も成立していなかった**ことが判明した．詳細は
+「設計上の重要な知見と修正」節を参照．
+
 ## 技術スタック
 
 | 分野           | 技術                                             |
@@ -156,9 +163,11 @@ flowchart LR
 
 ## 設計上の重要な知見と修正（実験を通じて確立）
 
-本フレームワークは実機（RTX 3060 12GB × 5 ノード + 管理サーバー，`google/gemma-4-E2B` を 4-bit QLoRA）での
+本フレームワークは実機（RTX 3060 12GB × 10 ノード + 管理サーバー，`google/gemma-4-E2B` を 4-bit QLoRA）での
 反復実験を通じて，いくつかの重要な設計判断とバグ修正を確立してきた．ここに横断的な知見を集約する．
 個別の詳細は上記・下記の各節に対応している．
+実際に使うノードは `config/hosts.txt` の行数で決まり，2026-08-05 時点では 10 台（`192.168.15.100`〜`.109`）である．
+Iter1〜11 の実験は 5 台構成で行われたため，当時の数値と直接は比較できない（1 ノードあたりのシャードが半減する）．
 
 ### 学習効率（各ノードの性能を着実に向上させるための工夫）
 
@@ -223,6 +232,23 @@ flowchart LR
   ノードだけを長い沈黙で検出する．諦める際は欠落 peer をログ出力する．
 - **ロガーの早期終了バグ**: Thread 4 が `state.running=False` で自発終了すると実験後評価の結果を取りこぼす．
   `None` センチネル受信でのみ終了するよう修正．
+- **P2P 重み交換が成立していなかった問題（2026-08-05 修正．最も影響が大きい）**: 同一 peer との通信は
+  双方が別方向へ connect する 2 本の TCP 接続で成立する設計だったが，**outgoing 側の接続に受信処理が無く**，
+  相手からの重みは着信接続経由でしか `receive_buffers` に入らなかった．着信が成立しない環境では
+  `receive_buffers` が常に空のままマージ条件が偽になり続け，**Iter1〜13 の全実験で重み交換が一度も
+  起きていなかった**（接触イベント自体は正常に発生していたため気づきにくい）．
+  outgoing 接続にも `_recv_peer_info()` と受信ループを追加して解消した．
+  併せて，peer_id の受信と重みデータの受信を別スレッドへ分けてデッドロックを解消し
+  （`_receive_weights_loop`），接触終了直後の peer のバッファもマージ対象に含めるよう
+  `prev_whitelist` でフィルタするようにした．
+- **マージに自ノードの重みを含める（W3，2026-08-05 採用）**: 従来は受信した remote peer のみを平均し，
+  その結果でローカル重みを `param.copy_()` で完全上書きしていた．接触相手が 1 台のとき（RWP のペア接触では
+  通常こうなる）これは平均ではなく**相手の重みへの置換**であり，直前のマージ以降の自ノードの学習が
+  すべて破棄されていた（WAFL 原典 Eq.3 は自ノードを含む平均を規定している）．
+  自ノードの重みを加えて `count += 1` する実装に変更し，環境変数 `WAFL_MERGE_INCLUDE_SELF`（既定 `1`）で
+  切り替えられるようにした．10 ノードでの対比では最終 loss が 0.517 → 0.364，per-peer の最終 loss の
+  標準偏差が 0.406 → 0.171 となった（`merged` は CPU 上・`param` は CUDA 上にあるため，加算前に
+  `.to(param.device)` が必要である点に注意）．
 
 ### 運用・可観測性
 
@@ -234,10 +260,29 @@ flowchart LR
   `results/IterX_<timestamp>` で識別しやすくする．
 - **外部 GPU 競合への配慮**: ノードの GPU を他ユーザーが共有し，これが OOM・step 遅延（マージ時のメモリ逼迫で
   一時的に compute が遅くなる。P2P stall ではなく外部要因由来）の主因になる．上記の VRAM 削減で共存性を確保する．
+- **マージイベントの JSONL 化（2026-08-05）**: マージの発生は `print()` で標準出力にしか出ておらず，
+  `collect_logs.py` が JSONL メトリクスファイルのみを回収するため事後に数えられなかった（Docker の
+  標準出力は回収対象外）．`type: "merge"` のレコードをメトリクスへ書き出すようにし，発生数・時刻・
+  相手 peer 数・自ノードを含めたかを検証できるようにした．**マージが起きたか分からない状態で
+  accuracy を解釈してはならない**という教訓による（実際に Iter1〜13 は 0 回だった）．
 
-### 到達点（学習最適化の収束）
+### 到達点（学習最適化の収束）— **2026-07-26 に判定を保留**
 
-反復実験（Iter1〜11）の結果，固定制約（VRAM／contact pattern／モデルを固定）下での学習最適化は上限に収束した．
+> **この節の結論は保留中である．** 評価問題数が 40〜80 問しかなく，accuracy p≈0.225 における
+> 80% power の最小検出可能差が 18.5〜26.2pt だったのに対し，当時の成功条件は「+2pt 以上」であった．
+> したがって以下の「有意差なし／悪化」といった判定の大半は測定ノイズの範囲内であり，
+> 統計的には成立していない（`plans/p0001_research_direction_2026-07.md` F1，
+> `.claude/research/backlog.md` の B3）．
+>
+> さらに 2026-08-05（Iter14）に，**outgoing 接続に受信ロジックが無く `receive_buffers` が常に空だった**
+> ため，**Iter1〜13 の全実験で P2P 重み交換が一度も成立していなかった**ことが判明した
+> （commit `96d4716` / `077368a` / `182f46b` で修正）．以下の accuracy 系列は「協調学習の効果」ではなく
+> 各ノードの孤立学習の結果として読む必要がある．
+>
+> 記録として当時の内容をそのまま残すが，再利用する際は必ず上記 2 点を添えること．
+> 現在の到達点は `.claude/research/journal.md` の「現在の状態」節を参照する．
+
+反復実験（Iter1〜11，5 ノード構成）の結果，固定制約（VRAM／contact pattern／モデルを固定）下での学習最適化は上限に収束した（と当時判定した）．
 
 - **最良構成**: `lora_rank=16 / lora_alpha=32 / lr 2e-4 / lr_min_ratio=0.5 / lora_dropout=0.15 /
   grad_accum_steps=8 / max_seq_len=208` + chunked CE + paged 8-bit AdamW．
@@ -265,14 +310,18 @@ graph LR
         EW["eval_worker.py<br/>評価専用ホストの随時評価ワーカー"]
         SD["setup_data.py<br/>データ準備"]
         GC["generate_contact_pattern.py<br/>接触パターン生成"]
-        AN["analyze.py<br/>分析・可視化"]
+        AN["analyze.py<br/>単一実験の分析・可視化"]
+        CR["compare_runs.py<br/>反復実験の集計（平均±標準偏差）"]
+        CB["compare_baselines.py<br/>ベースラインとの比較"]
         GEV["gsm8k_eval.py<br/>GSM8K評価ロジック共通モジュール"]
         DD["deploy_distribute.py<br/>デプロイ（eval 引数で評価ホストにも配布）"]
+        SG["setup_gpu_nodes.py<br/>各ノードへGPUツールキット導入"]
         SC["start_clients.py<br/>学習クライアント並列起動"]
         SE["start_eval_workers.py<br/>評価ワーカー起動"]
         CLG["collect_logs.py<br/>ログ回収"]
         CN["clean.py<br/>クリーンアップ"]
         UT["utils.py<br/>共通関数"]
+        LG["log.py<br/>ログ整形"]
     end
 
     subgraph data["data/"]
@@ -281,9 +330,30 @@ graph LR
         CP["contact_pattern/<br/>時変トポロジーJSON"]
     end
 
+    subgraph rec["記録（コード外）"]
+        DOC["docs/<br/>調査・設計・論文原稿（索引は docs/README.md）"]
+        PL["plans/<br/>研究方針・大規模変更の計画"]
+        RS[".claude/research/<br/>research-cycle の journal / backlog / config"]
+    end
+
     cfg --> src
     src --> data
+    src -.->|結果の解釈| rec
 ```
+
+各ディレクトリの役割は次のとおりである．`results/`・`data/`・`cache/` は `.gitignore` 対象であり，
+リポジトリには含まれない．
+
+| ディレクトリ | 役割 |
+| --- | --- |
+| `config/` | 実験設定（`settings.json`）とノード一覧（`hosts.txt` / `hosts.eval.txt`） |
+| `src/` | サーバー・クライアント・デプロイ・分析のスクリプト |
+| `data/` | Non-IID 分割済みデータと接触パターン（`mise run setup` が生成） |
+| `results/` | 実験ごとの `logs/` と `output/`（分析レポート・図） |
+| `cache/` | モデル・データセットのダウンロードキャッシュ |
+| `docs/` | 文献調査・位置付けの調査記録，論文原稿．索引は [docs/README.md](docs/README.md) |
+| `plans/` | 研究方針の意思決定（`p0001_research_direction_2026-07.md`） |
+| `.claude/research/` | research-cycle の一次記録（`journal.md` / `backlog.md` / `config.yml` / `state.json`） |
 
 ## 時変トポロジー (contact_pattern.json)
 
@@ -560,6 +630,29 @@ self_attn.q_proj, self_attn.k_proj, self_attn.v_proj, self_attn.o_proj
 mlp.gate_proj, mlp.up_proj, mlp.down_proj
 ```
 
+## 環境変数（アルゴリズムの切り替え）
+
+`settings.json` に置くと実験ごとの書き換えが必要になる「条件の切り替え」は，環境変数で行う．
+`mise run start:clients`（または `mise run start`）の実行時に指定すると，
+`src/start_clients.py` が `docker run -e ...` として各学習ノードのコンテナへ転送する．
+比較実験では **1 つだけ変える**（単一レバー原則）．
+
+| 環境変数 | 既定 | 意味 |
+| --- | --- | --- |
+| `WAFL_P2P_ENABLED` | `1` | `0` で P2P 重み交換を無効化する．孤立学習（self-training）ベースラインを取るときに使う |
+| `WAFL_MERGE_INCLUDE_SELF` | `1` | `1` でマージの平均に自ノードの重みを含める（WAFL 原典 Eq.3 準拠）．`0` は含めない従来の挙動で，接触相手 1 台のときは相手の重みへの置換になる．メトリクスの `merge_includes_self` にそのまま出る |
+| `WAFL_P2P_SYNC` | `0` | `1` で同期バリア方式（訓練ループ内で重み交換の完了を待つ逐次方式）にする．`0` は非同期（ストールフリー）経路 |
+| `WAFL_P2P_SYNC_TIMEOUT_SEC` | 未指定 | 同期バリアのタイムアウト秒．未指定なら `settings.json` の `communication.p2p_sync_timeout_sec`（既定 15.0）を使う |
+| `WAFL_SELF_EVAL` | `1` | `0` で学習ノードの実験後自己評価を無効化する．評価専用ホスト（`eval_worker.py`）へ評価を委譲する構成で使う |
+
+```bash
+# 例: マージに自ノードを含めない条件で実験する（control 側）
+WAFL_MERGE_INCLUDE_SELF=0 mise run start
+
+# 例: 孤立学習ベースライン
+WAFL_P2P_ENABLED=0 mise run start
+```
+
 ## 使用方法
 
 ### 1. 環境セットアップ
@@ -708,6 +801,18 @@ accuracy 採点は `gsm8k_eval.py` の `score_generations` に集約されてお
 `#### N` の数値を正規化し，gold と**厳密一致**したものを正解とする（採点の落とし穴は後述の知見を参照）．
 環境変数 `ANALYZE_CONVERGENCE=0` で評価 5・6 の作図をスキップできる．
 
+**実験間の比較**には別のスクリプトを使う．
+
+| スクリプト | 用途 |
+| --- | --- |
+| `src/compare_runs.py` | 同一条件の反復実験を集計する（平均 ± 標準偏差）．research-cycle の `metrics_cmd` に登録されている |
+| `src/compare_baselines.py` | 孤立学習（`WAFL_P2P_ENABLED=0`）などのベースラインとの比較 |
+
+**accuracy や loss を解釈する前に，マージが実際に起きたかを必ず先に確認する**こと．
+メトリクスの `"type": "merge"` レコードを数える（例:
+`grep -c '"type": "merge"' results/<実験名>/logs/peer_*/metrics_peer_*_final.log`）．
+0 件であれば，その実験は孤立学習であり協調学習の結果として読めない．
+
 ## Docker コンテナ構成
 
 各コンテナは以下のボリュームをマウントする．
@@ -768,9 +873,16 @@ Dockerfile はビルドレイヤーの最適化を考慮している．変更頻
 | gpu_util_percent  | float \| null | GPU SM 使用率 (%) ． CPU 環境では null                        |
 | accuracy          | float         | GSM8K accuracy (%) ，"eval" タイプのみ（実験後評価の各チェックポイント） |
 | allowed_peers     | list[int]     | 接触可能peer一覧（"contact_event" のみ）                      |
-| type              | string        | "metric" ・ "checkpoint" ・ "contact_event" ・ "eval" のいずれか |
+| num_peers_merged  | int           | マージした remote peer 数（"merge" のみ）．`merge_includes_self` が true のときは自ノードを除いた数 |
+| merge_includes_self | bool        | そのマージが自ノードの重みを平均に含めたか（"merge" のみ）．`WAFL_MERGE_INCLUDE_SELF` の値と一致する |
+| type              | string        | "metric" ・ "checkpoint" ・ "contact_event" ・ "merge" ・ "eval" のいずれか |
 
 "contact_event" は Thread 1 がサーバーからの signal で許可 peer リストが変化した瞬間にのみ記録され，`contact_pattern.json` の意図した切り替え時刻と実際の接続状態がずれていないかを事後検証できる．
+
+"merge" は Thread 2 がマージ済み重みを `merge_queue` へ渡した瞬間に記録される．**マージが実際に発生したかを
+確認できる唯一の機械可読な記録**であり（標準出力の `print()` ログは回収されない），accuracy や loss を
+解釈する前にまずこのレコード数を数えること．10 ノード・接触窓 1500s の構成では 1 実験あたり 240〜270 件程度，
+その 97% 前後が `num_peers_merged=1`（相手 1 台との交換）になる．
 
 "eval" は**実験終了後**に各クライアントが自分のチェックポイント履歴を評価した結果である（`run_post_experiment_evaluation`）．各レコードの `step`・`elapsed` は評価対象チェックポイントの学習時点を表し， `accuracy` はそのチェックポイントの GSM8K accuracy である．`analyze.py` の評価 6（ノード別収束）はこのレコードを読む．
 

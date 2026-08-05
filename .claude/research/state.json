@@ -2,14 +2,14 @@
   "repo": "WAFL-PEFT",
   "iteration": "Iter16",
   "iteration_name": "merge_includes_self動的値化 + W3再評価",
-  "phase": "plan",
+  "phase": "reflect",
   "status": "running",
-  "current_lever": "merge_include_self_dynamic",
-  "experiment_dir": null,
+  "current_lever": "WAFL_MERGE_INCLUDE_SELF",
+  "experiment_dir": "results/Iter16treat_20260805T114152",
   "experiment_deadline": null,
-  "updated_at": 1785885648,
+  "updated_at": 1785914713,
   "last_slack_ts": null,
-  "iteration_thread_ts": null,
-  "notion_toggle_created": false,
-  "last_commit": "42a9cfe"
+  "iteration_thread_ts": "1785892462.554839",
+  "notion_toggle_created": true,
+  "last_commit": "fc6e3c9"
 }

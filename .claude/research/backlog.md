@@ -3,6 +3,11 @@
 新しいものを常に先頭に追記する（逆時系列）．
 - 可逆な暫定判断: `## B{n} [auto-decided YYYY-MM-DD] 題目`（状況・自動選択・根拠・要レビュー）
 - 不可逆・危険な事項: `## B{n} [needs-human YYYY-MM-DD] 題目`（Slack で @mention 済みと明記）
+- 人間が回答して決着した事項: `## B{n} [resolved-by-human YYYY-MM-DD] 題目`
+- 決着した項目には末尾に `- 決着（YYYY-MM-DD）:` 行を追記し，未決の項目と区別できるようにする．
+
+**未決（人間判断待ち）**: なし．B1 は B2 で回答済み．B3 の「W1 完了まで accuracy を採否根拠にしない」は
+現在も有効な制約であり，W1（評価解像度）・W2（`max_seq_len`）は 2026-08-05 時点で未着手である．
 
 ---
 
@@ -24,6 +29,12 @@
   コードで制御する仕組みが必要。plannerが実装計画を立てること。
 - 補足: self-evalスキップ（GSM8K validation data not available）はIter16でも解消しない可能性
   が高い。per-peer accuracyは次イテレーション以降に回す。
+- 決着（2026-08-05）: Iter16 として実施した．(1) 動的値化は成功（control 全 265 件 `false` /
+  treatment 全 242 件 `true`）．(2) W3 は **採用**（最終 loss 0.517 → 0.364，per-peer の最終 loss
+  標準偏差 0.406 → 0.171）．既定 `WAFL_MERGE_INCLUDE_SELF=1` として永続適用する．
+  accuracy は両条件とも peak 17.5% でノイズ範囲内であり，判定は W1 完了後に再実施する．
+  補足の予想どおり self-eval スキップは未解消で per-peer accuracy は取得できていない．
+  ※ Iter16 の考察フェーズ（journal の `### Iteration 16 実行済み`）は未記入である．
 
 ## B8 [auto-decided 2026-08-05] Iter15: merge JSONL メトリクス化 + W3 対比実験
 
@@ -133,6 +144,11 @@
   - `src/client.py:1523` の `set_deterministic_seed(PEER_ID)` により `lora_A` の初期値がノード毎に異なる。
 - 要レビュー: 過去 11 イテレーションの結論を再評価する必要があるため、論文（`docs/paper.tex`）に
   既存の判定を根拠として書いている箇所があれば、W1 完了まで主張を弱める必要がある。
+- 進捗（2026-08-05）: W3（F2 のマージ乖離）は Iter16 で **採用済み**（B9 参照）．W5（`lora_A_only`）の
+  前提となる F3（`lora_A` の初期値がノード毎に異なる）は未修正．**W1・W2 はいずれも未着手**であり、
+  「W1 完了まで accuracy を採否根拠にしない」という制約は現在も有効である．
+  `docs/paper.tex` の主張の弱化も未実施（提出済み文書のため改変は人間判断とし、位置付けの注記を
+  `docs/README.md` に記載した）．
 
 ## B2 [resolved-by-human 2026-07-18] Iter12 実験: hosts.txt 2台構成でのデッドロックへの対応
 - 状況: 前回セッションで外部 GPU 競合により `config/hosts.txt` を 5 台→2 台へ縮小していたが、
@@ -152,3 +168,7 @@
 - 暫定方針（planner が着手前に確認）: 新規実装のみで着手できる「逐次方式との throughput 比較
   （client.py に P2P 同期実行フラグを追加）」を可逆な第一候補とし、ノード確保が要るスケール検証は人間判断待ちとする．
 - Slack: 初回サイクル開始時に @mention してこの選定を仰ぐ．
+- 決着（2026-08-05 追記）: B2 で人間が「5 台構成のまま GPU 競合の解消を待つ」と回答し，暫定方針の
+  「逐次方式との throughput 比較」を Iter12〜13 で実施した（`WAFL_P2P_SYNC`）．
+  その後 B3 で研究方針そのものを改訂したため，本項目は解決済みとして扱う．
+  ノード数スケール（数十台規模）は未着手のまま `config.yml` の `research_frontier` に残っている．

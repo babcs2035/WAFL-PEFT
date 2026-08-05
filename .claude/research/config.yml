@@ -32,6 +32,19 @@ journal_retention: 3
 # 約 1,962 問が必要で，GSM8K test 全 1319 問でも足りない）．rank32 の「大幅悪化」(z≈1.0) を含め，
 # +14pt の全体効果を除くほぼすべての判定が測定ノイズの範囲内だった．
 # したがって W1・W2（測定系の立て直し）を最優先とし，これを終えるまで accuracy 系の判定は行わない．
+#
+# 実施状況（2026-08-05 Iter16 終了時点．planner はここを見て次のレバーを選ぶ）:
+#   W1 eval_resolution        : 未着手（最優先．global_eval.sample_limit は現在も 40）
+#   W2 max_seq_len            : 未着手（最優先）
+#   W3 merge_include_self     : **採用済み**（Iter16）．既定 WAFL_MERGE_INCLUDE_SELF=1 で固定．レバーとして振らない
+#   W4 skip_local_train_when_isolated : 未着手
+#   W5 lora_exchange_scope    : 未着手（前提の F3 = lora_A のノード毎初期値差 は未修正）
+#   W6 alternating_merge_interval : 未着手
+#   W2b ple_device            : 未着手（W2 が OOM したときの前提条件）
+#   W7 train_dataset / W8 node_count / W9 base_model : 未着手（W8 は 10 ノード運用中だが seed 1 本のみ）
+# なお Iter14 で判明したとおり，Iter1〜13 の全実験は P2P 重み交換が機能しておらず（outgoing 接続に
+# 受信ロジックが無かった），accuracy 系列は協調学習の効果としては読めない．過去の判定と比較する際は
+# 「P2P が機能していた実験は Iter14 以降のみ」という前提を必ず添えること．
 levers:
   # --- W1: 最優先．これ以前に accuracy 系のレバーを振っても判定できない ---
   - {name: eval_resolution, values: [500, 1319],
@@ -56,8 +69,12 @@ levers:
             **このレバーは accuracy の絶対水準を大きく動かす可能性があるため，W1（評価解像度）と
             同時に実施し，以降の全比較のベースラインを取り直すこと**"}
 
-  # --- W3: WAFL 原典との乖離の解消．改善策ではなく仮説の切り分けとして位置付ける ---
+  # --- W3: WAFL 原典との乖離の解消．**Iter16 で採用済み・以降は固定**（履歴として残す） ---
   - {name: merge_include_self, values: [true],
+     status: "adopted 2026-08-05 (Iter16)．環境変数 WAFL_MERGE_INCLUDE_SELF（既定 1）で切替可能．
+              W3 あり/なしを 10 ノードで対比した結果，最終 loss 0.517 → 0.364（-29.7%），per-peer の
+              最終 loss 標準偏差 0.406 → 0.171 で採用．accuracy は両条件とも peak 17.5% でノイズ範囲内
+              （採否根拠は loss と分散であり accuracy ではない．accuracy 判定は W1 完了後に再実施）",
      note: "[2026-07-26 p0001 F2] src/client.py:882-902 の merged は受信した remote peer のみを平均し
             （count に自ノードが入らない），:1151-1155 で param.copy_() によりローカル重みを完全上書き
             する．接触相手が 1 台のとき（RWP のペア接触では通常こうなる）これは平均ではなく
