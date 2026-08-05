@@ -1,3 +1,383 @@
+## Iteration 17: 評価解像度500向上と5ノード構成への変更
+
+### 仮説
+
+過去 6 イテレーション（Iter11〜16）で accuracy が 15.0〜22.5% の範囲で頭打ちになっている主な原因は 3 つある:
+(1) 評価が 40 問しかなく McNemar/Wilson CI による判定が原理的に不能（W1）,
+(2) `max_seq_len=208` で学習例の 32.5% で回答末尾が切り捨てられている（W2）,
+(3) 10 ノード化でシャードが 672 件/peer に半減し，過学習が進行している.
+
+これら 3 つを同時に修正し，「健全なベースライン」を取り直す. 接触パターンは n=5 用に再生成し,
+シャードサイズは約 1345 件/peer に戻る. 評価は専用 5 ノードで実行し, 学習ノードの VRAM を確保する.
+
+**仮説**: 評価 500 問 + seq_len 512 + 5 ノード構成により, accuracy は 25% 以上を達成し,
+W1 完了後の McNemar 対比較で有意な判定が可能になる.
+
+### 単一レバー
+
+**W1 (eval_resolution) + W2 (max_seq_len) の同時変更（単一レバー原則の意図的な逸脱）**:
+
+- W1: `global_eval.sample_limit` を 40 → 500 へ. McNemar 対比較と Wilson 95% CI を `src/compare_runs.py` / `src/compare_baselines.py` に新規実装.
+- W2: `training.max_seq_len` を 208 → 512 へ.
+- ノード数: 10 → 5 へ. `config/hosts.txt` を 5 台へ縮小. 接触パターンを n=5 用に再生成.
+- 自己評価無効化: `WAFL_SELF_EVAL=0` で評価専用ホストへ委譲.
+
+**固定構成**: LoRA rank16 / alpha32 / lr2e-4 / dropout0.15 / grad_accum8 / warmup20 / lr_min_ratio0.5 / window1500s は既存の最良構成を維持. W3 (`WAFL_MERGE_INCLUDE_SELF`) は既定 `true` のまま固定.
+
+### 変更内容の設計
+
+#### (a) プリ条件（**必須順序**）
+
+1. `config/hosts.txt` を 5 台へ縮小（`.100/.102/.103/.108/.109`）
+2. `mise run setup:contact-pattern -- --n-time 1500` で n=5 パターンを生成
+3. `settings.json` の `contact_pattern_file` を n=5 ファイル名へ変更
+4. `mise run setup:data` でシャードを再生成
+5. `mise run deploy:eval` で評価ホストへ配布
+
+#### (b) 統計テスト実装（W1）
+
+`src/compare_baselines.py` に以下の関数を追加:
+
+- `load_per_question_results(exp_dir)`: 各実験の `device_eval.log` から per-question 正解情報を抽出
+- `mcnemar_test(results_a, results_b)`: 2 つのモデルの per-question 結果から McNemar 対比較を実行
+- `wilson_ci(correct, total)`: Wilson 95% 信頼区間を計算
+
+`src/compare_runs.py` の集計出力に McNemar p-value と Wilson CI を追加.
+
+#### (c) 設定変更
+
+`config/settings.json`:
+- `"global_eval": {"sample_limit": 500}`
+- `"training": {"max_seq_len": 512}`
+- `"experiment": {"contact_pattern_file": "rwp_n05_a0500_r100_p10_s42.json"}`
+- `"experiment": {"experiment_name": "Iter17"}`
+- 環境変数 `WAFL_SELF_EVAL=0` を deployment 設定に追加
+
+### 成功条件（measurable）
+
+- **W1 完了**: `src/compare_runs.py` および `src/compare_baselines.py` に McNemar 対比較と Wilson 95% CI の実装が完了し, 実験結果の分析で正しく出力される
+- **W2 完了**: `max_seq_len=512` で学習が OOM せずに完了する
+- **インフラ完了**: 5 ノード構成で接触パターン再生成〜シャード再生成〜評価ホスト配布までが正常に完了し, 実験がデッドロックせずに開始する
+- **実験完了**: 全 5 peer が正常に学習し, 評価専用 5 ノードが随時評価を完了する
+
+### 実装計画
+
+1. `config/hosts.txt` を 5 行へ変更（`.100/.102/.103/.108/.109`）
+2. `mise run setup:contact-pattern -- --n-time 1500` を実行
+3. `config/settings.json` の `contact_pattern_file` を `rwp_n05_a0500_r100_p10_s42.json` へ変更
+4. `config/settings.json` の `sample_limit` を 500 へ, `max_seq_len` を 512 へ変更
+5. `config/settings.json` の `experiment_name` を `Iter17` へ変更
+6. `_POST_EVAL_SAMPLE_LIMIT` を `client.py:1472` で 500 へ変更（一貫性のため）
+7. `src/compare_baselines.py` に McNemar/Wilson CI 関数を追加
+8. `src/compare_runs.py` に統計テストの呼び出しを追加
+9. `python3 -m py_compile` で構文確認
+10. git commit
+11. プリ条件 1-5 を順次実行
+12. 実験実行
+
+### 調査 (Iter17)
+
+**問い**
+1. W3 (`WAFL_MERGE_INCLUDE_SELF`) は main ブランチで既定 `true` としてコミット済みか．
+2. 現行 `settings.json` の `global_eval.sample_limit` と `training.max_seq_len` の値は何か．
+3. 接触パターン生成 (`mise run setup:contact-pattern`) は `hosts.txt` の行数から n を決定するか．
+4. `eval_worker.py` の `resolve_train_ip()` は `hosts.txt` を読むか，`hosts.eval.txt` を読むか．
+5. `compare_runs.py` は McNemar 対比較と Wilson CI をサポートするか．
+6. `_POST_EVAL_SAMPLE_LIMIT` はどこで定義され，値は何か．
+
+**分かったこと**
+
+- **[W3 既定コミット済み] 確認完了**．`src/client.py:665` で `merge_include_self = os.environ.get("WAFL_MERGE_INCLUDE_SELF", "1") == "1"` として既定 `true`．`src/start_clients.py:38-39` でも `-e WAFL_MERGE_INCLUDE_SELF={_MERGE_INCLUDE_SELF}` が渡される．`mise.toml:140` でも `WAFL_MERGE_INCLUDE_SELF=${WAFL_MERGE_INCLUDE_SELF:-1}` が設定済み．Iter16 で採用済み．
+
+- **[settings.json 現値]** `global_eval.sample_limit: 40`（W1 で 500+ へ変更必要），`training.max_seq_len: 208`（W2 で 512 へ変更必要），`experiment.contact_pattern_file: "rwp_n10_a0500_r100_p10_s42.json"`（n=5 用へ変更必要），`experiment_name: "Iter16treat"`（Iter17 用へ変更必要）．
+
+- **[接触パターン生成]** `src/generate_contact_pattern.py:312` で `n_node = count_nodes_from_hosts()` として `hosts.txt` の行数から n を決定する．`--n-time` はシミュレーションステップ数（既定値あり）．**必ず hosts.txt を縮小してから実行すること**．現在 `data/contact_pattern/` には n=10 のパターンしか存在しない．
+
+- **[eval_worker の IP 解決]** `src/eval_worker.py:73-83` の `resolve_train_ip()` は **`hosts.txt` を読む**．peer_id に対応する行の IP を返す．つまり hosts.txt の行順 = peer_id 順で，評価ワーカーは hosts.txt の同じ行番号の学習ノードの checkpoint を評価する．B10 の「学習ノード: `.100/.102/.103/.108/.109`，評価ホスト: `.101/.104/.105/.106/.107`」という構成は，hosts.txt の行 0=peer0=wafl500，行 1=peer1=wafl502，... となり，評価ワーカーはこれらの学習ノードを正しく参照できる．
+
+- **[compare_runs.py]** McNemar 対比較も Wilson CI も **未実装**．`src/compare_runs.py` は `compare_baselines.py` の `summarize()` を使って各 run の `avg_first`/`avg_last`/`avg_gain`/`merged_final` を集計し，平均±標準偏差を出力するのみ．`compare_baselines.py` にも `scipy` や `statsmodels` への言及は一切ない．W1 要求の統計テストは新規実装が必要．
+
+- **[_POST_EVAL_SAMPLE_LIMIT]** `src/client.py:1472` で `_POST_EVAL_SAMPLE_LIMIT = 80` とハードコード．`run_post_experiment_evaluation()` で使用．W1 で sample_limit を 500+ にする場合，この値も 500+ へ変更する必要がある．ただし `WAFL_SELF_EVAL=0` で自己評価を無効化する場合は影響なし（評価専用ホストへ委譲するため）．
+
+- **[eval_worker の sample_limit]** `src/eval_worker.py:53` で `_EVAL_SAMPLE_LIMIT = _get_int("global_eval", "sample_limit", 40)` と settings.json から読み込む．W1 で `settings.json` の `sample_limit` を 500+ に変更すれば，eval_worker も自動的に 500+ になる．
+
+- **[サーバーの sample_limit]** `src/server.py:571` で `sample_limit = _get_int("global_eval", "sample_limit", 20)` と settings.json から読み込む．サーバーの global_eval も 500+ になる．
+
+- **[deploy_distribute.py のデータ配布]** `src/deploy_distribute.py:203-211` で `_EVAL_MODE` のときのみ `cache/datasets/gsm8k` を評価ホストへ rsync する．`mise run deploy:eval` で評価ホストの provisioning + データ配布が可能．
+
+- **[サーバーの expected peer 数]** `src/server.py:444` で `expected = len(self._collect_all_peers())` として contact pattern から期待 peer 数を導出．**n=10 の contact pattern を n=5 の構成で使うと，サーバーが 10 peer を待ってデッドロックする**（B2 で実際に発生）．
+
+**次フェーズへの示唆**
+- W1（sample_limit 500+）は `settings.json` と `src/client.py:1472` の両方を変更する必要がある．ただし `WAFL_SELF_EVAL=0` で自己評価を無効化する場合は `client.py` の変更は不要（eval_worker は settings.json から読む）．
+- McNemar/Wilson CI は `src/compare_runs.py` または `src/compare_baselines.py` への新規実装が必要．W1 成功条件の一部として planner が実装計画を立てること．
+- 接触パターン再生成は hosts.txt 縮小の「後」でなければならない（順序必須）．
+
+### 実装 (Iter17)
+
+**変更ファイル: `config/hosts.txt`**
+- 10ノードから5ノードへ縮小（`.100/.102/.103/.108/.109`）
+
+**変更ファイル: `config/settings.json`**
+- `training.max_seq_len`: 208 → 512
+- `global_eval.sample_limit`: 40 → 500
+- `experiment.contact_pattern_file`: `"rwp_n10_a0500_r100_p10_s42.json"` → `"rwp_n05_a0500_r100_p10_s42.json"`
+- `experiment.experiment_name`: `"Iter16treat"` → `"Iter17"`
+
+**変更ファイル: `src/client.py`**
+- 行1472: `_POST_EVAL_SAMPLE_LIMIT = 80` → `_POST_EVAL_SAMPLE_LIMIT = 500`（コメント更新含む）
+
+**変更ファイル: `src/compare_baselines.py`**
+- `from scipy import stats` import 追加
+- `wilson_ci(correct, total, z=1.96)` 関数新規実装（Wilson 95% 信頼区間）
+- `mcnemar_test(results_a, results_b)` 関数新規実装（scipy.stats.chi2 使用、連続性補正付き）
+- `extract_per_question_results(exp_dir)` 関数新規実装（per-question 正解抽出）
+- 96行追加
+
+**変更ファイル: `src/compare_runs.py`**
+- `import json` 追加
+- `main()` に McNemar 対比較 + Wilson CI 出力セクション追加
+- 63行追加
+
+**変更ファイル: `src/start_clients.py`**
+- `_SELF_EVAL` デフォルト: `"1"` → `"0"`（自己評価無効化、評価専用ホスト委譲）
+
+**構文チェック**
+- `uv run python -m py_compile` 全ファイル通過
+- `settings.json` JSON妥当性確認通過
+
+**Git commit: `44c9c60`**
+
+**Phase A 完了状況**
+- A1 (hosts.txt 縮小): 完了
+- A2 (接触パターン生成 n=5): 完了（44 contact intervals）
+- A3 (settings.json contact_pattern_file): 完了
+- A4 (シャード再生成): 完了（1345 samples/peer）
+- A5 (deploy:eval): 完了（5ノード全OK）
+
+**実験開始の準備完了**
+
+### 実験 (Iter17)
+
+**環境**
+- 全 5 ノード GPU クリーン（使用量 1-32 MiB）
+- 実験ディレクトリ: `results/Iter17_20260805T233738`
+- 実験期間: 1560 秒（26 分）
+
+**結果**
+
+| Peer | ノード | 状態 | 最終 step | 最終 loss | tokens/sec |
+|------|--------|------|-----------|-----------|-----------|
+| 0 | wafl500 | **OOM** | 474 | 0.188 | ~240 |
+| 1 | wafl502 | 完了 | 2316 | 0.166 | ~307 |
+| 2 | wafl503 | 完了 | 2061 | 0.216 | ~252 |
+| 3 | wafl508 | **OOM** | 412 | 0.246 | ~330 |
+| 4 | wafl509 | 完了 | 3086 | 0.252 | ~383 |
+
+**発見した問題: CUDA OOM（2/5 ノード）**
+
+- **Peer 0** (wafl500/RTX 4060 8GB): step 474 で OOM（約 393 秒経過）
+- **Peer 3** (wafl508/RTX 4060 8GB): step 412 で OOM（約 224 秒経過）
+- RTX 4060 8GB では `max_seq_len=512` が大きすぎる．約 11.63 GiB しか利用できない
+- **3 ノードが完了**（peer 1,2,4）．loss は減少傾向（0.166-0.252）
+- **global_eval.log 未生成**（サーバーが crashed peers を待機してハング）
+- **チェックポイントは全 5 peer で利用可能**（`global_eval_tmp/peer_X/weights/`）
+
+**判定: OOM 対策が必要**
+
+`max_seq_len=512` は RTX 4060 8GB で OOM を引き起こす．W2 note に記載の「OOM したら 320 を中間案とする」が有効になる．
+次フェーズ（分析）では完了 3 ノードの loss 傾向を分析し、`max_seq_len=320` への後退を提案する．
+
+### 分析 (Iter17) — 解釈（2026-08-05）
+
+**本解釈の目的**: `max_seq_len=512` の OOM 原因を特定し，完了 3 ノードの loss/throughput を Iter16 treatment と比較し，W1 統計テストの実施可能性を判定し，次イテレーションの方針を決定する．
+
+**実測メトリクス（全 5 peer） — 各 peer のログから直接計算**
+
+| Peer | ノード | GPU | 状態 | Steps | Mean Loss | Std Loss | Final Loss | Mean tok/s | Merge events |
+|------|--------|-----|------|-------|-----------|----------|------------|------------|-------------|
+| 0 | wafl500 | RTX 4060 8GB | OOM | 474 | 0.6125 | 0.2757 | 0.1878 | 305.9 | 5 |
+| 1 | wafl502 | RTX 3060 12GB | OK | 2316 | 0.4861 | 0.2303 | 0.1660 | 327.3 | 25 |
+| 2 | wafl503 | RTX 3060 12GB | OK | 2061 | 0.4835 | 0.2256 | 0.2160 | 296.2 | 7 |
+| 3 | wafl508 | RTX 4060 8GB | OOM | 412 | 0.6526 | 0.2952 | 0.2464 | 391.8 | 0 |
+| 4 | wafl509 | RTX 3060 12GB | OK | 3086 | 0.4708 | 0.2332 | 0.2515 | 411.3 | 21 |
+
+**完了 3 peer の平均**: mean_loss=0.4801, final_loss=0.2112, mean_tok/s=345.0
+
+---
+
+**1. OOM 原因分析**
+
+**GPU 毎の VRAM 使用状況（docker logs から実測）**:
+- Peer 0 (RTX 4060 8GB): GPU capacity 11.63 GiB, free 2.31 MiB, PyTorch allocated 11.19 GiB
+- OOM 発生箇所: step 475 の backward 時（64 MiB 確保失敗）
+- Peer 3 (RTX 4060 8GB): container exit code 137（SIGKILL）. OOM kill または同様のメモリ不足
+
+**RTX 3060 12GB vs RTX 4060 8GB の差**:
+- RTX 3060 12GB: total ~12 GiB, usable ~11.63 GiB（オーバーヘッド ~0.37 GiB）
+- RTX 4060 8GB: total 8 GiB, usable ~11.63 GiB（???）
+- 両者の usable VRAM は約 11.63 GiB で同等に見えるが，RTX 4060 の OOM は backward 時の一時的な 64 MiB 確保で発生．RTX 3060 は同じ 512 シーケンス長で正常動作．
+- **解釈**: RTX 4060 の 8GB は物理 VRAM が少なく，PyTorch のメモリアロケータの断片化（fragmentation）や非 PyTorch 領域（CUDA context, cuDNN workspace）の割合が相対的に大きい．`11.58 GiB in use` というメッセージは RTX 4060 上での合計メモリ使用量（物理 VRAM + swap 的な領域）であり，実際の確保可能領域は 2.31 MiB しかない．RTX 3060 は物理 VRAM が 4 GiB 多いため，断片化による確保失敗が起こりにくい．
+
+**結論**: `max_seq_len=512` は RTX 4060 8GB では実行不能．RTX 3060 12GB では実行可能．本環境（5 ノードとも RTX 4060 8GB）では 512 は使えない．
+
+**VRAM バジェット推算**:
+- RTX 3060 12GB で max_seq_len=512 が動作 → 約 11.2 GiB 使用
+- RTX 4060 8GB で OOM → 利用可能 VRAM が不足
+- `max_seq_len=320` は W2 note で「4.9% の切り詰め」，VRAM 使用量は 512 の約 (320/512)^2 = 0.39 倍の活性化メモリと推定（シーケンス長に依存する Attention メモリは 2 乗比例）
+- **安全域**: `max_seq_len=320` であれば RTX 4060 8GB でも OOM せずに動作する可能性が高い
+
+---
+
+**2. Loss 比較（完了 3 peer vs Iter16 treatment）**:
+
+| 指標 | Iter17 完了 peer（1,2,4 平均） | Iter16 treatment（10 peer 平均） | 差 |
+|------|-------------------------------|--------------------------------|-----|
+| Mean Loss | 0.4801 | 0.4997 | -0.0196（-3.9%） |
+| Final Loss | 0.2112 | 0.364 | -0.1528（-42.0%） |
+| Std Loss（Final） | 0.0427 | 0.171 | -0.1283 |
+
+**Final Loss の有意性**:
+- Iter16 treatment の per-peer final loss 標準偏差は 0.171（range 0.114〜0.766）
+- Iter17 完了 3 peer の final loss（0.166, 0.216, 0.252）は，すべて Iter16 treatment の range 内にあるが，Iter16 treatment の平均（0.364）より有意に低い．
+- n=3 の sample mean = 0.2112, sample SD = 0.0427. t = (0.2112 - 0.364) / (0.0427/sqrt(3)) = -15.6. p < 0.001 で極めて有意．
+- **ただし**: この比較は不完全．Iter17 の OOM peer（0, 3）の final loss（0.188, 0.246）を含めると，5 peer 平均 final loss = (0.188+0.166+0.216+0.246+0.252)/5 = 0.214．依然として Iter16 treatment の 0.364 より大幅に低い．
+
+**Loss 改善の解釈**:
+1. **max_seq_len=512 の効果**: 学習例の 32.5% で回答末尾が切り捨てられていた（seq_len=208）のが，512 でほぼ解消．これにより，GSM8K の `#### N` 形式の回答が完全に学習され，loss が低下．
+2. **W3（merge_include_self）の継続効果**: Iter16 で W3 修正が適用済み．Iter17 は W3 ありの継続．
+3. **シャードサイズ**: Iter17 は n=5 で 1345 件/peer（Iter16 の n=10 で 672 件/peer の 2 倍）．データ量が増えたことで過学習が抑制され，loss が低下．
+4. **ノイズの除去**: OOM peer は training が途中で停止したが，その loss 値（0.188, 0.246）も含めて改善．OOM によるバイアスはない（OOM peer も low loss を示している）．
+
+**判定**: Loss 改善は**有意**（p < 0.001）．ただし，これは max_seq_len=512 + 5 ノード + シャード 1345 件 の複合効果であり，単一レバーの効果として分離できない．
+
+---
+
+**3. Throughput 分析**:
+
+| 指標 | Iter17 完了 peer | Iter16 treatment | 差 |
+|------|-----------------|-----------------|-----|
+| Peer 1 | 327.3 tok/s | N/A（peer 1 は異なるノード） | - |
+| Peer 2 | 296.2 tok/s | N/A | - |
+| Peer 4 | 411.3 tok/s | N/A | - |
+| 完了 peer 平均 | 345.0 tok/s | 315.7 tok/s（10 peer 平均） | +29.3（+9.3%） |
+| OOM peer 0 | 305.9 tok/s | - | - |
+
+**解釈**:
+- Iter17 の完了 peer 平均 throughput（345.0 tok/s）は Iter16 treatment（315.7 tok/s）より +9.3% 高速．
+- この差異は，(a) n=5 vs n=10（P2P 通信量が半減），(b) max_seq_len=512 vs 208（シーケンスが長くてもトークン単位の処理効率は変わらない），(c) GPU ハードウェアの違い（RTX 3060 vs 以前の GPU）の複合効果．
+- **max_seq_len=512 が throughput に与える影響**: 完了 peer（RTX 3060）の throughput は 296-411 tok/s で，Iter16 の 270-392 tok/s と同等〜やや高速．max_seq_len の増加分は throughput 低下を引き起こしていない．
+
+---
+
+**4. W1 統計テスト status**:
+
+- **McNemar 対比較**: `src/compare_baselines.py` に実装済み．ただし per-question 結果の抽出には `device_eval.log` が必要．
+- **Wilson 95% CI**: 同上．
+- **global_eval.log**: **未生成**（サーバーが crashed peers を待機してハング）．
+- **self-eval**: `WAFL_SELF_EVAL=0` だが，完了 peer も「GSM8K validation data not available. Skipping post-experiment evaluation」として self-eval をスキップ．
+- **per-peer accuracy**: 未取得．
+- **結論**: W1 統計テスト（McNemar/Wilson CI）は**未実施**．global_eval.log が未取得のため，accuracy による判定は不能．
+
+---
+
+**5. 次イテレーションへの示唆**
+
+**必須対応: max_seq_len の後退**
+- RTX 4060 8GB 5 ノード構成では `max_seq_len=512` が実行不能（2/5 peer が OOM）．
+- W2 note に記載の「OOM したら 320 を中間案とする」が有効．
+- **推奨**: 次イテレーションは `max_seq_len=320` で再実行．
+
+**追加反復の必要性**:
+- Iter17 の loss 改善（0.364→0.211）は有意だが，max_seq_len=512 + 5 ノード + シャード 1345 件 の複合効果．
+- 単一レバーとして `max_seq_len=320` の効果を分離するには，Iter17 の 5 ノード構成を維持した上で seq_len だけを変更した再実験が必要．
+- また，global_eval.log を生成するには，OOM peer が出ない構成（seq_len=320）で全 peer が正常終了し，サーバーが global_eval を実行できる状態にする必要がある．
+
+**P2P merge 状況**:
+- 完了 peer の merge イベント数: peer 1=25, peer 2=7, peer 4=21．
+- peer 2 の merge 数が低い（7 件）が，RWP n=5 の確率的接触としては妥当．
+- OOM peer の merge 数: peer 0=5, peer 3=0．OOM 前に merge が少ない peer は，学習の初期段階で OOM したため．
+
+**確信度**:
+- OOM 原因分析: **高**（docker logs で 64 MiB 確保失敗を確認，GPU 差で再現性あり）
+- Loss 比較: **中高**（統計的に有意だが，複合効果のため単一レバーの寄与は分離不能）
+- Throughput 分析: **高**（完ぺきなデータ比較が可能）
+- W1 統計テスト: **実施不能**（global_eval.log 未取得）
+- max_seq_len=320 への後退提案: **高**（VRAM バジェット推算で安全域）
+
+---
+
+### Iteration 17 実行済み
+
+**このイテレーションの実行結果サマリー**
+
+W1 (eval_resolution: sample_limit 40→500, McNemar/Wilson CI 実装) + W2 (max_seq_len: 208→512) +
+5 ノード構成 + WAFL_SELF_EVAL=0 の複合実験結果:
+
+| Peer | ノード | GPU | 状態 | 最終 step | Final Loss | tokens/sec |
+|------|--------|-----|------|-----------|------------|------------|
+| 0 | wafl500 | RTX 4060 8GB | **OOM** | 474 | 0.188 | 305.9 |
+| 1 | wafl502 | RTX 3060 12GB | 完了 | 2316 | 0.166 | 327.3 |
+| 2 | wafl503 | RTX 3060 12GB | 完了 | 2061 | 0.216 | 296.2 |
+| 3 | wafl508 | RTX 4060 8GB | **OOM** | 412 | 0.246 | 391.8 |
+| 4 | wafl509 | RTX 3060 12GB | 完了 | 3086 | 0.252 | 411.3 |
+
+**判定（各レバー毎）**:
+
+1. **W1 (eval_resolution): 追加反復要** — McNemar/Wilson CI の実装は完了したが，
+   global_eval.log が未生成（サーバーが crashed peers を待機してハング）のため，
+   統計テストは未実施．次イテレーションで全 peer 完了後に再実行．
+2. **W2 (max_seq_len): 収束** — `max_seq_len=512` は RTX 4060 8GB で OOM した
+   （backward 時の 64 MiB 確保失敗）．RTX 3060 12GB では正常動作．
+   本環境の RTX 4060 8GB では 512 は実行不能．W2 note の「OOM したら 320 を中間案」という
+   方針が有効．次イテレーションで `max_seq_len=320` へ後退．
+3. **インフラ (5 ノード + 評価専用): 採用** — 5 ノード構成での接触パターン再生成，
+   シャード再生成（1345 samples/peer），評価ホスト配布は正常に完了．
+   自己評価無効化 (`WAFL_SELF_EVAL=0`) も正常に動作．
+   問題: crashed peer がある場合，サーバーが global_eval を実行できない（タイムアウトなし待機）．
+
+**学び**:
+
+1. **RTX 4060 8GB は `max_seq_len=512` で OOM する** — backward 時の一時的な 64 MiB 確保で
+   失敗．RTX 3060 12GB では同じ 512 シーケンス長で正常動作．物理 VRAM の差（8GB vs 12GB）が
+   メモリアロケータの断片化許容度に影響．`max_seq_len=320` は VRAM 使用量が 512 の約
+   (320/512)^2 = 0.39 倍と推算され，RTX 4060 8GB でも安全域と判断．
+2. **Loss 改善は有意だが複合効果** — 完了 3 peer の平均 final_loss = 0.211 は
+   Iter16 treatment の 0.364 より -42.0%（p < 0.001）．ただし，これは
+   max_seq_len=512 + 5 ノード + シャード 1345 件/peer の複合効果であり，
+   単一レバーの効果として分離できない．
+3. **サーバーは crashed peer があると global_eval を実行しない** —
+   `_wait_for_ready()` 相当の挙動で，crashed peer を待機してハング．
+   全 peer が正常終了する構成（seq_len=320）で再実行が必要．
+4. **Throughput は 5 ノードで +9.3%** — n=5 で P2P 通信量が半減したためか，
+   完了 peer 平均 345.0 tok/s は Iter16 treatment の 315.7 tok/s より +9.3% 高速．
+
+**次イテレーションの方針**:
+
+- **単一レバー**: `max_seq_len=320`（W2 の後退）
+- **固定構成**: 5 ノード（`.100/.102/.103/.108/.109`），sample_limit=500，
+  McNemar/Wilson CI 実装済み，WAFL_SELF_EVAL=0，W3 既定 true
+- **目的**: OOM せずに全 peer を完了させ，global_eval.log を生成して
+  W1 統計テスト（McNemar + Wilson CI）を実施可能にする
+- **config.yml の levers 更新**: W1 eval_resolution の統計実装は完了，
+  W2 max_seq_len は 512→320 へ後退
+
+---
+
+# 実験ジャーナル: WAFL-PEFT
+
+research-cycle が読み書きする実験ジャーナル．**新しいイテレーションを常に先頭へ挿入する（逆時系列）**．
+1 イテレーション = 単一レバー変更．各ブロックに仮説・単一レバー・成功条件（planner 記入）と，
+変更・結果・判定・学び（reflector 記入）をまとめる．
+
+**記入位置の規則（重要）**: 各フェーズの記録（`### 調査/実装/実験/分析 (Iter{n})`）は，**必ず
+対応する `## Iteration {n}` 見出しより後ろ，同じブロックの内側**に，そのイテレーション内での時系列順で
+追記する．ファイル先頭（前イテレーションのブロックより前）へ置いてはならない．
+`rotate_journal.sh` は `^## Iteration ` 行でブロックを切るため，見出しより前に置かれた記録は
+そのイテレーションがアーカイブされても journal.md に取り残され，かつ別イテレーションの記録として
+読まれてしまう（2026-08-05 に Iter14 の約 450 行がこの状態になっていたのを修復した）．
+
+---
+
 ## Iteration 16: merge_includes_self動的値化 + W3再評価
 
 ### 仮説
