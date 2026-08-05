@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
-  "iteration": "Iter19",
-  "iteration_name": "W1評価解像度500とMcNemar実装修正",
-  "phase": "reflect",
+  "iteration": "Iter20",
+  "iteration_name": "W1評価解像度500とstart:evalタイミング修正",
+  "phase": "plan",
   "status": "running",
   "current_lever": "eval_resolution",
-  "experiment_dir": "results/Iter19_20260806T025818",
+  "experiment_dir": null,
   "experiment_deadline": null,
-  "updated_at": 1785955006,
+  "updated_at": 1754476800,
   "last_slack_ts": null,
   "iteration_thread_ts": null,
   "notion_toggle_created": false,
-  "last_commit": "848de4c"
+  "last_commit": "aad4e96"
 }
