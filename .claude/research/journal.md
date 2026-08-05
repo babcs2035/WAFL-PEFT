@@ -1,3 +1,110 @@
+## Iteration 21: W1 McNemar/Wilson CI動作確認とサーバーディスク清理
+
+### 検討・計画 (Iter21)
+
+**単一レバー**: `eval_resolution` (W1) — McNemar/Wilson CI のバグ修正 + ディスク清理プリ条件整備
+
+**変更内容**:
+
+1. **`src/compare_baselines.py` のバグ修正**（可逆・自動判断）:
+   - 行133: docstring `存在しない場合は空の辞書を返す` → `存在しない場合は空のリストを返す`
+   - 行137: `return {}` → `return []`
+   - 型ヒント `-> list[bool]` と実装の不一致を解消
+
+2. **サーバーディスク清理**（破壊的操作・人間承認必要）:
+   - wafl-ctrl5 上での `df -h` 確認
+   - 旧実験結果 (`results/Iter13-*` 〜 `Iter16*` 等、約152GB) の削除
+   - `/tmp` 内のアーカイブ (`wafl-peft-fix.tar`, `skippy-runtime` 等、約38GB) の削除
+   - Docker Local Volumes のクリーンアップ（215.9GB 回収可能）
+   - **planner は清理手順を計画するのみ。実行は人間の承認後**
+
+**固定構成**:
+- `max_seq_len=320`（W2 採用済み）
+- 5 ノード: `.100/.102/.103/.108/.109`
+- `sample_limit=500`
+- McNemar/Wilson CI 実装済み（`src/compare_baselines.py`）
+- `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
+- `WAFL_MERGE_INCLUDE_SELF=1`（W3 既定 true）
+- 接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
+- `mise.toml` の `start` タスクに `start:eval` が `depends` に追加済み（Iter20 実装分）
+
+**成功条件（measurable）**:
+
+1. **主成功条件**: `src/compare_baselines.py` の `extract_per_question_results()` が `return []` を返し、`uv run python -m py_compile` で構文エラーがない
+2. **副成功条件1**: wafl-ctrl5 のディスク清理が完了し、ルートファイルシステムの空きが 100MB 以上確保される
+3. **副成功条件2**: 清理後に `mise run start` を実行し、`device_eval.log` が生成される（`start:eval` は `depends` で自動起動）
+4. **副成功条件3**: `device_eval.log` に `"questions"` フィールドが含まれ、`compare_baselines.py` の McNemar 対比較が正常に実行される
+5. **副成功条件3**: Wilson 95% CI が併記される
+6. **副成功条件4**: 全 5 peer が OOM せずに学習を完了する
+
+**期待効果**:
+- `compare_baselines.py` のバグ修正により、`extract_per_question_results()` が正しく空リストを返し、以降の処理で型エラーが発生しなくなる
+- ディスク清理により `device_eval.log` の書き込みが可能になり、McNemar 対比較 + Wilson 95% CI の動作確認が初めて実施可能になる
+
+**実験計画**:
+- コマンド: `WAFL_SELF_EVAL=0 mise run start`（`start:eval` は `depends` で自動起動）
+- timeout: 80 分（config.yml 既定）
+- poll_interval: 120 秒（config.yml 既定）
+- 実験前: wafl-ctrl5 でのディスク清理（人間承認後）
+- 実験後: `device_eval.log` の存在確認と McNemar/Wilson CI 実行
+
+**config.yml levers 更新**:
+- W1 `eval_resolution`: status を「`start:eval` timing 修正完了（Iter20 実装完了）」のまま維持（バグ修正のみ）
+
+---
+
+### 調査 (Iter21)
+
+**問い**
+
+1. wafl-ctrl5 のディスク使用状況と、清理可能な対象は何か。
+2. 実験プリ条件（5ノードGPU、接触パターン、settings.json、mise.toml）は整っているか。
+3. `compare_baselines.py` の McNemar/Wilson CI 実装は最新か。`return {}` バグは修正済みか。
+
+**分かったこと**
+
+- **ディスク状況（清理前）**:
+  - wafl-ctrl5 ルートファイルシステム: 1.5T 中 1.4T 使用、**残り 19MB（100%）**
+  - 主要なディスク消費源:
+    - `/home/denjo/workspace/ktakahashi/WAFL-PEFT/results/`: 約 152GB
+      - Iter15ctrl: 24GB, Iter16treat: 23GB, Iter16ctrl: 23GB, Iter15treat: 23GB
+      - Iter18: 12GB, Iter13treat: 12GB, Iter14ctrl x2: 20GB
+      - Iter19: 7.4GB, Iter17: 831MB
+    - `/tmp/`: 約 38GB（`wafl-peft-fix.tar` 16GB, `wafl-fix3.gz` 8.1GB, `wafl-fix4.gz` 8.1GB, `wafl-peft-fix.tar.gz` 5.8GB, `skippy-runtime` 28GB）
+    - Docker Local Volumes: 224.6GB（215.9GB 回収可能）
+  - **清理は承認されず、100% のまま**。`rm -rf` による削除には人間の承認が必要。
+  - **planner への要請**: `df -h` で確認後、`rm -rf` で旧実験結果（Iter13-16）と `/tmp` 内のアーカイブを削除する手順を計画に含める。または、ユーザーが管理サーバー上で手動清理を実行する。
+
+- **実験プリ条件**:
+  - **5ノードGPU**: 全5台（wafl500/.102/.103/.108/.109）が**空き**（1-32 MiB 使用）。
+    - GPU 型が Iter20 から変更: wafl500/.108/.109 が RTX 4060 8GB → **RTX 3060 12GB** に統一。
+    - VRAM 12GB に統一され、seq_len=320 には十分余裕がある。
+  - **接触パターン**: `rwp_n05_a0500_r100_p10_s42.json`（n=5）が存在。
+  - **hosts.txt**: 5台構成（.100/.102/.103/.108/.109）。正しい。
+  - **hosts.eval.txt**: 5台構成（.101/.104/.105/.106/.107）。正しい。
+  - **settings.json**: `max_seq_len=320`（正しい）、`sample_limit=500`（正しい）、
+    `contact_pattern_file=rwp_n05_a0500_r100_p10_s42.json`（正しい）。
+  - **mise.toml**: `start` タスクの `depends = ["start:server", "start:clients", "start:eval"]`（Iter20 修正済み）。正しい。
+  - **結論**: プリ条件は**全て OK**。
+
+- **McNemar/Wilson CI 実装の最新確認**:
+  - `gsm8k_eval.py::score_generations()`: `(accuracy, per_question)` タプルを返すように修正済み（Iter19）。
+  - `eval_worker.py::evaluate_step()`: `questions` フィールドをサーバーへ送信する実装済み（Iter19）。
+  - `server.py::_accept_clients()`: `device_eval.log` に `questions` フィールドを追記する実装済み（Iter19）。
+  - **`compare_baselines.py::extract_per_question_results()`**: **バグが残っている**。
+    - 型ヒントは `list[bool]` だが、`if not recs: return {}` で**空辞書を返す**（line 137）。
+    - docstring も「存在しない場合は空の辞書を返す」と誤記。
+    - これは Iter19 の `848de4c` で型ヒントのみ修正されたが、`return {}` → `return []` の修正は**未適用**。
+  - **planner への要請**: `return {}` → `return []` の修正を planner が実装计划に含める必要がある。
+
+**次フェーズへの示唆**
+
+- **ディスク清理**: 管理サーバー wafl-ctrl5 上の旧実験結果（Iter13-16, 約 120GB）と `/tmp` アーカイブ（約 38GB）の削除が必要。`rm -rf` による削除には人間の承認が必要。
+- **`compare_baselines.py` のバグ修正**: `extract_per_question_results()` の `return {}` を `return []` に修正する必要がある（planner 実装）。
+- **実験構成**: 5ノードGPUが RTX 3060 12GB に統一。VRAM 余裕あり。seq_len=320 は安全域。
+
+---
+
 ## Iteration 20: W1評価解像度500とstart:evalタイミング修正
 
 ### 調査 (Iter20)

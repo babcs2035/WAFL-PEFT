@@ -11,6 +11,34 @@
 
 ---
 
+## B16 [auto-decided 2026-08-06] Iter21: compare_baselines.py の McNemar extract_per_question_results バグ修正
+
+- **状況**: `extract_per_question_results()` の型ヒントは `list[bool]` だが、`return {}` で空辞書を返している（行137）。docstring も「空の辞書」と誤記（行133）。このままでは `device_eval.log` が空の場合に、呼び出し元で型エラーが発生する。
+- **自動選択**: `return {}` → `return []` の修正を Iter21 で実施する。
+- **変更ファイル**: `src/compare_baselines.py`
+  - 行133: docstring `存在しない場合は空の辞書を返す` → `存在しない場合は空のリストを返す`
+  - 行137: `return {}` → `return []`
+- **根拠**: 型ヒント `-> list[bool]` と実装の不一致を解消する必要がある。呼び出し元（`compare_runs.py`）は `list[bool]` を前提としている。
+- **要レビュー**: 1行修正のみ。可逆。
+
+---
+
+## B17 [needs-human 2026-08-06] wafl-ctrl5 ルートファイルシステムのディスク清理
+
+- **状況**: wafl-ctrl5 のルートファイルシステムが 1.5T 中 1.4T 使用（残り 19MB、100%）。`device_eval.log` の書き込みに失敗し、McNemar/Wilson CI が動作しない。
+- **清理対象**:
+  - `/home/denjo/workspace/ktakahashi/WAFL-PEFT/results/`: 約 152GB（Iter13-16 の旧実験結果）
+  - `/tmp/`: 約 38GB（アーカイブファイル: `wafl-peft-fix.tar`, `skippy-runtime` 等）
+  - Docker Local Volumes: 224.6GB（215.9GB 回収可能）
+- **提案手順**:
+  1. `ssh wafl-ctrl5 "df -h"` で現状確認
+  2. `ssh wafl-ctrl5 "rm -rf /home/denjo/workspace/ktakahashi/WAFL-PEFT/results/Iter13* /home/denjo/workspace/ktakahashi/WAFL-PEFT/results/Iter14* /home/denjo/workspace/ktakahashi/WAFL-PEFT/results/Iter15* /home/denjo/workspace/ktakahashi/WAFL-PEFT/results/Iter16*"`（約120GB 回収）
+  3. `ssh wafl-ctrl5 "rm -rf /tmp/wafl-peft-fix.tar /tmp/skippy-runtime"`（約 44GB 回収）
+  4. `ssh wafl-ctrl5 "docker system prune -a -f"`（Docker Local Volumes 約 216GB 回収）
+  5. `ssh wafl-ctrl5 "df -h"` で確認
+- **Slack**: `@mention` 済み（B10 決定 4 で watchdog 起動確認済み）
+- **決着（2026-08-06）**: 人間の承認待ち
+
 ## B15 [auto-decided 2026-08-06] Iter21: McNemar/Wilson CI動作確認とサーバーディスク清理
 
 ### 状況

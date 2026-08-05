@@ -130,11 +130,11 @@ def extract_per_question_results(exp_dir: Path) -> list[bool]:
     device_eval.log の各行は {"peer_id": int, "step": int,
         "questions": [{"question": str, "correct": bool}, ...]} の形式を想定。
     peer_id と step の最大値を持つレコードの questions を返す。
-    存在しない場合は空の辞書を返す。
+    存在しない場合は空のリストを返す。
     """
     recs = _read_jsonl(exp_dir / "device_eval.log")
     if not recs:
-        return {}
+        return []
     # 最終ステップのレコードを選ぶ（各 peer について最大の step）
     best: dict[int, dict] = {}
     for r in recs:
