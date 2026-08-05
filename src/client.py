@@ -1535,7 +1535,7 @@ def run_post_experiment_evaluation(state: SharedState, model: Any, tokenizer: An
             continue
 
         model.load_state_dict(weights, strict=False)
-        accuracy = gsm8k_eval.score_generations(model, tokenizer, val_data, max_new_tokens=256)
+        accuracy, _ = gsm8k_eval.score_generations(model, tokenizer, val_data, max_new_tokens=256)
         elapsed = state.checkpoint_elapsed.get(step, 0.0)
         # ここの時刻はチェックポイントが訓練中に保存された時点（=学習経過）を表し、
         # prefixの「現在の経過時間」とは別物なので ckpt@Ns と明示する

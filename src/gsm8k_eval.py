@@ -230,8 +230,8 @@ def score_generations(
     tokenizer: Any,
     samples: list[dict[str, str]],
     max_new_tokens: int = 256,
-) -> float:
-    """GSM8K形式のsamplesに対しgreedy生成を行い、最終数値の厳密一致でaccuracy(%)を返す。
+) -> tuple[float, list[bool]]:
+    """GSM8K形式のsamplesに対しgreedy生成を行い、accuracy(%)と各問の正解結果を返す。
 
     重要な採点仕様（従来実装のバグ修正）:
       1. 生成トークンのみをデコードする。model.generate()の出力には入力
@@ -246,13 +246,17 @@ def score_generations(
       3. 部分文字列一致ではなく、生成文から取り出した数値と gold 数値の
          厳密一致（正規化後）で採点する。
 
+    返値: (accuracy(%), list[bool]) のタプル。list[bool] は samples と同じ
+    順序で各問の正解(True/False)を格納する。McNemar 対比較用に per-question
+    結果を保持するため、この関数のみこの形式を返す。
+
     複数問をまとめてバッチ生成し、全問1バッチによるOOMを避けるため
     _EVAL_MINI_BATCH_SIZEずつ分割する。生成タスクでは左パディングが必須の
     ため、tokenizerのpadding_sideを一時的に変更し、呼び出し前の状態へ必ず復元する。
     """
     total = len(samples)
     if total == 0:
-        return 0.0
+        return (0.0, [])
 
     original_padding_side = tokenizer.padding_side
     original_pad_token = tokenizer.pad_token
@@ -260,7 +264,7 @@ def score_generations(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    correct = 0
+    per_question: list[bool] = []
     try:
         for start in range(0, total, _EVAL_MINI_BATCH_SIZE):
             mini_batch = samples[start:start + _EVAL_MINI_BATCH_SIZE]
@@ -281,15 +285,21 @@ def score_generations(
                 gen_only = generated[i][prompt_len:]
                 generated_text = tokenizer.decode(gen_only, skip_special_tokens=True)
                 pred = extract_predicted_answer(generated_text)
-                if pred is not None and gold_numbers[i] is not None and pred == gold_numbers[i]:
-                    correct += 1
+                correct = (
+                    pred is not None
+                    and gold_numbers[i] is not None
+                    and pred == gold_numbers[i]
+                )
+                per_question.append(correct)
             del tokens, generated
             torch.cuda.empty_cache()
     finally:
         tokenizer.padding_side = original_padding_side
         tokenizer.pad_token = original_pad_token
 
-    return correct / total * 100
+    correct_count = sum(per_question)
+    accuracy = correct_count / total * 100
+    return (accuracy, per_question)
 
 
 def evaluate_weights(
@@ -298,11 +308,12 @@ def evaluate_weights(
     weights: dict[str, torch.Tensor],
     val_data: list[dict[str, Any]],
     max_new_tokens: int = 256,
-) -> float:
+) -> tuple[float, list[bool]]:
     """指定したLoRA重みをモデルへ適用し、GSM8Kバリデーションセットでaccuracy(%)を評価する。
 
     採点ロジックは score_generations に集約している（client.py の非同期評価と
     共通化し、学習時と分析時で採点基準がずれないようにするため）。
+    返値は (accuracy(%), list[bool]) のタプル。list[bool] は McNemar 対比較用。
     """
     model.load_state_dict(weights, strict=False)
     return score_generations(model, tokenizer, val_data, max_new_tokens=max_new_tokens)

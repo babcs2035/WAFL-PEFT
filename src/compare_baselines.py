@@ -124,7 +124,7 @@ def mcnemar_test(results_a: list[bool], results_b: list[bool]) -> dict[str, Any]
     }
 
 
-def extract_per_question_results(exp_dir: Path) -> dict[int, list[bool]]:
+def extract_per_question_results(exp_dir: Path) -> list[bool]:
     """実験ディレクトリの device_eval.log から per-question 正解情報を抽出する。
 
     device_eval.log の各行は {"peer_id": int, "step": int,

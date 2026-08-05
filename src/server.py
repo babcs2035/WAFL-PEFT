@@ -333,6 +333,7 @@ class WAFLServer:
                             "peer_id": msg.get("peer_id"),
                             "step": msg.get("step"),
                             "accuracy": msg.get("accuracy"),
+                            "questions": msg.get("questions", []),
                         }
                         try:
                             with open(log_path, "a") as f:

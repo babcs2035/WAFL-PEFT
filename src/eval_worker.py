@@ -155,12 +155,23 @@ def main() -> None:
             # rsync 途中の不完全ファイル等。次ループで再取得されるため未評価のままにする
             _log(f"step {step}: 読み込み失敗（次回再試行）: {e}")
             return
-        accuracy = gsm8k_eval.evaluate_weights(
+        accuracy, per_question = gsm8k_eval.evaluate_weights(
             model, tokenizer, weights, val_data, max_new_tokens=_EVAL_MAX_NEW_TOKENS
         )
         evaluated.add(step)
+        # McNemar 対比較用に per-question 結果を questions フィールドに格納
+        questions = [
+            {"question": val_data[i]["question"], "correct": per_question[i]}
+            for i in range(len(val_data))
+        ]
         _send_to_server(
-            {"type": "eval_result", "peer_id": EVAL_PEER_ID, "step": step, "accuracy": accuracy}
+            {
+                "type": "eval_result",
+                "peer_id": EVAL_PEER_ID,
+                "step": step,
+                "accuracy": accuracy,
+                "questions": questions,
+            }
         )
         _log(f"step {step}: accuracy={accuracy:.1f}% を送信 ({len(evaluated)} 件評価済み)")
 
