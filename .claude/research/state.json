@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
   "iteration": "Iter21",
-  "iteration_name": "W1 McNemar/Wilson CI\u52d5\u4f5c\u78ba\u8a8d\u3068\u30b5\u30fc\u30d0\u30fc\u30c7\u30a3\u30b9\u30af\u6e05\u7406",
-  "phase": "investigate",
+  "iteration_name": "W1 McNemar/Wilson CI動作確認とサーバーディスク清理",
+  "phase": "plan",
   "status": "running",
   "current_lever": "eval_resolution",
   "experiment_dir": null,
   "experiment_deadline": null,
-  "updated_at": 1785962400,
-  "last_slack_ts": null,
-  "iteration_thread_ts": null,
-  "notion_toggle_created": false,
-  "last_commit": "70a9993"
+  "updated_at": 1785961975,
+  "last_slack_ts": "1785960524.246589",
+  "iteration_thread_ts": "1785960917.701189",
+  "notion_toggle_created": true,
+  "last_commit": "9684d85"
 }
