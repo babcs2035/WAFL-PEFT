@@ -11,6 +11,42 @@
 
 ---
 
+## B15 [auto-decided 2026-08-06] Iter21: McNemar/Wilson CI動作確認とサーバーディスク清理
+
+### 状況
+
+Iter20 で `start:eval` timing fix（`mise.toml` の `start` タスク `depends` への `start:eval` 追加）は
+**採用**とした。全5 peer が OOM なく完了し、評価ワーカーも自動起動した。
+
+ただし `device_eval.log` が未生成だった。原因は管理サーバー（wafl-ctrl5）のルートファイルシステムが
+100%使用（1.5T 中 1.4T 使用、残り 34MB）だったため。
+
+### 次イテレーションの設計
+
+- **単一レバー**: `eval_resolution`（W1）— McNemar/Wilson CI の動作確認
+- **プリ条件**: 管理サーバー（wafl-ctrl5）のディスク清理
+  - `df -h` で使用状況確認
+  - 古い experiment results の削除、または `docker system prune` の実行
+- **固定構成**: `max_seq_len=320`（W2 採用済み）、5 ノード（`.100/.102/.103/.108/.109`）、
+  `sample_limit=500`
+- **コマンド**: `WAFL_SELF_EVAL=0 mise run start`（`start:eval` は depends で自動起動）
+- **目的**: `device_eval.log` を生成し、McNemar 対比較 + Wilson 95% CI で W1 統計テストを実施
+
+### 根拠
+
+- W1 (eval_resolution) は config.yml で最優先レバー
+- McNemar/Wilson CI の実装は `src/compare_baselines.py` に完了済み
+- McNemar データ収集側の修正は Iter19 で実装済み
+- `start:eval` の自動起動は Iter20 で確認済み
+- 唯一のブロックはサーバーのディスク容量のみ
+
+### 要レビュー
+
+- ディスク清理は管理サーバー上での手動作業が必要。rc-investigate フェーズで実施する。
+- 清理後、同じ構成で再実験すれば十分（コード変更不要）。
+
+---
+
 ## B14 [auto-decided 2026-08-06] Iter20: start:evalタイミング修正 + McNemar/Wilson CI テスト
 
 ### 状況
