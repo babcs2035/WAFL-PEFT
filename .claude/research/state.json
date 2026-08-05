@@ -7,9 +7,9 @@
   "current_lever": "WAFL_MERGE_INCLUDE_SELF",
   "experiment_dir": "results/Iter16treat_20260805T114152",
   "experiment_deadline": null,
-  "updated_at": 1785914713,
+  "updated_at": 1785925961,
   "last_slack_ts": null,
   "iteration_thread_ts": "1785892462.554839",
   "notion_toggle_created": true,
-  "last_commit": "fc6e3c9"
+  "last_commit": "1d50d81"
 }
