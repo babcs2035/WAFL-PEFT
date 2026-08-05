@@ -4,12 +4,12 @@
   "iteration_name": "max_seq_len320へ後退とW1統計テスト",
   "phase": "investigate",
   "status": "running",
-  "current_lever": "W2(max_seq_len)=320",
+  "current_lever": null,
   "experiment_dir": null,
-  "experiment_deadline": 1785945546,
-  "updated_at": 1785944200,
-  "last_slack_ts": "1785944165.843479",
-  "iteration_thread_ts": "1785937807.877369",
-  "notion_toggle_created": true,
+  "experiment_deadline": null,
+  "updated_at": 1785944600,
+  "last_slack_ts": null,
+  "iteration_thread_ts": null,
+  "notion_toggle_created": false,
   "last_commit": "ee362fb"
 }
