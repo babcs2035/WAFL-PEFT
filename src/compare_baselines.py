@@ -14,7 +14,7 @@
       "FedAvg近似=results/FedAvgApprox_XXXX"
 
 引数を省略すると、results/ 下から Iter10_* / SelfTrain_* / FedAvgApprox_* の最新をそれぞれ自動選択する。
-出力: docs/figures/fig07_baseline_comparison.png と、標準出力への比較表（Markdown）。
+出力: results/fig07_baseline_comparison.png と、標準出力への比較表（Markdown）。
 """
 
 import json
@@ -30,8 +30,8 @@ import matplotlib.pyplot as plt
 from utils import get_base_dir
 
 BASE_DIR = get_base_dir()
-# 比較図の出力先（レポートが参照する docs/figures/ に直接置く）
-_FIG_PATH = BASE_DIR / "docs" / "figures" / "fig07_baseline_comparison.png"
+# 比較図の出力先（results/ 直下。個別実験の output/ と異なり複数実験を横断するため専用の場所に置く）
+_FIG_PATH = BASE_DIR / "results" / "fig07_baseline_comparison.png"
 # 引数省略時に自動選択する条件（ラベル, results 下のフォルダ名 prefix）。
 # ベースラインは self-training のみ（FedAvg 近似は実施しない方針）。
 _DEFAULT_CONDITIONS = [
