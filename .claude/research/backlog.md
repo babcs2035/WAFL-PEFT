@@ -11,6 +11,38 @@
 
 ---
 
+## B14 [auto-decided 2026-08-06] Iter20: start:evalタイミング修正 + McNemar/Wilson CI テスト
+
+### 状況
+
+Iter19 で McNemar データ収集側の修正（`gsm8k_eval.py`, `eval_worker.py`, `server.py`）は
+実装完了（`848de4c`）したが、`start:eval` が学習完了「後」に実行されたため、
+`device_eval.log` が未生成。McNemar/Wilson CI の動作確認は不能。
+
+### 次イテレーションの設計
+
+- **単一レバー**: `eval_resolution`（W1）— 引き続き McNemar/Wilson CI のテスト
+- **固定構成**: `max_seq_len=320`（W2 採用済み）、5 ノード（`.100/.102/.103/.108/.109`）、
+  `sample_limit=500`
+- **必須手順**: `mise run start` の直後に `mise run start:eval` を実行
+  （または `mise.toml` の `start` タスクに `start:eval` を `depends` に追加）
+- **目的**: `device_eval.log` を生成し、McNemar 対比較 + Wilson 95% CI で W1 統計テストを実施
+
+### 根拠
+
+- W1 (eval_resolution) は config.yml で最優先レバー
+- McNemar/Wilson CI の実装は `src/compare_baselines.py` に完了済み
+- データ収集側の修正は Iter19 で実装済み
+- `start:eval` のタイミング問題が唯一のブロック
+
+### 要レビュー
+
+- `mise.toml` の `start` タスクに `start:eval` を `depends` に追加する場合、
+  `start:clients` と `start:eval` が並列起動される。これが学習に影響しないか確認必要。
+- 追加しない場合は、実験手順として `mise run start` 直後に `mise run start:eval` を明記。
+
+---
+
 ## B13 [auto-decided 2026-08-06] Iter19: W1 統計テスト実施（start:eval 実行 + McNemar/Wilson CI）
 
 ### 状況
