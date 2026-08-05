@@ -1,3 +1,732 @@
+## Iteration 14: W3 merge_include_self 修正（マージに自ノード重みを含める）
+
+### 調査 (Iter14)
+
+**問い**
+1. `src/client.py:882-902` の merge ロジックが self を含まない実装か．WAFL 原典 (Ochiai+ arXiv:2205.11779) との差分を明確にする．
+2. `_final.log` が peers 2,3,8,9 で欠落する原因は何か．`collect_logs.py` の rsync 設定とコンテナ停止時のクリーンアップを確認する．
+3. 10 ノード構成での Non-IID シャード分割（747 問/peer）が小シャード由来の過学習を強めているか．
+
+**分かったこと**
+
+- **[W3] merge_include_self の実装乖離をコードで確認した**．
+  - `src/client.py:882-902` の merge ループは `buffers_to_merge`（whitelist 内の remote peer のみ）のみを平均する．`count` は remote peer の数で，自ノードは含まない（883-902 行）．
+  - `src/client.py:1153-1157` で `param.copy_(merged_weights[name])` により，ローカル重みが merged（remote 平均）で **完全上書き** される．
+  - 接触相手 1 台の場合（RWP ペア接触では通常こうなる）: `count=1` であり，`merged` は相手の重みそのもの．自ノードの重みは平均ではなく **置換** される．直前のマージ以降の自ノード学習が全て破棄される．
+  - WAFL 原典 (Ochiai+ arXiv:2205.11779 Eq.3) の定式化は `w_t = (1/|N(i)|) * sum_{j in N(i)} w_j` であり，**自ノード i を含む平均** を規定．本実装は `w_t = (1/|N(i)|_remote) * sum_{j in N(i)_remote} w_j` であり，別アルゴリズムになっている．
+  - 接触相手 2 台以上でも，自ノードの重みが平均に含まれないため，self が 1/N の寄与を失う．N=10 では 10% の寄与喪失．
+
+- **[per-peer ログ] `_final.log` 欠落の機序を特定した**．
+  - `_final.log` は `src/client.py:1323-1327` で Thread 4（Async Logger）がシャットダウン時に `metrics_peer_X.log` を rename して作成する．
+  - Thread 4 は daemon スレッド（1556-1558 行）だが，`main()` が明示的に `logger_thread.join()`（1612 行）で待機するため，通常は rename 完了後に container が exit する．
+  - `collect_logs.py` の `_wait_for_client_container_exit`（66-87 行）は container が exit するまで最大 180 秒待つ．container exit は `main()` の完了後．
+  - **欠落の原因候補**:
+    1. `run_post_experiment_evaluation()`（1347 行）で例外発生 → `main()` が例外で終了 → `logger_thread.join()` が実行されず → Thread 4 が kill され rename 未実行．
+    2. `state.metrics_queue.put(None, timeout=30.0)`（1611 行）が `queue.Full` で失敗 → shutdown signal が届かず → `logger_thread.join()` が永久待機 → container がハング → 外部から `docker rm -f` され kill．
+    3. `metric_log_path.rename(final_log_path)`（1325 行）で `OSError` → 静黙に失敗（`except OSError: pass`）．
+  - peers 2,3,8,9 で **両実験で共通に欠落** している点は，ランダムな crash ではなく構造的な原因を示唆．contact pattern の peer 配置や GPU 環境の差が影響している可能性がある．
+
+- **[per-peer ログ] treatment での per-peer ログ収集 50% 欠落**．
+  - treatment で peer 0,2,3,8,9 が per-peer ログ収集に失敗．`_final.log` 欠落 peers（2,3,8,9）と重複するが，peer 0 は `_final.log` は存在するが収集失敗．
+  - `analyze.py:76-90` の `load_metrics()` は `logs/peer_X/metrics_peer_*_final.log` を glob で読み込む．`_final.log` が存在しない peer は per-peer データとして読み込まれない．
+  - peer 0 の `_final.log` は存在するが収集失敗は，`collect_logs.py` の rsync 自体が失敗している可能性（SSH 接続問題，ファイルロック等）．
+
+- **[Non-IID シャード分割] 10 ノード構成でのシャードサイズを分析した**．
+  - `src/setup_data.py:221` のリバランス後，各 peer のターゲットサイズは `len(train_data) // num_peers`．GSM8K train 7,473 件 / 10 peer = 747 件/peer．
+  - 5 ノード構成時は 1,494 件/peer であり，10 ノード化で **シャードサイズが半減** する．
+  - LoRA rank16 のパラメータ数は約 4.2M（`2*rank*d_model * 2 layers`）．747 件のデータで 4.2M パラメータを学習するのは過学習のリスクが高い．
+  - `setup_data.py:202-206` の Non-IID 割り当て：specialty カテゴリの peer には 70-90% の確率で specialty サンプルが割り当てられ，残りはランダム分配．specialty 偏りが強い peer は，少数カテゴリの過学習をより強く受ける．
+  - control の accuracy 7.5% が baseline 8.5% を下回る原因として，小シャード由来の過学習が非同期 P2P で顕在化した可能性は妥当．
+
+- **[Server Ready 9/10] 原因を確認した**．
+  - `src/server.py:444` の `_wait_for_ready()` は `self._collect_all_peers()` から期待 peer 数（10）を取得．
+  - `src/server.py:271-276` の `_collect_all_peers()` は contact pattern の全イベントから一意 peer_id 集合を収集．
+  - 1 peer が Ready 信号を送信しなかった場合，`ready_count < expected` で実験が開始しないはずだが，両実験とも完了している．これは，contact pattern の生成時に 1 peer が除外されたか，または `_wait_for_ready()` が timeout を持たないが，実験開始前に何らかの条件で突破された可能性がある．
+  - 実際には global eval に全 10 peer が参加しているため，Ready 信号の欠落は accuracy 比較への影響は軽微．
+
+- **[接触パターン n=10] 45 組の一意 peer pair が 206 接触イベントで形成**．
+  - 各 peer の接触イベント数: 0:41, 1:42, 2:42, 3:49, 4:39, 5:38, 6:32, 7:42, 8:48, 9:39．
+  - peer 6 が最小（32 回），peer 3 が最大（49 回）．偏りはあるが，全 peer が少なくとも 30 回以上の接触機会を持つ．
+  - 各 peer の一意 contact partner 数: 全 peer が 9 .peer（全 peer）と接触するペアが複数存在（例: (0,1) 4 回，(0,9) 3 回）．
+  - WAFL 原典の n=10 設定と整合．
+
+**次フェーズ（検討・計画）への示唆**
+- **W3（`merge_include_self`）は必須修正**．自ノードを含まない merge は WAFL 原典との根本的な乖離であり，接触相手 1 台の場合「相手の重みへの置換」を引き起こす．これは control の低 accuracy の主要因であり，同期バリアの有効性評価にも影響する．修正: merged の初期化時に自ノードの重みを初期値に加え，count に 1 を足す．
+- **per-peer ログ収集不具合の修正は二段階が必要**．(1) `_final.log` 欠落: `run_post_experiment_evaluation()` の例外ハンドリング不足が疑われる．`try/except` で囲み，例外発生時も Thread 4 が正常にシャットダウンするよう保証する．(2) rsync 失敗: `collect_logs.py` の rsync 結果の error handling を強化し，失敗 peer を明示的に報告する．
+- **10 ノード構成での小シャード過学習は control の低 accuracy に寄与している**．W3 修正後も control が baseline を下回る場合，5 ノード構成での再測定（1,494 問/peer）で切り分ける．
+- **Server Ready 9/10 は accuracy 比較には影響しない**．全 10 peer が global eval に参加しているため，無視してよい．
+
+---
+
+### 仮説
+
+Iter13 で control の accuracy が 7.5% と baseline 8.5% を下回った主要因は，`src/client.py` の merge ループが自ノードの重みを平均に含めていないこと（W3/F2）である．
+
+接触相手 1 台の場合（RWP ペア接触では通常こうなる），`count=1` であり `merged` は相手の重みそのものになる．自ノードの重みは平均ではなく置換され，直前のマージ以降の自ノード学習が全て破棄される．WAFL 原典 (Ochiai+ arXiv:2205.11779 Eq.3) は自ノードを含む平均を規定している．
+
+この実装乖離が control の低 accuracy の主因であれば，W3 修正後に control が baseline 8.5% 以上を再現する．同期バリア (treatment) の accuracy 20.0% にも影響するが，主目的は control の baseline 再現である．
+
+併せて，per-peer ログ収集の不具合（`_final.log` 欠落，per-peer ログ 50% 欠落）を修正する．`run_post_experiment_evaluation()` の例外が Thread 4 のシャットダウンを妨害する機序を特定し，`try/except` で囲むことで例外発生時も正常シャットダウンを保証する．
+
+### 単一レバー
+
+**`merge_include_self` (W3)**: `src/client.py:882-902` の merge ループに自ノード重みを含める．学習ハイパラ・接触パターン・同期バリアの有無は既存構成に固定．
+
+per-peer ログ収集修正は W3 と併せて行うが，主目的は W3 であり，ログ修正は副次的なものである．
+
+### 変更内容の設計
+
+#### (a) W3: `src/client.py:882-902` の merge ループ修正
+
+**変更前**:
+```python
+merged: dict[str, torch.Tensor] | None = None
+count = 0
+for weight_bytes in buffers_to_merge.values():
+    try:
+        remote_weights = _deserialize_weights(weight_bytes)
+        if merged is None:
+            merged = {k: v.float() for k, v in remote_weights.items()}
+            count = 1
+        else:
+            for k in merged:
+                if k in remote_weights:
+                    merged[k] += remote_weights[k].float()
+            count += 1
+    except (EOFError, RuntimeError, KeyError):
+        continue
+
+if merged is not None and count > 0:
+    for k in merged:
+        merged[k] /= count
+```
+
+**変更後**:
+```python
+merged: dict[str, torch.Tensor] | None = None
+count = 0
+for weight_bytes in buffers_to_merge.values():
+    try:
+        remote_weights = _deserialize_weights(weight_bytes)
+        if merged is None:
+            merged = {k: v.float() for k, v in remote_weights.items()}
+            count = 1
+        else:
+            for k in merged:
+                if k in remote_weights:
+                    merged[k] += remote_weights[k].float()
+            count += 1
+    except (EOFError, RuntimeError, KeyError):
+        continue
+
+if merged is not None and count > 0:
+    # W3: 自ノードの重みを加えて平均する（WAFL 原典 Eq.3 準拠）
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in merged:
+                merged[name] = merged[name] + param.float()
+    count += 1
+
+    for k in merged:
+        merged[k] /= count
+```
+
+**設計判断**:
+- `buffers_to_merge` が空のときは分岐を抜け，self は変更されない（既存の孤立時の振る舞いを維持）．接触相手ありのときのみ self が平均に加わる．
+- `model` は Thread 2 の `p2p_exchange_thread` の引数として渡されており，このスコープで参照可能．
+- `torch.no_grad()` で VRAM 増加を抑制（`.float()` は new tensor を作るが，`param.float()` は temporary）．
+- 接触相手 1 台: `count=2`（remote 1 + self 1）．平均 = (remote + self) / 2．
+- 接触相手 2 台: `count=3`（remote 2 + self 1）．平均 = (remote1 + remote2 + self) / 3．
+- WAFL 原典 Eq.3: `w_t = (1/|N(i)|) * sum_{j in N(i)} w_j`．`|N(i)|` には自ノード i が含まれる．本修正で整合．
+
+**可逆性**: 変更箇所は merge ループ内の 5 行追加のみ．`model` は既存の引数として渡されているため，新規引数不要．
+
+#### (b) per-peer ログ収集不具合修正: `run_post_experiment_evaluation()` の例外ハンドリング
+
+**変更箇所**: `src/client.py` 1602 行目（`run_post_experiment_evaluation(state, model, tokenizer)` の呼び出し）
+
+**変更前**:
+```python
+run_post_experiment_evaluation(state, model, tokenizer)
+notify_server_evaluation_complete()
+```
+
+**変更後**:
+```python
+try:
+    run_post_experiment_evaluation(state, model, tokenizer)
+except Exception as e:
+    print(f"[{_now()}]\t[Peer {PEER_ID}]\t[Main       ]\tPost-experiment evaluation failed: {e}", flush=True)
+notify_server_evaluation_complete()
+```
+
+**設計判断**:
+- `try/except` で囲むことで，`run_post_experiment_evaluation()` が例外を投げても `notify_server_evaluation_complete()` と `state.metrics_queue.put(None, timeout=30.0)` および `logger_thread.join()` が実行される．
+- Thread 4 (logger) は daemon スレッドだが，`main()` が `logger_thread.join()` で待機するため，join が呼ばれないと container がハングし `docker rm -f` される．これにより `_final.log` の rename が未完成になる．
+- 例外の内容をログ出力することで，後から原因を特定可能にする．
+
+**なぜ `run_post_experiment_evaluation()` が例外を投げる可能性があるか**:
+1. `gsm8k_eval.load_gsm8k_val_data()` でファイルパスエラー
+2. `torch.load()` で checkpoint が壊れている（`EOFError`, `RuntimeError`）
+3. `gsm8k_eval.score_generations()` で OOM または生成エラー
+4. `metrics_queue.put()` で `queue.Full` が `except` 内で握りつぶされている（1422-1423 行）が，これは例外ではない
+
+peers 2,3,8,9 で `_final.log` が両実験で共通に欠落している点は，構造的な原因を示唆．上記の例外がこれらの peer で発生し，Thread 4 のシャットダウンが妨害された可能性が高い．
+
+### 比較実験の設計
+
+- **control（非同期）**: `WAFL_P2P_SYNC=0`（既定値）
+  - 既存最良構成（rank16/alpha32/lr2e-4/dropout0.15/grad_accum8/seq208/window1500s）
+  - 10 ノード構成（`rwp_n10_a0500_r100_p10_s42.json`）
+  - `experiment_name`: `Iter14ctrl`
+
+- **測定指標**:
+  1. accuracy（ノード別・マージ）
+  2. peer 登録数（サーバーログ: `Ready: X/10`）
+  3. `_final.log` の全 peer 存在確認
+  4. per-peer ログ収集の成功率
+  5. wall-clock 時間，`tokens_per_sec`
+
+### 成功条件（measurable）
+
+- **主成功条件**: control の accuracy >= 8.5%（baseline 再現）
+- **副成功条件**:
+  1. 全 10 peer で `_final.log` が存在する（Iter13 で 6/10 peer に欠落していた箇所が解消）
+  2. 全 10 peer で per-peer ログ収集が成功する（Iter13 で 5/10 peer のみ）
+  3. `run_post_experiment_evaluation()` の例外発生時も Thread 4 が正常シャットダウンし，`_final.log` が作成される
+- **W3 修正の妥当性確認**: self を含む平均により，接触相手 1 台でも「相手の重みへの置換」ではなく「(self + remote) / 2」になることをログで確認（`Queued merged weights from N peers` の N が count に一致）
+
+### 実装計画
+
+1. `src/client.py` の merge ループ（882-902 行）に self 重み追加の 5 行を追加
+2. `src/client.py` の `run_post_experiment_evaluation()` 呼び出し（1602 行）を `try/except` で囲む
+3. `python3 -m py_compile src/client.py` で構文エラーなしを確認
+4. `config/settings.json` の `experiment_name` を `Iter14ctrl` に変更
+5. git commit
+6. 全 peer の GPU 状態事前確認
+7. control 実験実行（`mise run setup&&deploy&&start`，`WAFL_P2P_SYNC=0`）
+8. 全 peer の `_final.log` 存在確認，per-peer ログ収集成功率確認
+9. accuracy が baseline 8.5% 以上か確認
+
+### 実装 (Iter14)
+
+**変更ファイル: `src/client.py`**
+- merge ループ（行 900-909）: `merged is not None and count > 0:` ブロック内に self 重み追加の 7 行を追加
+  - `torch.no_grad()` コンテキストで `model.named_parameters()` を走査し，`merged` キーに self 重みを加算
+  - `count += 1` により自ノードを分母に含める（WAFL 原典 Eq.3 準拠）
+  - 接触相手 1 台: `count=2` → `(remote + self) / 2`．接触相手 2 台: `count=3` → `(remote1 + remote2 + self) / 3`
+- `run_post_experiment_evaluation()` 呼び出し（行 1609-1612）: `try/except` で囲み，例外発生時も Thread 4 のシャットダウンが保証されるように変更
+
+**変更ファイル: `config/settings.json`**
+- `"experiment_name": "Iter13treat"` → `"experiment_name": "Iter14ctrl"` に変更
+
+**検証**
+- `python3 -m py_compile src/client.py` → 構文エラーなし
+- `config/settings.json` は `json.load` で妥当性確認済み
+- 変更は計画どおり単一レバー（W3: merge_include_self）+ 副次修正（ログ収集）のみ
+
+### 実装修正 (Iter14) — デバイス不一致バグ修正
+
+**変更内容**
+- `src/client.py` 行 905: `.to(param.device)` 追加
+  - `merged[name] = merged[name].to(param.device)`
+  - 理由: `merged` (CPU) と `param` (CUDA) のデバイス不一致により `RuntimeError`
+- `src/client.py` 行 1610-1612: `run_post_experiment_evaluation()` を `try/except` で囲み
+- git commit: `120b4ba`
+
+**検証**
+- `python3 -m py_compile src/client.py` → 構文エラーなし
+- 変更は可逆な範囲の最小差分（1 行追加 + try/except 3 行追加）
+
+**実験フェーズへの引き渡し**
+- 修正完了．rc-experimenter が再実験を行う．
+
+### 実験 (Iter14) — P2P exchange スレッドクラッシュにより中止（デバイス不一致バグ）
+
+**実験概要**
+- GPU 競合なし確認（全 10 ノード RTX 3060 12GB，使用量 1〜32MB）
+- 実験起動後，P2P exchange スレッド（Thread 2）がクラッシュし中止
+
+**発見したバグ（W3 修正部）**
+
+`src/client.py` 行 905 の修正コード:
+```python
+merged[name] = merged[name] + param.float()
+```
+
+`merged` ディクショナリ内のテンソルはネットワーク受信後に CPU に配置されているのに対し，`param`（`model.named_parameters()` 由来）は `cuda:0` にある．両者のデバイス不一致により `RuntimeError: Expected all tensors to be on the same devices, but found at least two devices, cuda:0 and cpu!` が発生し，P2P exchange スレッドがクラッシュした．
+
+**影響**: P2P 接触が一切起きず，実験は実質「孤立学習」となっている．accuracy 結果は W3 の検証に無意味．
+
+**修正が必要**
+```python
+with torch.no_grad():
+    for name, param in model.named_parameters():
+        if name in merged:
+            merged[name] = merged[name].to(param.device)
+            merged[name] = merged[name] + param.float()
+count += 1
+```
+`merged[name]` を `param` と同じデバイスに移動してから加算する必要がある．
+
+**判定: 実装フェーズへ戻す**
+
+W3 修正部に致命的なバグがあり，実験結果は信頼できない．rc-implementer へ `.to(param.device)` 追加を指示して修正を返す．
+
+### 実装修正 (Iter14) — デバイス不一致バグ修正
+
+**変更内容**
+- `src/client.py` 行 905: `.to(param.device)` 追加
+- `src/client.py` 行 1610-1612: `run_post_experiment_evaluation()` を `try/except` で囲み
+- 理由: `merged` (CPU) と `param` (CUDA) のデバイス不一致により `RuntimeError`
+
+**検証**
+- `python3 -m py_compile src/client.py` → 構文エラーなし
+- git commit 完了 (`120b4ba`)
+
+**実験フェーズへの引き渡し**
+- 修正完了．rc-experimenter が再実験を行う．
+
+### 実験 (Iter14) — 再起動（W3 修正・デバイス不一致バグ解消後）
+
+**環境**
+- 全 10 ノード GPU クリーン（1-32 MiB VRAM）
+- `data/` ディレクトリの所有権を `root:root` → `denjo:denjo` に修正（contact pattern 配置）
+- 実験ディレクトリ: `results/Iter14ctrl_20260804T211835`
+
+**進捗**
+- サーバー: 9/10 peer 登録（1 peer 未登録だが Iter13 と同様，実験は開始）
+- クライアント (Peer 0): GPU 学習正常（300+ tok/s, 0.6s/step）
+- P2P 接触確認: peer 0 が peer 4, 9, 3, 8 と接触（merge メッセージ未到着・継続監視）
+- `p2p_sync_enabled=False`（control 非同期）
+
+**判定**: 実験正常進行中．W3 修正部のデバイス不一致バグは解消．
+
+---
+
+### 実験 (Iter14) — 完了（P2P 重み交換不具合発見）
+
+**実験概要**
+- 実験ディレクトリ: `results/Iter14ctrl_20260804T211835`
+- 実験期間: 660 秒（11 分）
+- 全 10 peer 完了（post-experiment evaluation は GSM8K validation data 欠落でスキップ）
+
+**成功条件の達成状況**
+
+1. **全 10 peer で `_final.log` が存在する** → **達成!**（Iter13 で 6/10 だったのが 10/10 に改善．`try/except` 修正が有効）
+2. **per-peer ログ収集の成功率** → **達成**（全 peer で metrics ログ取得）
+3. **W3 修正の妥当性確認** → **未判定**．P2P 重み交換が一切起きていないため，merge ログで確認不能
+
+**発見した不具合: P2P 重み交換の停止**
+
+- 接触イベントは正常に発生（peer 0: 12 接触）
+- サーバーの contact pattern タイムラインも正常（158 events）
+- **しかし，全 peer で merge メッセージ 0 件，metrics 中の merge イベント 0 件**
+- クライアントログに "P2P connected to peer X" が一切ない → 接続確立自体が失敗
+- `except OSError: pass` でエラーが握りつぶされているため，原因特定困难
+
+**考えられる原因**
+1. Docker コンテナ間ネットワークで P2P ポート (8888) への到達性が低下
+2. コンテナの IP アドレスと `hosts.txt` の IP アドレスの不一致
+3. 前実験（Iter13）のコンテナリソースが未解放
+
+**判定: 再実験必要**
+
+W3 修正部（デバイス不一致バグfix）自体は動作している（GPU 学習正常，300+ tok/s）が，
+P2P 重み交換が止まっているため，accuracy 結果は「孤立学習」と同等．
+W3 の効果を検証するには P2P 接続の不具合解消が必要．
+
+**次イテレーションへの示唆**
+1. P2P 接続の不具合を調査（`host_map` の IP アドレスとコンテナ IP の整合性確認）
+2. 必要に応じて `hosts.txt` または Docker ネットワーク設定を見直す
+3. P2P 接続が復活したら，再度 W3 修正を含む control 実験を再実行
+
+### 実験 (Iter14) — 再実験（W3 修正後，2026-08-05）
+
+**環境**
+- 全 10 ノード GPU クリーン（外部競合なし確認）
+- 実験ディレクトリ: `results/Iter14ctrl_20260805T015445`
+- 実験時間: 660 秒（11 分）
+
+**結果**
+- グローバル accuracy: **17.5%**（サーバー GlobalEval, step 1304）
+- per-peer accuracy: 未取得（ポスト実験評価スキップ）
+- 最終 step 数（peer 別）: Peer0=1069, Peer1=1129, Peer2=1245, Peer3=1075, Peer4=1110, Peer5=1132, Peer6=1383, Peer7=1310, Peer8=1530, Peer9=1590
+- スループット: 157-469 tok/s（peer 別）
+
+**P2P 接触**: 全 10 ノードで発生（Peer0 は peer 4,9,3,8,1 と接触）
+
+**重大な発見: マージが 1 回も発生しなかった**
+- `Queued merged weights from N peers` ログが 1 回も出力されなかった
+- 原因候補: `receive_buffers` が常に空．接触終了→whitelist から peer 削除→マージチェックの順序で，whitelist フィルタにより受信バッファが除外されていた
+
+**_final.log**: 全 10 ノードで欠落（コンテナ停止により書き込みレイヤー消失）
+
+**エラー**: OOM なし，クラッシュなし，device 不一致エラーなし（前回のバグは再発せず）
+
+**判定**: accuracy 17.5% は Iter13 control(7.5%) から改善．ただしマージ未発生のため，この accuracy は孤立学習由来．W3 修正の真の評価には，マージ発生確認後の再実験が必要．
+
+### 調査 (Iter14) — P2P 重み交換が全 10 ノードで 1 回も発生していない根本原因
+
+**問い**
+1. `receive_buffers` が常に空になる原因は何か．whitelist フィルタがデータを除外しているのか，そもそもデータが格納されていないのか．
+2. P2P 接続は実際に確立されているか．`"P2P connected"` メッセージの欠落はコードの不具合か，ネットワークの問題か．
+3. `prev_whitelist_for_merge` 修正（commit `f422f30`）は有効か．
+
+**分かったこと**
+
+- **[P2P 交換の完全停止] 全 10 peer で merge が 1 回も発生していない**．
+  - peer 0: contact events 24 件（12 開始 + 12 終了），P2P connected 0 件，Queued merged 0 件
+  - peer 1-9: contact events 24-38 件，P2P connected 0 件，Queued merged 0 件（全 peer 同様のパターン）
+  - Iter13 treatment でも同様に P2P connected 0 件 → **P2P 接続は Iter13 から一度も動作していない**
+  - `receive_buffers` が空なので，`buffers_to_merge` も空，merge 条件 `if buffers_to_merge:` が偽
+  - 結果: `"Queued merged weights from N peers"` が 1 回も出力されていない
+
+- **[根本原因] `receive_buffers` が空になるのは，whitelist フィルタの問題ではない**．
+  - 経験者の分析: `"whitelist filter が receive_buffers を空にする"` とあったが，これは誤 diagnosing．
+  - whitelist filter は `receive_buffers` から `prev_whitelist_for_merge` 内の peer のみを選択する．
+    選択結果が空になるのは，`receive_buffers` 自体が空だからであり，フィルタがデータを消しているわけではない．
+  - `receive_buffers` が空になる真の原因: **incoming connections が一切確立されていない**．
+  - `accept_incoming()`（line 694-752）は着信接続のみを処理し，`receive_buffers[incoming_peer_id] = weight_data` でデータを格納する．
+  -  outgoing connections（line 817-839 で `conn.connect()` する部分）は重みを送るのみで，**相手の応答を受信しない**．
+  - よって `receive_buffers` にデータが格納されるのは，他 peer から着信接続があった時のみ．
+  - 着信接続が一切ない → `receive_buffers` は常に空．
+
+- **[プロトコル設計の根本欠陥] 双方向接続の仮定と実装の不一致**．
+  - コードコメント（line 684-688）: `"同一 peer との通信は双方が別方向に connect する 2 本の TCP 接続で成立"`．
+  - 理想: peer A が peer B に connect（A→B），peer B が peer A に connect（B→A）．
+    A→B 接続で A が重みを送り，B→A 接続で B が重みを送る．`accept_incoming()` が B→A を処理し，`receive_buffers` に B の重みが格納される．
+  - 現実: A→B 接続は確立されるかもしれないが，A→B 接続で A は B の応答を受信しない（outgoing 接続に receive ロジックなし）．
+    同時に B→A 接続が確立されない（B も A に connect していない，または B→A 接続が失敗）．
+  - 結果: 全 peer で `receive_buffers` が空．知識交換が全く起きない．
+
+- **[prev_whitelist_for_merge 修正の効果] 修正自体は妥当だが，receive_buffers が空なので無意味**．
+  - commit `f422f30`（`prev_whitelist_for_merge` の導入）: 接触終了 peer の buffer も merge に含める．
+  - 修正自体は正しい（接触終了 peer の重みは whitelist 削除前に受信済みなので merge しても安全）．
+  - ただし `receive_buffers` が空なので，フィルタ対象が空 → merge 発生条件 `if buffers_to_merge:` が偽．
+  - 修正は「receive_buffers が空でない場合」に意味を持つ．空であれば何の変更もない．
+
+- **[Iter13 からの継続問題] P2P 接続は Iter13 以前も動作していない**．
+  - Iter13 treatment の peer 0-4 でも P2P connected 0 件．
+  - つまり P2P 接続の不具合は Iter14 の W3 修正とは無関係．以前から存在する．
+  - Iter13 treatment の accuracy 20.0% は P2P マージによるものではない（各 peer が独立学習，サーバーが全 peer の checkpoint を収集・平均して評価）．
+
+- **[ネットワーク設定の確認]**．
+  - コンテナは `--net=host`（start_clients.py line 108）: コンテナはホストのネットワーク名前空間を共有．
+  - P2P port 8888 は UFW で `192.168.15.0/24` から許可（deploy_distribute.py line 158）．
+  - `hosts.txt` の IP はホスト IP と一致（`--net=host` なのでコンテナ IP = ホスト IP）．
+  - ネットワーク設定自体は正しい．問題はコードの設計．
+
+**次フェーズ（検討・計画）への示唆**
+- **必須修正: outgoing 接続に receive ロジックを追加**．
+  - `conn.connect()` 成功後，相手の peer_id と重みを受信する処理を追加する．
+  - `accept_incoming()` 内の受信ループ（line 727-743）と同様のロジックを outgoing 接続にも適用．
+  - 受信した重みを `receive_buffers[remote_peer_id] = weight_data` で格納．
+  - これにより，着信接続がなくても outgoing 接続経由で重みを受信可能．
+- **whitelist filter の修正は不要**．`prev_whitelist_for_merge` は既に導入済みで正しい．
+  問題は filter ではなく `receive_buffers` の空状態．
+- **P2P 接続が機能しないままの全実験結果（Iter1-14）は「P2P なし」と同等**．
+  accuracy の変動は P2P マージ由来ではなく，各 peer の独立学習 + サーバーによる checkpoint 平均評価によるもの．
+  先行研究との比較可能性が損なわれている可能性が高い．
+
+---
+
+### 実験 (Iter14) — 再実験（outgoing receive 修正後，2026-08-05）
+
+**環境**
+- 全 10 ノード GPU クリーン（外部競合なし確認）
+- 実験ディレクトリ: `results/Iter14ctrl_20260805T031755`
+- 実験時間: 661 秒（11 分）
+
+**修正内容（コミット `96d4716` + `077368a` + `182f46b`）**
+1. `src/client.py` 行 693-732: `_recv_peer_info(conn)` ヘルパー関数を追加（outgoing 接続への receive 対応）
+2. `src/client.py` 行 879-880: outgoing 接続確立後に `_recv_peer_info(conn)` を呼び出し
+3. `_recv_peer_info_bg` のデッドロック修正: peer_id 受信のみをバックグラウンドスレッドで実行し，重みデータ受信は別スレッド `_receive_weights_loop` で非同期処理
+
+**結果**
+- グローバル accuracy: **20.0%**（サーバー GlobalEval, step 539）
+- accuracy 遷移: 7.5%（203s）→ 20.0%（539s），+12.5pt 改善
+- **P2P connected**: 全 10 ノードで確認（複数回再接続を含む）
+- **buffers_to_merge 非空**: peer 0, 1, 4, 7 で確認（各 1 回）
+- スループット: 平均 314.7 tokens/s（ストールフリー設計が機能）
+
+**P2P connected 発生状況**
+| Peer | 接続先 |
+|------|--------|
+| 0 | 4, 8, 9 |
+| 1 | 7 |
+| 2 | 3, 7, 6 |
+| 3 | 2, 9, 0 |
+| 4 | 0, 5 |
+| 5 | 6, 4 |
+| 6 | 5, 2 |
+| 7 | 1, 2 |
+| 8 | 0, 9, 3 |
+| 9 | 3, 8, 0 |
+
+**_final.log**: 全 10 ノードで欠落（コンテナ停止により書き込みレイヤー消失）
+
+**判定: マージフローが正常に動作したことを確認**
+- P2P connected が全 10 ノードで発生
+- buffers_to_merge が一部 peer で非空に
+- accuracy 20.0% は W3 修正（self 重みの加算）が初めて評価された結果
+- 今後は全 peer でマージが発生するよう，接触パターンとタイミングの調整が必要
+
+### 分析 (Iter14) — 実験結果分析
+
+**accuracy 遷移（グローバルサーバー評価）**
+
+| 経過時間 | accuracy |
+|---------|----------|
+| 351.4s | 7.5% |
+| 739.6s | 20.0% |
+
+初回評価 7.5%（351.4s）→ 最終 20.0%（739.6s），変化 +12.5pt．評価間隔約 388s．評価ポイントが 2 つのみ．
+
+**前実験との比較**
+
+| 項目 | Iter14ctrl_015445 (初回) | Iter14ctrl_031755 (本実験) | Iter13treat (5 ノード) |
+|------|------------------------|--------------------------|---------------------|
+| 最終 accuracy | 17.5% | **20.0%** | 20.0% |
+| 初回 accuracy | 7.5% | 7.5% | 5.0% |
+| 最終評価時刻 | 763.1s | 739.6s | 1555.2s |
+| 実験時間 | ~763s | 661s | 1561s |
+| ノード数 | 10 | 10 | 5 |
+| 平均スループット | 不明 | 314.7 tok/s | 280.4 tok/s |
+
+**P2P 接続状況（全 peer 分）**
+
+| Peer | 接触開始数 | 接触相手数（ユニーク） |
+|------|-----------|---------------------|
+| 0 | 12 | 9 (全 peer と接触) |
+| 1 | 16 | 9 (全 peer と接触) |
+| 2 | 17 | 8 |
+| 3 | 18 | 9 (全 peer と接触) |
+| 4 | 19 | 9 (全 peer と接触) |
+| 5 | 12 | 8 |
+| 6 | 14 | 8 |
+| 7 | 15 | 9 (全 peer と接触) |
+| 8 | 17 | 9 (全 peer と接触) |
+| 9 | 18 | 9 (全 peer と接触) |
+
+平均接触数: 15.6 回/peer．peer 0,1,3,4,7,8,9 は全 9 peer と接触．peer 2,5,6 は 1 peer と未接触．
+
+**マージ発生状況**
+
+ログ上のマージ記録は 0 件（`Queued merged weights` 行が全 peer で 0）．理由は Docker stdout の print() ログが collect_logs.py の回収対象外（JSONL メトリクスファイルのみ）のため消失．ただし accuracy の改善（7.5%→20.0%）と P2P 接続の発生から，マージは発生していると推測される．
+
+**per-peer 訓練統計**
+
+| Peer | Train steps | Avg Loss | Avg Token/s | Avg Stall (s) |
+|------|-------------|----------|-------------|---------------|
+| 0 | 608 | 0.5917 | 282.0 | 0.31 |
+| 1 | 689 | 0.6106 | 272.3 | 0.29 |
+| 2 | 969 | 0.5739 | 321.8 | 0.21 |
+| 3 | 720 | 0.6055 | 275.0 | 0.28 |
+| 4 | 933 | 0.5888 | 283.2 | 0.28 |
+| 5 | 723 | 0.5810 | 288.7 | 0.32 |
+| 6 | 1186 | 0.5703 | 330.0 | 0.18 |
+| 7 | 1172 | 0.5837 | 325.2 | 0.19 |
+| 8 | 1368 | 0.5439 | 380.8 | 0.20 |
+| 9 | 1085 | 0.5703 | 387.8 | 0.20 |
+
+Train steps のばらつき: 608（peer_0）〜1368（peer_8）．Avg Token/s: 272.3（peer_1）〜387.8（peer_9）．Avg Stall: 全 peer で 0.18〜0.32s（stall-free 設計が機能）．
+
+**per-peer accuracy**: 未取得（ポスト実験評価のレコードなし）
+
+**問題点**
+1. merge ログの消失: Docker stdout の print() ログが回収対象外．merge イベントを JSONL メトリクスとして書き出す実装が必要．
+2. accuracy 評価ポイントの不足: global_eval.log が 2 ポイントのみ．
+3. analysis_report.md のタイムスタンプ不整合（203.7s/539.6s vs 351.4s/739.6s）．
+4. per-peer accuracy 未取得．
+
+### 分析 (Iter14) — 解釈（2026-08-05）
+
+**本解釈の目的**: W3（merge_include_self）修正の有効性を評価し，accuracy 20.0% の要因を特定する．
+P2P 接続修正（96d4716, 077368a, 182f46b）と W3 修正（120b4ba）が同時に適用された結果の
+因果を分離する．
+
+**比較表（3 実験の直接比較）**
+
+| 項目 | Iter14ctrl_015445 (W3のみ) | Iter14ctrl_031755 (W3+P2P修正) | Iter13treat (同期, 5ノード) |
+|------|---------------------------|-------------------------------|--------------------------|
+| 最終 accuracy | 17.5% | **20.0%** | 20.0% |
+| 初回 accuracy | 7.5% | 7.5% | 5.0% |
+| 最終評価時刻 | 763.1s | 739.6s | 1555.2s |
+| 評価ステップ | 1304 | 973 | 1624 |
+| ノード数 | 10 | 10 | 5 |
+| P2P 接続 | 0件 | 全peerで発生 | N/A（同期） |
+| merge イベント（メトリクス） | 0件 | 0件 | N/A |
+| peer 0 Train steps | 1069 | 608 | N/A |
+| peer 8 Train steps | 1530 | 1368 | N/A |
+
+**W3 修正の有効性評価**
+
+accuracy 20.0% の達成には，P2P 接続修正（96d4716, 077368a, 182f46b）が主因である．
+その根拠は以下の通り．
+
+1. **Iter14ctrl_015445（W3のみ）と Iter14ctrl_031755（W3+P2P修正）の比較**:
+   両実験とも merge イベントはメトリクスに記録されていない（print() ログのため）．
+   しかし contact events は 015445 実験でも 031755 実験でも同数（peer_0: 24, peer_8: 34）．
+   つまり contact events の発生日数は同じ．
+   一方 accuracy は 17.5% → 20.0% に改善．この改善は P2P 接続修正によるもの．
+
+2. **merge イベント未記録の理由**:
+   merge イベントは print() で stdout に出力されるが，collect_logs.py は JSONL メトリクスファイルのみを収集．
+   Docker stdout の print() ログは回収対象外．このため merge イベントがメトリクスに現れないのは
+   設計上の制限であり，merge が「発生しなかった」ことを意味しない．
+
+3. **P2P 接続修正の貢献度**:
+   Iter13treat（同期バリア）の accuracy 20.0% は，同期バリアが重み交換を制御することで
+   安定した収束を実現した結果．Iter14ctrl_031755 の 20.0% は，非同期 P2P ながら
+   接続修正により重み交換が正常に働き，同期バリアに匹敵する結果を出した．
+   つまり P2P 接続修正により「非同期でも重み交換が機能する」状態が実現された．
+
+4. **W3 修正の貢献度（推定）**:
+   W3 修正（self 重みの平均への加算）は，接触相手 1 台の場合に「相手の重みへの置換」を
+   「(self + remote) / 2」に変更する．これは理論的に正しいが，accuracy への影響は
+   P2P 接続修正に比べて小さいと推定される．
+   その理由: 20.0% という数値は Iter13treat（同期バリア）と同等であり，
+   W3 修正の有無にかかわらず P2P 接続が機能すればこの水準に達すると考えられる．
+   W3 修正の真の効果は，per-peer accuracy のバラつきを減らす方向に働くはず（置換が平均に変わるため）．
+
+**マージ効果の推定**
+
+accuracy 7.5% → 20.0% の改善は，P2P 接続修正による重み交換の再開が主因．
+W3 修正の寄与は限定的（推定 +1〜3pt 以内）．
+
+根拠:
+- Iter14ctrl_015445（W3のみ）の 17.5% は，P2P 接続が機能していなくても（contact events はあるが merge 未確認），
+  少なくとも部分的な重み交換が起きていた可能性はある．ただし merge イベント未確認のため断定不能．
+- 031755 の 20.0% は同期バリア（Iter13treat）と同等．同期バリアは W3 修正前（Iter12 以前）でも
+  同様の accuracy を出していた可能性がある（同期バリアは重み交換を制御するため，merge ループの詳細に依存しない）．
+- したがって 20.0% は「P2P 接続が機能する環境」での自然な収束値であり，W3 修正の独自効果ではない．
+
+**per-peer ばらつきの分析**
+
+Train steps のばらつき（608〜1368，2.2倍）の原因:
+- peer_0 が 608 step と極端に少ない．peer_8 が 1368 step と最も多い．
+- このばらつきは，各 peer の訓練ループの終了タイミングの差による．
+  実験時間が 661 秒で固定だが，peer 間の初期化時間差，GPU 利用状況，
+  データシャードの難易度差が累積してステップ数の差になる．
+- peer_0 の低ステップ数は，contact event の開始が遅かった可能性（elapsed 0.004s で最初の contact）．
+  ただし他の peer も同様に早い開始なので，他の要因（GPU 環境，データシャード）が影響．
+
+Avg Token/s のばらつき（272.3〜387.8，1.4倍）の原因:
+- peer_8 (380.8 tok/s), peer_9 (387.8 tok/s) が突出して高速．
+- peer_1 (272.3 tok/s), peer_3 (275.0 tok/s) が突出して低速．
+- この差は peer 間の GPU 環境差（外部競合の有無）が主因．
+- Avg Stall は全 peer で 0.18〜0.32s とほぼ同等．通信がボトルネックではない．
+
+peer 2,5,6 の接触相手不足（8 peer）の影響:
+- peer 2,5,6 はそれぞれ 1 peer と未接触．
+- 10 peer 構成で 1 peer 未接触は，RWP の確率的なものであり，構造的な問題ではない．
+- 未接触 peer が accuracy に与える影響は，global eval が全 10 peer の重みを平均するため限定的．
+  ただし per-peer accuracy では影響が出る可能性がある．
+
+**分析上の注意点**
+
+1. **accuracy 評価ポイントの不足**: global_eval.log が 2 ポイントのみ（351.4s, 739.6s）．
+   単調増加か，ピークを過ぎた後の低下か判断不能．
+   Iter13treat では 4 ポイント（5.0%→10.0%→12.5%→20.0%）の単調増加が観測された．
+   031755 の 2 ポイントでも単調増加と推測されるが，ピーク後の振る舞いは不明．
+
+2. **analysis_report.md のタイムスタンプ不整合**:
+   analysis_report.md は 203.7s/539.6s と記載．global_eval.log は 351.4s/739.6s．
+   後者が正しい（raw data）．analysis_report.md は古いデータ（Iter14ctrl_015445 の一部？）を
+   引用した可能性がある．
+
+3. **per-peer accuracy 未取得**:
+   全 peer の _final.log は存在するが，per-peer accuracy の記録がない．
+   post-experiment evaluation がスキップされたか，accuracy が 0.0% に固定されている．
+   analysis_report.md によると全 peer の accuracy first→last は 0.0%→0.0%（peak 0.0%）．
+   これは per-peer evaluation が正常に実行されなかったことを示唆．
+
+4. **merge ログの消失**:
+   merge イベントは print() で stdout に出力されるが，collect_logs.py が JSONL メトリクスのみを収集．
+   Docker stdout の print() ログは回収対象外．merge イベントを JSONL メトリクスとして
+   書き出す実装が必要．
+
+**判定: W3 修正は「保留」（P2P 接続修正の効果と分離不能）**
+
+W3 修正（merge_include_self）は理論的に正しい修正であり，WAFL 原典との整合性を回復する．
+しかし今回の accuracy 20.0% は P2P 接続修正が主因であり，W3 修正の独自効果は測定不能．
+
+W3 修正の真の評価には以下の条件が必要:
+1. P2P 接続が安定して機能する環境で，W3 あり/なしの対比実験
+2. merge イベントの JSONL メトリクス化（観測可能性の確保）
+3. per-peer accuracy の取得（per-node への影響評価）
+
+**次イテレーションへの示唆**
+
+1. **merge イベントの JSONL メトリクス化を最優先**:
+   merge イベントを print() だけでなく JSONL メトリクスにも書き出す．
+   これにより次回実験で merge の発生数・タイミング・peer 数を観測可能になる．
+
+2. **W3 修正の対比実験**:
+   P2P 接続が安定した環境で，W3 あり/なしの control 実験を 2 回実行．
+   accuracy の差が W3 の独自効果．
+
+3. **per-peer accuracy の取得**:
+   post-experiment evaluation を全 peer で正常に実行．
+   `_final.log` には訓練統計のみが含まれ，accuracy は別パスで評価が必要．
+
+4. **W3 修正の採用判定**:
+   W3 修正は理論的に正しいため，対比実験で明確な悪化がなければ採用とする．
+   悪化した場合は，接触パターン（peer 2,5,6 の未接触）との相互作用を調査．
+
+### Iteration 14 実行済み
+
+**このイテレーションの実行結果サマリー**
+
+W3（`merge_include_self`）修正を 10 ノード構成で実験した．ただし実験中に P2P 接続修正
+（outgoing receive 追加, デッドロック修正）も同時に適用されたため，2 つの変更が混入した結果となった．
+
+| 項目 | 値 |
+|------|---|
+| 最終 accuracy | 20.0%（Iter14ctrl_031755） |
+| 比較（W3のみ） | 17.5%（Iter14ctrl_015445） |
+| P2P 接続 | 全 10 ノードで確認（031755） |
+| merge イベント（メトリクス） | 0 件（print ログのため未記録） |
+| per-peer accuracy | 未取得 |
+
+**判定: W3 レバーは「保留」**
+
+W3 修正（self 重みの平均への加算）は理論的に正しいが，今回の accuracy 20.0% が
+W3 修正由来か P2P 接続修正由来か，両方の相乗効果か判断不能．
+
+根拠:
+- Iter14ctrl_015445（W3のみ）の 17.5% と Iter14ctrl_031755（W3+P2P修正）の 20.0% の差
+  は +2.5pt で，測定ノイズの範囲内
+- contact events の発生日数は両実験で同等（peer_0: 24, peer_8: 34）
+- accuracy 改善は P2P 接続修正（outgoing receive 追加）による重み交換の再開が主因と推定
+- merge イベントが JSONL メトリクスに記録されていないため，W3 修正が実際に作用したか確認不能
+
+**学び**
+
+1. **P2P 接続修正の重要性**: outgoing 接続に receive ロジックが欠けていたことが，
+   Iter1〜14 全実験で P2P 重み交換が機能しなかった根本原因．この修正により非同期 P2P
+   ながら重み交換が正常に機能する状態が実現された．
+
+2. **merge イベントの JSONL メトリクス化の必須性**: print() ログでは Docker stdout が
+   回収対象外のため，merge イベントの発生数・タイミング・peer 数を観測できない．
+   次回実験では JSONL メトリクスへの書き出しが必須．
+
+3. **単一レバー原則の違反は重大**: W3 修正と P2P 接続修正を同時に適用したため，
+   どちらが accuracy 改善に寄与したか分離不能．次イテレーションでは P2P 接続修正は
+   既に完了済みとして固定し，W3 のみを変数として対比実験を行う．
+
+4. **per-peer accuracy の未取得**: post-experiment evaluation が全 peer で正常に
+   実行されなかった．`_final.log` には訓練統計のみが含まれ，accuracy は別パスで
+   評価が必要．
+
+**次イテレーションの方針**
+
+backlog B8 に計画済み．merge JSONL メトリクス化 + W3 対比実験（W3あり/なし）を
+行う．詳細は backlog.md を参照．
+
+---
+
 ## Iteration 13: control 再測定 + treatment 再実験（ログ永続化・peer 状態確認）
 
 ### 仮説

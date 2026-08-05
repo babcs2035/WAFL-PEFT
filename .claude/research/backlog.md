@@ -11,6 +11,42 @@
 
 ---
 
+## B12 [auto-decided 2026-08-05] Iter18: max_seq_len=320 へ後退 + W1 統計テストの実施
+
+### 状況
+
+Iter17 で W1 (eval_resolution) + W2 (max_seq_len=512) の複合実験を実施したが，
+RTX 4060 8GB 2 ノード (peer 0, 3) が OOM した．サーバーが crashed peer を待機して
+global_eval.log が未生成．W1 統計テスト（McNemar/Wilson CI）は未実施．
+
+### 次イテレーションの設計
+
+- **単一レバー**: `max_seq_len=320`（W2 の後退）
+- **固定構成**:
+  - 5 ノード: `.100/.102/.103/.108/.109`（Iter17 構成を維持）
+  - `sample_limit=500`（W1 実装済み）
+  - McNemar/Wilson CI は `src/compare_baselines.py` に実装済み（Iter17 実装分）
+  - `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
+  - `WAFL_MERGE_INCLUDE_SELF=1`（W3 既定 true）
+- **目的**: OOM せずに全 peer を完了させ，global_eval.log を生成して
+  W1 統計テストを実施可能にする
+
+### 根拠
+
+- W2 note に「OOM したら 320 を中間案とする」と記載
+- RTX 3060 12GB では seq_len=512 が正常動作 → 問題なのは RTX 4060 8GB の VRAM 不足
+- `max_seq_len=320` の VRAM 使用量は 512 の約 (320/512)^2 = 0.39 倍と推算
+- seq_len=320 の切り詰め率: 4.9%（W2 note 記載）
+- 全 peer 完了 → global_eval.log 生成 → McNemar/Wilson CI 実行可能
+
+### 要レビュー
+
+- Iter17 の loss 改善（0.364→0.211）は複合効果．単一レバーとして seq_len=320 の
+  効果を分離するには，Iter17 構成を維持した上での再実験が唯一の手段．
+- accuracy 効果の判定は W1 統計テストの結果次第．
+
+---
+
 ## B11 [auto-decided 2026-08-05] Iter17 開始前の環境確認と，次セッションへの申し送り
 
 ### 次セッションが最初にやること（reflector 向け）
