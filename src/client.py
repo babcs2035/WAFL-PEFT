@@ -661,6 +661,8 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
         return
 
     print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T2:P2P     ]\tThread 2 (P2P Exchange) started")
+    # W3: merge_include_self の動的値化（環境変数 WAFL_MERGE_INCLUDE_SELF で制御）
+    merge_include_self = os.environ.get("WAFL_MERGE_INCLUDE_SELF", "1") == "1"
 
     # peer_id -> IP マッピング
     host_map = resolve_hosts()
@@ -1007,15 +1009,17 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
 
                 if merged is not None and count > 0:
                     # W3: 自ノードの重みを加えて平均する（WAFL 原典 Eq.3 準拠）
-                    with torch.no_grad():
-                        for name, param in model.named_parameters():
-                            if name in merged:
-                                merged[name] = merged[name].to(param.device)
-                                merged[name] = merged[name] + param.float()
-                    count += 1
+                    # merge_include_self: 環境変数 WAFL_MERGE_INCLUDE_SELF で制御（既定 true）
+                    if merge_include_self:
+                        with torch.no_grad():
+                            for name, param in model.named_parameters():
+                                if name in merged:
+                                    merged[name] = merged[name].to(param.device)
+                                    merged[name] = merged[name] + param.float()
+                        count += 1
 
-                    for k in merged:
-                        merged[k] /= count
+                        for k in merged:
+                            merged[k] /= count
 
                     try:
                         state.merge_queue.put(merged, timeout=1.0)
@@ -1023,8 +1027,9 @@ def p2p_exchange_thread(state: SharedState, model: Any) -> None:
                         # merge イベントを JSONL メトリクスへ追記（W3 対比実験用観測）
                         merge_event = {
                             "type": "merge", "peer_id": PEER_ID, "step": current_step,
-                            "elapsed": state.elapsed_time, "num_peers_merged": count - 1,
-                            "merge_includes_self": False,
+                            "elapsed": state.elapsed_time,
+                            "num_peers_merged": count - (1 if merge_include_self else 0),
+                            "merge_includes_self": merge_include_self,
                         }
                         try:
                             state.metrics_queue.put(merge_event, timeout=1.0)

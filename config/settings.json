@@ -32,7 +32,7 @@
     "deploy_dir": "/home/denjo/workspace/ktakahashi/WAFL-PEFT"
   },
   "experiment": {
-    "experiment_name": "Iter15treat",
+    "experiment_name": "Iter16ctrl",
     "contact_pattern_file": "rwp_n10_a0500_r100_p10_s42.json"
   },
   "global_eval": {

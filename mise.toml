@@ -137,7 +137,7 @@ DEPLOY_DIR=$(python3 -c "import json; print(json.load(open('config/settings.json
 # WAFL_P2P_SYNC 未指定なら 0=従来の非同期経路。WAFL_P2P_SYNC_TIMEOUT_SEC 未指定なら
 # 空文字を渡し、start_clients.py 側で config/settings.json の既定値へフォールバックする）。
 ssh "$SSH_USER@$SERVER_HOST" \
-  "cd $DEPLOY_DIR && WAFL_P2P_ENABLED=${WAFL_P2P_ENABLED:-1} WAFL_SELF_EVAL=${WAFL_SELF_EVAL:-1} WAFL_P2P_SYNC=${WAFL_P2P_SYNC:-0} WAFL_P2P_SYNC_TIMEOUT_SEC=${WAFL_P2P_SYNC_TIMEOUT_SEC:-} python3 src/start_clients.py"
+  "cd $DEPLOY_DIR && WAFL_P2P_ENABLED=${WAFL_P2P_ENABLED:-1} WAFL_SELF_EVAL=${WAFL_SELF_EVAL:-1} WAFL_P2P_SYNC=${WAFL_P2P_SYNC:-0} WAFL_P2P_SYNC_TIMEOUT_SEC=${WAFL_P2P_SYNC_TIMEOUT_SEC:-} WAFL_MERGE_INCLUDE_SELF=${WAFL_MERGE_INCLUDE_SELF:-1} python3 src/start_clients.py"
 """
 
 [tasks.start]

@@ -35,6 +35,8 @@ _P2P_ENABLED = os.environ.get("WAFL_P2P_ENABLED", "1")
 _SELF_EVAL = os.environ.get("WAFL_SELF_EVAL", "1")
 _P2P_SYNC = os.environ.get("WAFL_P2P_SYNC", "0")
 _P2P_SYNC_TIMEOUT_SEC = os.environ.get("WAFL_P2P_SYNC_TIMEOUT_SEC", "")
+# W3: merge_include_self の動的値化（環境変数 WAFL_MERGE_INCLUDE_SELF で制御）
+_MERGE_INCLUDE_SELF = os.environ.get("WAFL_MERGE_INCLUDE_SELF", "1")
 
 # 管理サーバー上かローカルかでSSH接続方法を変える
 _CURRENT_HOSTNAME = socket.gethostname()
@@ -111,6 +113,7 @@ def start_client_container(ip: str, peer_id: int) -> str:
         f"-e WAFL_P2P_ENABLED={_P2P_ENABLED} "
         f"-e WAFL_SELF_EVAL={_SELF_EVAL} "
         f"-e WAFL_P2P_SYNC={_P2P_SYNC} "
+        f"-e WAFL_MERGE_INCLUDE_SELF={_MERGE_INCLUDE_SELF} "
         f"{sync_timeout_flag}"
         # 断片化由来の OOM を抑える。巨大 vocab(262144) の logits transient と外部 GPU 競合
         # (~2GB, 可変)で reserved が膨らみ、total 12GB 近傍で 256MB 級の割当が断片化により
