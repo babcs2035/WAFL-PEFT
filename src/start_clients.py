@@ -125,6 +125,7 @@ def start_client_container(ip: str, peer_id: int) -> str:
         f"-v {DEPLOY_DIR}/data:/app/data "
         f"-v {DEPLOY_DIR}/cache:/app/cache "
         f"-v {DEPLOY_DIR}/logs:/app/logs "
+        f"-v {DEPLOY_DIR}/results:/app/results "
         f"{IMAGE_NAME} "
         f"/app/.venv/bin/python src/client.py'"
     )
