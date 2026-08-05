@@ -137,7 +137,7 @@ def _rsync_to_peer(
     """
     jump_flag = f"-J {SSH_USER}@{SERVER_HOST} " if _JUMP else ""
     return subprocess.run(
-        f"rsync -az -e 'ssh -o StrictHostKeyChecking=no {jump_flag}' "
+        f"rsync -az --omit-dir-times -e 'ssh -o StrictHostKeyChecking=no {jump_flag}' "
         f"{extra_args} --info=progress2 '{src}' '{SSH_USER}@{ip}:{dst}'",
         shell=True, capture_output=True, text=True, timeout=600,
     )
@@ -191,7 +191,7 @@ def rsync_to_device(ip: str, peer_id: int) -> str:
     model_cache_dir = f"{DEPLOY_DIR}/cache/models/{model_path_parts[0]}"
 
     # リモートディレクトリ作成
-    result = _peer_ssh(ip, f"export LC_ALL=C; mkdir -p {DEPLOY_DIR}/config {DEPLOY_DIR}/data/train {DEPLOY_DIR}/data/test {DEPLOY_DIR}/logs {model_cache_dir} {DEPLOY_DIR}/cache/datasets {DEPLOY_DIR}/results {DEPLOY_DIR}/src")
+    result = _peer_ssh(ip, f"export LC_ALL=C; mkdir -p {DEPLOY_DIR}/config {DEPLOY_DIR}/data/train {DEPLOY_DIR}/data/test {DEPLOY_DIR}/data/contact_pattern {DEPLOY_DIR}/logs {model_cache_dir} {DEPLOY_DIR}/cache/datasets {DEPLOY_DIR}/results {DEPLOY_DIR}/src")
     if result.returncode != 0:
         return f"FAILED mkdir (peer={peer_id}, ip={ip})"
 
@@ -225,13 +225,25 @@ def rsync_to_device(ip: str, peer_id: int) -> str:
                 return f"FAILED rsync test data (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
     # ソースコード転送（data/・cache/・results/ は別途転送または不要のため除外）
-    r = _rsync_to_peer(
-        ip, str(BASE_DIR) + "/", DEPLOY_DIR + "/",
-        extra_args="--exclude='data/' --exclude='cache/' --exclude='results/' "
-                   "--exclude='.git/' --exclude='__pycache__' --exclude='.venv/'",
-    )
-    if r.returncode != 0:
-        return f"FAILED rsync source (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
+    # 注: サーバー側の data/ が root 所有の場合、rsync が全体をスキャンすると失敗するため、
+    # 必要なサブディレクトリ/ファイルを個別に rsync する（ファイルとディレクトリで区別）
+    sync_items = [
+        ("src", True),
+        ("README.md", False),
+        ("mise.toml", False),
+        ("pyproject.toml", False),
+        ("requirements.txt", False),
+        ("requirements-dev.txt", False),
+    ]
+    for name, is_dir in sync_items:
+        src_path = BASE_DIR / name
+        if src_path.exists():
+            if is_dir:
+                r = _rsync_to_peer(ip, str(src_path) + "/", f"{DEPLOY_DIR}/{name}/")
+            else:
+                r = _rsync_to_peer(ip, str(src_path), f"{DEPLOY_DIR}/{name}")
+            if r.returncode != 0:
+                return f"FAILED rsync {name} (peer={peer_id}, ip={ip}): {r.stderr[:300]}"
 
     # モデルキャッシュ転送（HuggingFaceキャッシュ形式）
     model_src = str(BASE_DIR / "cache" / "models" / model_path_parts[0] / model_path_parts[1])
