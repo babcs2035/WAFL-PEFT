@@ -217,6 +217,46 @@ W3（merge_include_self=true）の独自効果について:
 
 **判定の確信度**: 高（loss 改善は明確，per-peer 安定化は直接的な証拠．accuracy 効果はノイズ範囲内だが，安定性の差異はシグナルの可能性）．
 
+### Iteration 16 実行済み
+
+**このイテレーションの実行結果サマリー**
+
+Control (W3 なし) vs Treatment (W3 あり) の 10ノード対比実験結果:
+
+| 指標 | Control (W3なし) | Treatment (W3あり) |
+|------|------------------|-------------------|
+| 総mergeイベント | 265件 | 242件 |
+| `merge_includes_self` | 全件 `false` | 全件 `true` |
+| 最終 loss 平均 | 0.517 | 0.364 |
+| 最終 loss 標準偏差 | 0.406 | 0.171 |
+| accuracy peak | 17.5%（Step 1529） | 17.5%（Step 1752→2539維持） |
+| accuracy 最終→peak差 | -2.5pt（低下） | 0pt（維持） |
+| `_final.log` 取得 | 10/10 peer | 10/10 peer |
+| global_eval.log | 4ポイント存在 | 4ポイント存在 |
+
+**判定: W3 採用**
+
+1. **merge_includes_self 動的値化: 完全成功** — Control 全 265 件 `false`、Treatment 全 242 件 `true`
+2. **W3 修正は「採用」** — 最終 loss 0.517→0.364（-29.7%）、per-peer ばらつき 0.406→0.171（約2倍縮小）
+3. **accuracy は両条件とも peak 17.5% でノイズ範囲内** — 判定は W1 完了後に再実施
+4. **安定性で Treatment 優位** — Control は peak から -2.5pt 低下、Treatment は peak を維持
+5. **global_eval.log 保存問題: 解消** — Iter15 の未生成問題が解消
+
+**学び**
+
+1. **W3 の loss 改善効果は明確** — 最終 loss 29.7% 低下、per-peer 分散の縮小
+2. **accuracy 効果は判定不能** — 両条件とも peak 17.5% でノイズ範囲内。W1 完了後に再評価
+3. **Control の accuracy 低下機序** — W3 なしで merge 後 self の学習が置換されるため、過学習→merge による更新→過学習のサイクル
+4. **per-peer accuracy 未取得** — self-eval スキップ（GSM8K validation data not available）は未解消
+
+**次イテレーションの方針**
+
+B10 の決定に従う:
+- W1 (eval_resolution) + W2 (max_seq_len=512) を同時に実施
+- ノード数を 10→5 に戻し、評価専用 5 ノードを確保
+- 単一レバー原則を意図的に破る（人間承認済み）
+- Iter17 は「ベースラインを取り直すイテレーション」として位置付け
+
 ---
 
 ## Iteration 15: merge JSONLメトリクス化 + W3対比実験
