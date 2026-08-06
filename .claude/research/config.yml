@@ -95,7 +95,8 @@ levers:
      note: "[2026-07-26 p0001] WAFL 原典 Eq.(4) 直後に『If |nbr(n)| = 0, this minibatch-based adjustment
             process should be skipped because it causes over-fitting to the local dataset』と明記されている．
             現行実装が孤立時も局所学習を続けているなら，『小シャード由来の過学習』という既存の判定は
-            この未実装に起因する可能性がある．接触窓 1500s→3000s の悪化とも整合する"}
+            この未実装に起因する可能性がある．接触窓 1500s→3000s の悪化とも整合する",
+     status: "実装完了（Iter24）"}
 
   # --- W5/W6: LoRA 集約の改良．W1 完了後に着手する ---
   - {name: lora_exchange_scope, values: [lora_A_only],

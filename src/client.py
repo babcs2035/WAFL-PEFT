@@ -1181,6 +1181,11 @@ def training_loop_thread(
     print(f"[{_now()}]\t[Peer {PEER_ID}]\t[T3:Train   ]\tp2p_sync_enabled={p2p_sync_enabled}, barrier_timeout={barrier_timeout}s", flush=True)
 
     while state.running:
+        # W4: WAFL 原典 Eq.(4) 規定 — 孤立時は局所学習をスキップ（過学習防止）
+        skip_isolated = os.environ.get("WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED", "true") == "true"
+        if skip_isolated and len(state.peer_whitelist) == 0:
+            time.sleep(0.1)
+            continue
         if not state.experiment_running.is_set():
             time.sleep(0.1)
             continue
