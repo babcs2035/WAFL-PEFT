@@ -111,6 +111,7 @@ def start_eval_container(ip: str, eval_peer_id: int) -> str:
         f"-v {DEPLOY_DIR}/config:/app/config "
         f"-v {DEPLOY_DIR}/cache:/app/cache "
         f"-v {DEPLOY_DIR}/logs:/app/logs "
+        f"-v {DEPLOY_DIR}/results:/app/results "
         f"{IMAGE_NAME} "
         f"/app/.venv/bin/python src/eval_worker.py'"
     )
