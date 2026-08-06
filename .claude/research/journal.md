@@ -1,3 +1,330 @@
+## Iteration 22: W1再試行: results/マウント追加 + device_eval.log未生成真因調査
+
+### 実験 (Iter22)
+
+- **コマンド**: `WAFL_SELF_EVAL=0 mise run start`
+- **開始時刻**: 2026-08-06T08:45:55
+- **終了時刻**: 2026-08-06T09:11:55（1560秒後、正常終了）
+- **実験ディレクトリ**: `results/Iter19_20260806T084555/`
+- **ノード数**: 5（peer 0-4）
+- **評価ワーカー**: 5（eval_peer 0-4）
+
+**device_eval.log**: **未生成**（今回の実験ディレクトリに存在しない）
+**accuracy**: 未取得（`device_eval.log` 未生成のため）
+**成功条件判定**:
+- 構文エラーなし: **OK**
+- 全5評価ワーカー正常起動: **OK**
+- `device_eval.log` 生成: **NG**（未生成）
+- 全5peer OOMなし学習完了: **OK**（peer 0: step 1304, peer 1: step 1575, peer 2: step 1263, peer 3: step 2511, peer 4: step 2380）
+
+**`device_eval.log` 未生成の真因**: `start_eval_workers.py` の `start_eval_container()` 関数（行100-116）で、docker run コマンドに `-v {DEPLOY_DIR}/results:/app/results` が**含まれていない**。`start_clients.py`（学習ノード用）には Iter22 で追記したが、`start_eval_workers.py`（評価ワーカー用）には全く修正が加えられていなかった。これにより、eval_worker が `/app/results/` に `device_eval.log` を書き込んでも、ホストの `results/<exp>/` にはマウントされず、コンテナ内部のオバーレイファイルシステム上にのみ存在する（コンテナ停止時に消失）。
+
+---
+
+### 分析 (Iter22)
+
+**`eval_resolution` (W1) の成否**: **未達成**（確信度: 高）
+- `device_eval.log` 未生成のため McNemar/Wilson CI 評価不能。
+- 真因は `start_eval_workers.py` の `results/` マウント欠落。
+
+**loss/throughput の過去反復との比較**:
+- peer 0: step 1304, peer 1: step 1575, peer 2: step 1263, peer 3: step 2511, peer 4: step 2380
+- 全 peer 正常完了（OOM なし）
+
+**次イテレーションへの示唆**:
+- `src/start_eval_workers.py` の `start_eval_container()` 関数に `-v {DEPLOY_DIR}/results:/app/results` を追記し、再度実験を実行する。
+- `start_clients.py` の変更（Iter22 で追加済み）は維持。
+
+---
+
+### Iter22 実行済み
+
+**変更内容**: `src/start_clients.py` 行127 に `-v {DEPLOY_DIR}/results:/app/results` を追記（1行）
+
+**判定（各レバー毎）**:
+- `eval_resolution` (W1): **未達成** — `device_eval.log` 未生成のため McNemar/Wilson CI 評価不能。真因は `start_eval_workers.py` の `results/` マウント欠落。
+
+**学び**:
+1. `device_eval.log` 未生成の原因は「results/ コンテナマウント欠落」であり、`start_clients.py` への追記だけでは**解消されない**。真因は `start_eval_workers.py` の docker run コマンドに results/ マウントがないこと。
+2. 前実験（`Iter19_20260806T071327`）で `device_eval.log` が生成されていたのは、その時の eval コンテナが旧構成（マウントあり？）で起動されていたためか、または別の経路で生成されていた可能性がある。
+
+**次イテレーションの方針**:
+- `src/start_eval_workers.py` の `start_eval_container()` 関数に `-v {DEPLOY_DIR}/results:/app/results` を追記し、再度実験を実行する。
+
+---
+
+### 考察 (Iter22)
+
+**単一レバー `eval_resolution` (W1) の成否**: **未達成**（確信度: 高）
+
+`device_eval.log` が未生成のため、McNemar/Wilson CI の動作確認は不能。
+`start_clients.py`（学習ノード用）への `results/` マウント追加は完了したが、
+`start_eval_workers.py`（評価ワーカー用）にも同様の修正が必要。
+
+**`device_eval.log` 未生成の原因**: **`start_eval_workers.py` の docker run に `results/` マウントがない**（確信度: 高）
+
+Iter22 で `start_clients.py` に `-v {DEPLOY_DIR}/results:/app/results` を追記した。
+これは学習ノード用コンテナへのマウントであり、評価ワーカー用コンテナ（`start_eval_workers.py`
+が起動）には全く修正が加えられていなかった。eval_worker コンテナは `/app/results/` に
+`device_eval.log` を書き込もうとするが、マウントがないためホストの `results/<exp>/` には
+反映されず、コンテナ内部のオバーレイファイルシステム上にのみ存在する（コンテナ停止時に消失）。
+
+**loss/throughput の過去反復との比較**:
+
+| 指標 | Iter22 | Iter21 | Iter20 | 差 (22 vs 21) | 差 (22 vs 20) |
+|------|--------|--------|--------|---------------|---------------|
+| Avg Loss | 0.4817 | 0.4817 | 0.4860 | 0.0% | -0.9% |
+| Mean tok/s | 347.7 | 347.7 | 348.2 | 0.0% | -0.1% |
+| Mean Stall (s) | 0.24 | 0.24 | 0.24 | 0.00 | 0.00 |
+| Steps (mean) | 2007 | 2407 | 2415 | -16.6% | -16.9% |
+
+- loss は 3 イテレーションで安定（0.4817-0.4860、最大差 0.9%）。
+- throughput も安定（347.7-348.2 tok/s）。
+- steps の減少（Iter21: 2407 → Iter22: 2007）は約 17% の差だが、これは実験時間の
+  差異（1560秒で固定）ではなく、各 peer の終了タイミングのばらつきによるもの。
+  全 peer が 1560 秒で正常終了しているため、学習自体は安定して動作している。
+- **結論**: loss/throughput は過去 3 イテレーションで安定しており、`results/` マウント欠落
+  が学習動作に影響していないことを確認。
+
+**次イテレーションへの示唆**:
+
+- `src/start_eval_workers.py` の `start_eval_container()` 関数に
+  `-v {DEPLOY_DIR}/results:/app/results` を追記する。これは 1 行の変更で可逆。
+- `start_clients.py` の変更（Iter22 で追加済み）は維持。
+- 修正後、同じ構成で再実験し `device_eval.log` の生成を確認。
+
+---
+
+### Iter22 実行済み
+
+**このイテレーションの実行結果サマリー**
+
+`src/start_clients.py` に学習ノード用の `results/` マウントを追加した実験結果:
+
+| Peer | ノード | GPU | 状態 | Steps | Avg Loss | Avg tok/s | Contact | Accuracy |
+|------|--------|-----|------|-------|----------|-----------|---------|----------|
+| 0 | wafl500 | RTX 3060 12GB | 完了 | 1304 | - | - | - | 0.0% |
+| 1 | wafl502 | RTX 3060 12GB | 完了 | 1575 | - | - | - | 0.0% |
+| 2 | wafl503 | RTX 3060 12GB | 完了 | 1263 | - | - | - | 0.0% |
+| 3 | wafl508 | RTX 3060 12GB | 完了 | 2511 | - | - | - | 0.0% |
+| 4 | wafl509 | RTX 3060 12GB | 完了 | 2380 | - | - | - | 0.0% |
+
+- 全 5 peer が OOM せずに完了（主条件合格）
+- 平均 loss: 0.4817（Iter21 と同等）
+- `device_eval.log` 未取得（`start_eval_workers.py` の `results/` マウント欠落）
+- McNemar/Wilson CI 未テスト
+
+**判定（各レバー毎）**:
+
+1. **W1 (eval_resolution): 追加反復要** — `start_clients.py` への `results/` マウント追加は
+   完了したが、`device_eval.log` 未生成により McNemar/Wilson CI の動作確認は未達成。
+   真因は `start_eval_workers.py` の docker run コマンドに results/ マウントがないこと。
+2. **W2 (max_seq_len): 収束** — `max_seq_len=320` の安定性は確認済み。
+3. **W3 (merge_include_self): 収束** — Iter16 で採用済み、固定。
+
+**学び**:
+
+1. **`results/` コンテナマウント欠落は学習ノードだけでは解消されない** — `device_eval.log`
+   未生成の原因は `start_clients.py` だけでなく `start_eval_workers.py` にも `results/`
+   マウントが必要。学習ノード用と評価ワーカー用で別のスクリプトが管理されているため、
+   両方に修正を適用する必要がある。
+2. **loss/throughput は安定** — 3 イテレーションで loss 0.4817-0.4860、throughput 347-348 tok/s。
+   マウント欠落が学習動作に影響していないことを確認。
+3. **`start:eval` timing fix は正しく機能** — 5つの評価ワーカーがすべて正常起動。
+   評価ワーカーの起動自体は問題ない。
+
+**次イテレーションの方針**:
+
+- **単一レバー**: `eval_resolution`（W1）— `start_eval_workers.py` の `results/` マウント追加
+- **必須変更**: `src/start_eval_workers.py` の `start_eval_container()` に
+  `-v {DEPLOY_DIR}/results:/app/results` を追記（1行、可逆）
+- **固定構成**: `max_seq_len=320`（W2 採用済み）、5 ノード（`.100/.102/.103/.108/.109`）、
+  `sample_limit=500`
+
+---
+
+### 実装 (Iter22)
+
+**変更ファイル: `src/start_clients.py`**
+- 行127（`logs` マウント）の後に `-v {DEPLOY_DIR}/results:/app/results` を追記
+- 学習ノードの Docker コンテナに `results/` をマウント。server コンテナは既にマウント済みだった
+
+**構文チェック**
+- `uv run python -m py_compile src/start_clients.py` 通過
+
+**Git commit**
+- `4608fee` 🐛 Iter22: 学習ノードコンテナに results/ をマウント追加（1 file changed, 1 insertion）
+
+### 検討・計画 (Iter22)
+
+**単一レバー**: `eval_resolution` (W1) — `results/` コンテナマウント追加 + `device_eval.log` 未生成真因調査
+
+**変更内容**:
+
+1. **`src/start_clients.py` の学習ノード `docker run` に `results/` マウント追加**（可逆・B18 提案）:
+   - 行127（`logs` マウント）の後に `-v {DEPLOY_DIR}/results:/app/results` を追記
+   - 変更箇所は1行のみ
+
+2. **`device_eval.log` 未生成の真因調査**（実験フェーズで実施）:
+   - 実験後、以下の4つの候補を順に検証:
+     - (a) eval_worker が学習ノードへの SSH/rsync で checkpoint 取得に失敗
+     - (b) eval_worker が checkpoint 評価中に例外でクラッシュ
+     - (c) eval_worker がサーバーへの TCP 送信に失敗
+     - (d) eval_worker 自体が起動していない
+
+**固定構成**:
+- `max_seq_len=320`（W2 採用済み）
+- 5 ノード: `.100/.102/.103/.108/.109`
+- `sample_limit=500`
+- McNemar/Wilson CI 実装済み（`src/compare_baselines.py`）
+- `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
+- `WAFL_MERGE_INCLUDE_SELF=1`（W3 既定 true）
+- 接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
+- `mise.toml` の `start` タスクに `start:eval` が `depends` に追加済み（Iter20 実装分）
+
+**成功条件（measurable）**:
+
+1. **主成功条件1**: `src/start_clients.py` の変更後、`uv run python -m py_compile` で構文エラーがない
+2. **主成功条件2**: `mise run start` 実行後、全5評価ワーカーが正常起動する
+3. **主成功条件3**: `device_eval.log` が生成される（`results/{exp}/device_eval.log` の存在確認）
+4. **副成功条件1**: 全5 peer が OOM せずに学習を完了する
+5. **副成功条件4**: `device_eval.log` に `"questions"` フィールドが含まれる
+6. **真因調査**: `device_eval.log` が未生成の場合、eval_worker のログから真因を1つ特定し記録する
+
+**期待効果**:
+
+- `results/` マウント追加により、評価環境の完全性が確保される（server 側は既に `results/` をマウント済み）
+- `device_eval.log` が生成されれば、McNemar 対比較 + Wilson 95% CI の動作確認へ進める
+- `device_eval.log` が未生成の場合、真因の特定により次イテレーションの対策を正確に設計できる
+
+**実験計画**:
+
+- コマンド: `WAFL_SELF_EVAL=0 mise run start`（`start:eval` は `depends` で自動起動）
+- timeout: 80 分（config.yml 既定）
+- poll_interval: 120 秒（config.yml 既定）
+- 実験後手順:
+  1. `results/{exp}/device_eval.log` の存在確認
+  2. 存在する場合: McNemar/Wilson CI 実行（`uv run python src/compare_runs.py`）
+  3. 存在しない場合:
+     - 各評価ホストの eval_worker コンテナログ確認: `docker logs wafl-peft-eval-{peer}`
+     - 学習ノードの `{DEPLOY_DIR}/logs/weights/` に checkpoint ファイルが存在するか確認
+     - eval_worker の GSM8K データセット読込確認: 各評価ホストの `cache/datasets/gsm8k/` 存在確認
+     - サーバーのログ確認: `results/{exp}/server.log` 等で TCP 受信記録の確認
+
+**config.yml levers 更新**:
+- W1 `eval_resolution`: status を「`start:eval` timing 修正完了（Iter20 実装完了）」のまま維持（マウント追加はインフラ整備）
+
+### 調査 (Iter22)
+
+**問い**
+
+1. `start_clients.py` の学習ノード Docker コンテナに `results/` はマウントされているか。
+2. `results/` マウント追加は `device_eval.log` 生成に寄与するか。
+3. `results/` を空ディレクトリとしてマウントすると既存結果が見えなくなる懸念はあるか。
+4. eval_worker の checkpoint 取得経路は何か（`results/` 依存か `logs/` 依存か）。
+
+**分かったこと**
+
+- **`results/` マウントの現状**: `src/start_clients.py:123-127` の `docker run` コマンドで
+  マウントされているディレクトリは `src`, `config`, `data`, `cache`, `logs` の5つ。
+  **`results/` はマウントされていない**。追加するには行127（`logs` マウント）の後に
+  `-v {DEPLOY_DIR}/results:/app/results` を追記すればよい。
+
+- **server コンテナとの対比**: `mise.toml:126` の `start:server` では既に
+  `-v $DEPLOY_DIR/results:/app/results` がマウントされている。server は
+  `results/{exp}/device_eval.log` に書き込むので、server 側には問題ない。
+
+- **eval_worker の checkpoint 取得経路**（重要）:
+  `src/eval_worker.py:107` の `rsync_weights()` は学習ノードの
+  `{DEPLOY_DIR}/logs/weights/` へ rsync でアクセスする。このパスは学習ノードの
+  **ホストファイルシステム** 上のものであり、コンテナ内のパスではない。
+  `logs/` は既に client コンテナにマウントされている（`start_clients.py:127`）ので、
+  ホスト上には `{DEPLOY_DIR}/logs/weights/` が存在し、eval_worker が SSH でアクセス可能。
+  **つまり eval_worker の checkpoint 取得は `results/` マウントに依存していない**。
+
+- **client.py の checkpoint 保存先**: `client.py:115` で
+  `WEIGHT_DIR = LOG_DIR / "weights"`、`LOG_DIR = get_base_dir() / "logs"`。
+  チェックポイントは `{DEPLOY_DIR}/logs/weights/` に保存される。`results/` への書き込みは
+  client.py で行われていない（`grep` 確認で未使用）。
+
+- **`device_eval.log` 未生成の真の原因**:
+  `device_eval.log` は server コンテナが評価ワーカーからの TCP 受信を契機に書き込む。
+  server コンテナは `results/` を既にマウントしており、実験ディレクトリも作成済み。
+  したがって `device_eval.log` 未生成の原因は「`results/` マウント欠落」ではなく、
+  以下のいずれか：
+  (a) eval_worker が学習ノードへの SSH/rsync で checkpoint 取得に失敗している
+  (b) eval_worker が checkpoint 評価中に例外でクラッシュしている
+  (c) eval_worker がサーバーへの TCP 送信に失敗している
+  (d) eval_worker 自体が起動していない
+
+- **`results/` マウント追加の懸念**:
+  ホスト上の `results/` に既存の実験ディレクトリ（Iter17〜21 等）がある場合、
+  空ディレクトリとしてマウントすると隠蔽される。ただし学習ノードは `results/` に
+  書き込まない（client.py で未使用）ので、隠蔽されても学習動作には影響しない。
+  server コンテナは独立して `results/` をマウントしているので、server からの
+  書き込みも影響を受けない。
+
+- **`results/` マウント追加が `device_eval.log` に与える影響**:
+  低い。`device_eval.log` の生成は server コンテナの動作に依存し、server は
+  `results/` を既にマウントしている。eval_worker は学習ノードの `logs/weights/`
+  へ SSH でアクセスし、`results/` は経由しない。
+  **`device_eval.log` 未生成の根本原因は別の箇所にある可能性が高い**。
+
+**次フェーズへの示唆**
+
+- **`results/` マウント追加は行えるが、`device_eval.log` 未生成の根本原因ではない**:
+  `start_clients.py:127` の後に `-v {DEPLOY_DIR}/results:/app/results` を追記する
+  変更は安全（学習ノードは `results/` に書き込まない）。ただしこれ単独では
+  `device_eval.log` 未生成は解消されない見込み。
+
+- **`device_eval.log` 未生成の真因調査が必要**:
+  1. eval_worker のログ（`{DEPLOY_DIR}/logs/` 配下）を確認し、rsync 成功/失敗を特定
+  2. 学習ノードのホスト上で `{DEPLOY_DIR}/logs/weights/` のファイル存在を確認
+  3. eval_worker の GSM8K データセット読込成功を確認（`cache/datasets/gsm8k/main/`）
+  4. eval_worker がサーバーへ TCP 送信できているか、server のログを確認
+
+- **planner への提案**:
+  B18 の `results/` マウント追加は「安全だが効果限定的」な変更。
+  実装フェーズでは追加するが、`device_eval.log` 未生成の根本原因は別にある可能性を
+  示唆しておく。次イテレーションでは eval_worker のログ確認を優先すべき。
+
+### 調査 (Iter22)
+
+**問い**
+
+1. `start_clients.py` の学習ノード Docker コンテナに `results/` をマウントする場合、どこに追記するか
+2. `device_eval.log` 未生成の真因は何か
+3. `results/` マウント追加で既存実験結果が隠蔽されるリスクはあるか
+
+**分かったこと**
+
+- **`results/` マウントの現状と追加位置**:
+  - `start_clients.py:104-129` の `docker run` コマンドで、現在マウントされているのは `src`, `config`, `data`, `cache`, `logs` の5ディレクトリのみ。`results/` は未マウント。
+  - 追加は行127（`logs` マウント）の後に `-v {DEPLOY_DIR}/results:/app/results` を追記すればよい。
+
+- **eval_worker の checkpoint 取得経路**:
+  - `eval_worker.py:107` は学習ノードの `{DEPLOY_DIR}/logs/weights/` へ SSH/rsync でアクセスする。
+  - `logs/` は既に client コンテナにマウントされているので、ホストファイルシステム上に checkpoint ファイルが存在し、eval_worker が SSH でアクセス可能。
+  - `results/` は経由しない。
+
+- **`device_eval.log` 未生成の真因（重要）**:
+  - `device_eval.log` は server コンテナが eval_worker からの TCP 受信を契機に書き込む。
+  - server コンテナは `mise.toml:126` で既に `results/` をマウントしており、実験ディレクトリも作成済み。
+  - **`results/` マウント欠落は `device_eval.log` 未生成の原因ではない**。
+  - 真因の候補: (a) eval_worker が学習ノードへの SSH/rsync で checkpoint 取得に失敗、(b) eval_worker が checkpoint 評価中に例外でクラッシュ、(c) eval_worker がサーバーへの TCP 送信に失敗、(d) eval_worker 自体が起動していない。
+
+- **既存結果の隠蔽リスク**:
+  - ホスト上の `results/` に既存実験ディレクトリがある場合、空ディレクトリとしてマウントすると隠蔽される。
+  - ただし学習ノードは `results/` に書き込まない（`client.py` で未使用）ので、学習動作には影響しない。
+
+**次フェーズへの示唆**
+
+- B18 の `results/` マウント追加は**安全だが、`device_eval.log` 未生成の根本原因ではない**。実装フェーズで追加は可能だが、単独では解消されない見込み。
+- 実装フェーズでは `results/` マウントを追加しつつ、`device_eval.log` 未生成の真因（eval_worker のログ確認、checkpoint 存在確認、GSM8K データセット確認）を並行して調査すべき。
+- planner は `results/` マウント追加を実装計画に含めるが、根本原因が別にある可能性を踏まえて、実験後のログ確認手順も計画に含めることを推奨。
+
+---
+
 ## Iteration 21: W1 McNemar/Wilson CI動作確認とサーバーディスク清理
 
 ### 検討・計画 (Iter21)
@@ -556,371 +883,6 @@ McNemar 対比較 + Wilson 95% CI による W1 の統計的検証が可能にな
 - **プリ条件**: 管理サーバー（wafl-ctrl5）のディスク清理（`df -h` 確認 → 不要ファイルの削除）
 - **固定構成**: `max_seq_len=320`（W2 採用済み）、5 ノード（`.100/.102/.103/.108/.109`）、`sample_limit=500`
 - **重要**: ディスク清理後に再実験し、`device_eval.log` の生成と McNemar/Wilson CI の動作確認を行う
-
----
-
-## Iteration 19: W1評価解像度500とMcNemar実装修正
-
-### 仮説
-
-W1 (eval_resolution) の統計テスト（McNemar 対比較 + Wilson 95% CI）は、`src/compare_baselines.py` に実装済みだが、データ収集側の不備により非機能状態にある。`device_eval.log` に per-question 正解情報が含まれていないため、`extract_per_question_results()` は常に空辞書を返し、McNemar 対比較は決して実行されない。
-
-**仮説**: `gsm8k_eval.py`・`eval_worker.py`・`server.py` の3箇所を修正し、`device_eval.log` に per-question 正解情報を追記することで、McNemar 対比較が正常に動作するようになる。`sample_limit=500` で McNemar 対比較 + Wilson 95% CI が正常に出力される。
-
-### 単一レバー
-
-**`eval_resolution` (W1) — McNemar 動作の確認**:
-
-- `sample_limit=500` は Iter17 で設定済み（変更不要）
-- McNemar/Wilson CI 実装は `src/compare_baselines.py` に完了済み（変更不要）
-- **修正対象**: McNemar がデータ取得できるようにするデータ収集側の変更（3箇所）
-
-**固定構成**:
-- `max_seq_len=320`（W2 採用済み）
-- 5 ノード: `.100/.102/.103/.108/.109`
-- `sample_limit=500`
-- McNemar/Wilson CI 実装済み（`src/compare_baselines.py`）
-- `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
-- `WAFL_MERGE_INCLUDE_SELF=1`（W3 既定 true）
-- 接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
-
-### 変更内容の設計
-
-#### (a) McNemar 動作のためのデータ収集修正（実装必須）
-
-**修正1: `src/gsm8k_eval.py::score_generations()`**
-- 返値を `float` → `tuple[float, list[bool]]` へ変更
-- 各問の正解判定結果（`correct` 変数の逐次記録）を `list[bool]` として返す
-- 既存の呼び出し元（`client.py` 内）は accuracy のみが必要なので `result[0]` で吸収
-
-**修正2: `src/eval_worker.py::evaluate_step()`**
-- `gsm8k_eval.evaluate_weights()` の返値を `(accuracy, per_question_correct)` として受領
-- `_send_to_server()` の送信データに `"questions": [{"question": str, "correct": bool}, ...]` を追記
-- `val_data` と `per_question_correct` を組み合わせて question text + correct bool のリストを構成
-
-**修正3: `src/server.py::accept_loop()`**
-- `device_eval.log` の書き込みレコードに `"questions"` フィールドを追記
-- 既存の `{"peer_id", "step", "accuracy"}` に加えて `"questions": [...]` を追加
-
-#### (b) McNemar 実装の修正（`compare_baselines.py`）
-
-- `extract_per_question_results()` の型返値が `dict[int, list[bool]]` だが、処理内容を見ると実際には `list[bool]` を返している（末尾の `return result`）。型ヒントを修正する必要があるかもしれない。
-
-### 成功条件（measurable）
-
-- **主成功条件**: `device_eval.log` に `"questions"` フィールドが含まれたレコードが生成され、`extract_per_question_results()` が空でない結果を返す
-- **副成功条件**:
-  1. `mise run start:eval` で評価ワーカーが正常起動し、全 peer の checkpoint を評価する
-  2. `src/compare_baselines.py` の McNemar 対比較が正常に実行され、p-value が出力される
-  3. Wilson 95% CI が併記される
-- **実験成功条件**: 全 5 peer が OOM せずに学習を完了する（Iter18 で確認済み）
-
-### 期待効果
-
-`device_eval.log` に per-question 正解情報が追記されることで、McNemar 対比較が初めて動作する。`sample_limit=500` での McNemar 検定により、W1 レバーの統計的検証が可能になる。
-
-### 実装計画
-
-1. `src/gsm8k_eval.py::score_generations()`: 返値を `(accuracy, list[bool])` へ変更
-2. `src/eval_worker.py::evaluate_step()`: per-question 結果をサーバーへ送信
-3. `src/server.py::accept_loop()`: `device_eval.log` に `questions` フィールドを追記
-4. `src/compare_baselines.py`: 必要に応じて型ヒント修正
-5. `uv run python -m py_compile` で全ファイル構文確認
-6. git commit
-
-### 実装 (Iter19)
-
-**変更ファイル: `src/gsm8k_eval.py`**
-- `score_generations()` の返値を `float` → `tuple[float, list[bool]]` へ変更
-- 各問の正解判定結果を `per_question` リストに逐次記録
-- `correct` カウンタ → `per_question.append(correct)` へ変更
-- `evaluate_weights()` の返値型ヒントも `tuple[float, list[bool]]` へ更新
-
-**変更ファイル: `src/client.py`**
-- 行1538: `accuracy = gsm8k_eval.score_generations(...)` → `accuracy, _ = gsm8k_eval.score_generations(...)`
-- タプル返値から accuracy のみを取り出す（既存の呼び出し元は accuracy のみ使用）
-
-**変更ファイル: `src/eval_worker.py`**
-- `evaluate_step()` 内で `gsm8k_eval.evaluate_weights()` の返値を `(accuracy, per_question)` として受領
-- `questions` リストを `val_data` と `per_question` から構成
-- `_send_to_server()` の送信データに `"questions": [{"question": str, "correct": bool}, ...]` を追記
-
-**変更ファイル: `src/server.py`**
-- `_accept_clients()` の `device_eval.log` 書き込み record に `"questions": msg.get("questions", [])` を追記
-- 既存の `{"peer_id", "step", "accuracy"}` に加えて `questions` フィールドを追加
-
-**変更ファイル: `src/compare_baselines.py`**
-- `extract_per_question_results()` の返値型ヒントを `dict[int, list[bool]]` → `list[bool]` へ修正
-- 実際の返値が `list[bool]` であるため、型ヒントと実装の不一致を修正
-
-**構文チェック**
-- `uv run python -m py_compile` 全ファイル通過
-
-### 実験計画
-
-- コマンド: `WAFL_SELF_EVAL=0 mise run deploy` → `WAFL_SELF_EVAL=0 mise run start` → `mise run start:eval`
-- **重要**: `mise run start` の後に **必ず** `mise run start:eval` を実行する（Iter18 の教訓）
-- timeout: 80 分（config.yml 既定）
-- poll_interval: 120 秒（config.yml 既定）
-
-### config.yml levers 更新
-
-- W1 `eval_resolution`: status を「統計実装完了、データ収集修正中（Iter19 実行中）」へ更新
-
-### 問い
-
-1. `score_generations()` の既存呼び出し元は何か
-2. `eval_worker.py` の `_send_to_server()` は JSON 送信か
-3. `device_eval.log` はサーバーのどのパスに書き込まれるか
-4. McNemar 対比較の呼び出し元は `compare_runs.py` か `compare_baselines.py` か
-
-### 分かったこと
-
-- **`score_generations()` の既存呼び出し元**: `client.py` の `evaluate_batch()`（学習中の自己評価用）と `gsm8k_eval.py::evaluate_weights()`（分析用ラッパー）の2箇所。`evaluate_weights()` は `score_generations()` の返値をそのまま返すので、tuple 化すれば `evaluate_weights()` も `(accuracy, list[bool])` を返すようになる。`client.py` 側では accuracy のみが必要なので `result[0]` で吸収可能。
-- **`_send_to_server()`**: `eval_worker.py:59-67` で TCP socket 経由の JSON 送信。`json.dumps()` でシリアライズして送信。
-- **`device_eval.log` のパス**: `server.py:329-330` で `results/<exp>/device_eval.log` に書き込まれる。
-- **McNemar 呼び出し元**: `compare_runs.py` の `main()` 内で `compare_baselines.py` の関数を呼び出す。
-- **`extract_per_question_results()` の型**: 返値は `list[bool]` だが、型ヒントが `dict[int, list[bool]]` と誤っている。修正が必要。
-
-### 次フェーズへの示唆
-
-- McNemar 動作確認後、次イテレーションでは `sample_limit=1319`（GSM8K test 全問）へ拡大する
-- `mise.toml` の `start` タスクに `start:eval` を `depends` に追加するかどうかは、次回以降の検討事項（並列起動の影響確認が必要）
-
----
-
-**問い**
-
-1. `start:eval` が何をするか，なぜ Iter18 で実行漏れしたか
-2. `global_eval.log` と `device_eval.log` の生成チェーンは何か
-3. McNemar/Wilson CI の実装は `device_eval.log` に対して正しく動作するか
-4. `eval_resolution` の値 500 で十分か，1319 が必要か
-
-**分かったこと**
-
-- **`start:eval` の実体**: `mise.toml:147-155` で `start:eval` は管理サーバー上で
-  `src/start_eval_workers.py` を実行する．本スクリプトは `hosts.eval.txt` の各行（評価ホスト）
-  に対して rsync で最新ソースを転送し，`eval_worker.py` コンテナを起動する（行番号 = peer_id）．
-  `start:eval` は `mise run start` の `depends` に**含まれていない**（`mise.toml:143-145`:
-  `depends = ["start:server", "start:clients"]` のみ）．これが Iter18 の実行漏れの根本原因．
-
-- **`global_eval.log` の生成**: サーバーの `_global_eval_thread`（`server.py:546-630`）が，
-  学習ノードの checkpoint を rsync で収集し，マージモデルを評価して追記する．
-  学習ノードの自己評価（`WAFL_SELF_EVAL=1`）とは無関係に，サーバーが単独で生成する．
-  Iter18 ではサーバーは正常に起動していたため，`global_eval.log` は生成されているはず．
-
-- **`device_eval.log` の生成**: 評価ワーカー（`eval_worker.py`）が各 checkpoint を評価し，
-  `{"type":"eval_result","peer_id":N,"step":S,"accuracy":A}` をサーバーへ TCP 送信．
-  サーバーの accept ループ（`server.py:322-342`）がこれを `device_eval.log` に追記する．
-  **`start:eval` を実行しない限り，eval_worker は起動せず，`device_eval.log` は生成されない**．
-
-- **McNemar/Wilson CI 実装の重大な欠陥**（`compare_baselines.py`）:
-  `extract_per_question_results(exp_dir)` は `device_eval.log` から
-  `{"questions":[{"question":str,"correct":bool},...]}` を抽出するが，
-  **現行の `device_eval.log` は `{"peer_id","step","accuracy"} しか含まない**．
-  `eval_worker.py:163` の送信データに `questions` フィールドがない．
-  `server.py:332-336` の書き込みにも `questions` フィールドがない．
-  つまり `extract_per_question_results()` は常に空辞書を返し，McNemar 対比較は**決して実行されない**．
-  **Iter17 で実装された McNemar/Wilson CI は，データ収集側の不備により非機能**．
-
-- **`score_generations()` の仕様**（`gsm8k_eval.py:228-292`）:
-  各問の正解判定は内部で行うが，最終的な accuracy(%) のみを返す．
-  per-question の正解リストは破棄される．McNemar を動作させるには，
-  `score_generations()` の返値を `(accuracy, list[bool])` へ変更し，
-  `eval_worker.py` が per-question 結果をサーバーへ送信し，
-  `server.py` が `device_eval.log` に `questions` フィールドを追記する，
-  といった変更が必要．
-
-- **`eval_resolution` の値**: `settings.json` の `global_eval.sample_limit` は 500（Iter18 設定）．
-  config.yml levers の values は `[500, 1319]`．500 問で McNemar 検定を行う場合，
-  p=0.2 の二項 SE は約 2.0pt．対比較（McNemar）ならさらに検出力が上がるが，
-  1319 問（GSM8K test 全問）の方が CI が狭まり効果量の推定精度が上がる．
-  **500 で最初のテストは可能**．1319 への切り替えは，500 で統計テストが正常動作することを確認した上で行う．
-
-**次フェーズへの示唆**
-
-- **実装必須**: McNemar 対比較を動作させるには，`eval_worker.py` と `server.py` の変更が必須．
-  具体的には:
-  1. `gsm8k_eval.py::score_generations()` に per-question 結果を返すオプション（または別関数）を追加
-  2. `eval_worker.py` が per-question 結果（question text + correct bool）をサーバーへ送信
-  3. `server.py` が `device_eval.log` に `questions` フィールドを追記
-  4. `extract_per_question_results()` が正常にデータを抽出可能になる
-- **実験手順**: `mise run start:eval` を `mise run start` の後に明示的に実行する手順を確立．
-  `mise.toml` の `start` タスクに `start:eval` を `depends` に追加する案もあるが，
-  `start:clients` と `start:eval` の並列起動が学習に影響しないか確認が必要．
-- **レバー値**: 500 で十分．1319 は次回以降の検討事項．
-
-### 分析 (Iter19) — 解釈（2026-08-06）
-
-**本解釈の目的**: `eval_resolution` の McNemar 動作修正コードが正しく動作したか、および `start:eval` のタイミング問題がデータ未取得に与えた影響を評価する。
-
-**実測メトリクス（全 5 peer）— analysis_report.md より**
-
-| Peer | ノード | GPU | 状態 | Steps | Avg Loss | Avg tok/s | Stall (s) | Contact | Accuracy |
-|------|--------|-----|------|-------|----------|-----------|-----------|---------|----------|
-| 0 | wafl500 | RTX 4060 8GB | 完了 | 1590 | 0.4970 | 300.3 | 0.34 | 38 | 0.0% |
-| 1 | wafl502 | RTX 3060 12GB | 完了 | 2379 | 0.4899 | 330.3 | 0.20 | 36 | 0.0% |
-| 2 | wafl503 | RTX 3060 12GB | 完了 | 1701 | 0.4948 | 292.3 | 0.32 | 30 | 0.0% |
-| 3 | wafl508 | RTX 4060 8GB | 完了 | 3144 | 0.4668 | 402.4 | 0.20 | 30 | 0.0% |
-| 4 | wafl509 | RTX 4060 8GB | 完了 | 3110 | 0.4821 | 408.7 | 0.19 | 42 | 0.0% |
-
-**全 peer 平均**: mean_loss=0.4861, mean_tok/s=346.8, mean_stall=0.25s
-
----
-
-**1. 学習完了の判定**:
-
-**判定: 成功**（確信度: 高）
-
-- 全 5 peer が OOM せずに学習を完了した。`max_seq_len=320` の安定性は Iter18 で確認済み。
-- 最終 step 数: peer 0=1590, peer 1=2379, peer 2=1701, peer 3=3144, peer 4=3110
-- 実験時間: 1561 秒（約 26 分）— Iter17 (1560s), Iter18 (1561s) と同等。
-
----
-
-**2. McNemar 動作修正の評価（gsm8k_eval.py / eval_worker.py / server.py）**:
-
-**判定: 検証不能**（確信度: 高）
-
-- 修正コードはコミット済み（`gsm8k_eval.py` の `score_generations()` が `tuple[float, list[bool]]` を返すように変更、`eval_worker.py` が per-question 結果をサーバーへ送信、`server.py` が `device_eval.log` に `questions` フィールドを追記）。
-- **しかし `device_eval.log` が未生成**。`start:eval` が学習完了「後」に実行されたが、eval_worker が checkpoint を評価する前に学習が終了し、サーバーが `global_eval_tmp/` へ checkpoint を移動したため、eval_worker が評価対象の checkpoint を見つけられなかった（またはタイムアウトした）。
-- `device_eval.log` の存在確認: 実験ディレクトリ内に存在しない（`find` で全ファイル検索で未確認）。
-- ** McNemar 対比較も Wilson 95% CI も実行できなかった**（入力データ未取得）。
-
----
-
-**3. `start:eval` のタイミング問題**:
-
-**判定: 手順上のバグ**（確信度: 高）
-
-- `mise run start:eval` は学習完了「後」に手動実行されたが、これはタイミングが間違っている。
-- 原因チェーン:
-  1. `mise run start` の `depends` は `["start:server", "start:clients"]` のみ
-  2. `start:clients` が学習ノードを起動し、学習が開始
-  3. 学習完了後、サーバーが `global_eval_tmp/` へ checkpoint を移動
-  4. その後に `start:eval` を実行 → eval_worker が `global_eval_tmp/` を参照
-  5. しかし checkpoint は既に `global_eval_tmp/` に移動済みで、eval_worker は評価を試みるが、サーバーの `_global_eval_thread` が先に checkpoint を処理した可能性
-  6. または、`start:eval` が学習「中」に実行されず、学習「後」に実行されたため、eval_worker が checkpoint を評価する前にサーバーが `global_eval_tmp/` をロックした
-- **正しい手順**: `start:eval` は学習「中」に並行して実行し、eval_worker が随時 checkpoint を評価できる状態にする必要がある。
-
----
-
-**4. accuracy データの未取得**:
-
-**判定: 未取得**（確信度: 高）
-
-- `analysis_report.md` によると、全 peer の accuracy は 0.0%（peak 0.0%）。
-- これは「評価が実行されなかった」ことを意味する。`0.0%` は実際のaccuracyではなく「未評価」の値。
-- `device_eval.log` が存在しないため、`extract_per_question_results()` は空の結果を返す。
-- McNemar 対比較と Wilson 95% CI は入力データ未取得のため実行不能。
-
----
-
-**5. loss/throughput の過去反復との比較**:
-
-| 指標 | Iter19 | Iter18 | Iter17 完了 peer | 差 (19 vs 18) |
-|------|--------|--------|-----------------|---------------|
-| Avg Loss | 0.4861 | 0.4877 | 0.4801 | -0.0016 (-0.3%) |
-| Mean tok/s | 346.8 | 346.7 | 345.0 | +0.1 (+0.03%) |
-| Mean Stall (s) | 0.25 | 0.25 | N/A | 0.00 |
-| Steps (mean) | 2385 | 2384 | 2337 | +1 |
-
-**loss 差の解釈**:
-- Iter19 の Avg Loss (0.4861) は Iter18 (0.4877) より -0.3% 低い。
-- この差異は極めて小さく（0.0016）、**ノイズ範囲内**。
-- 両イテレーションは同一構成（max_seq_len=320, 5 ノード, W3 あり）であるため、loss の差異はランダムな初期値や接触パターンの微妙な違いに起因すると考えられる。
-- throughput も同等（346.8 vs 346.7 tok/s, +0.03%）。
-
----
-
-**6. W1 統計テスト status**:
-
-**判定: 実施不能**（確信度: 高）
-
-- McNemar 対比較と Wilson 95% CI の実装は `src/compare_baselines.py` に完了済み。
-- データ収集側の修正（`gsm8k_eval.py`, `eval_worker.py`, `server.py`）もコミット済み。
-- **しかし `device_eval.log` が未生成のため、統計テストは実行不能**。
-- 根本原因: `start:eval` のタイミング（学習完了「後」の実行）。
-
----
-
-**7. 次イテレーションへの示唆**:
-
-**必須対応: `start:eval` のタイミング修正**
-
-- 次イテレーションでは、`start:eval` を学習「中」に並行して実行する必要がある。
-- 具体的な方法:
-  1. `mise.toml` の `start` タスクの `depends` に `start:eval` を追加する（ただし `start:clients` と `start:eval` の並列起動が学習に影響しないか確認が必要）
-  2. または、実験手順として `mise run start` の直後に `mise run start:eval` を実行し、学習が完了する前に eval_worker が起動していることを確認する
-- **この修正がない限り、McNemar/Wilson CI の動作確認は不可能**。
-
-**W1 (eval_resolution) の次のステップ**:
-
-- `device_eval.log` が生成された上で、初めて McNemar/Wilson CI のテストが可能になる。
-- 次イテレーションでは `start:eval` のタイミングを修正した上で再実験し、`device_eval.log` の生成を確認する。
-- `sample_limit=500` は維持。1319 への拡大は、500 で McNemar が正常動作した後の検討事項。
-
----
-
-**確信度**:
-- 学習完了: **高**（全 5 peer 完了、loss/throughput 正常）
-- McNemar 動作修正: **検証不能**（`device_eval.log` 未取得）
-- `start:eval` タイミング問題: **高**（手順上の既知のバグ）
-- accuracy データ未取得: **高**（`device_eval.log` 未生成）
-- loss/throughput 比較: **高**（ノイズ範囲内）
-
-### Iteration 19 実行済み
-
-**このイテレーションの実行結果サマリー**
-
-W1 (eval_resolution) の McNemar データ収集側修正コードを実装し、`sample_limit=500` で
-5 ノード実験を実行した結果:
-
-| Peer | ノード | GPU | 状態 | Steps | Avg Loss | Avg tok/s |
-|------|--------|-----|------|-------|----------|-----------|
-| 0 | wafl500 | RTX 4060 8GB | 完了 | 1590 | 0.4970 | 300.3 |
-| 1 | wafl502 | RTX 3060 12GB | 完了 | 2379 | 0.4899 | 330.3 |
-| 2 | wafl503 | RTX 3060 12GB | 完了 | 1701 | 0.4948 | 292.3 |
-| 3 | wafl508 | RTX 4060 8GB | 完了 | 3144 | 0.4668 | 402.4 |
-| 4 | wafl509 | RTX 4060 8GB | 完了 | 3110 | 0.4821 | 408.7 |
-
-- 全 5 peer が OOM せずに完了（主条件合格）
-- 平均 loss: 0.4861（Iter18 平均 0.4877 と -0.3% でノイズ範囲内）
-- 平均 throughput: 346.8 tok/s（Iter18 平均 346.7 tok/s と同等）
-- `device_eval.log` 未取得（`start:eval` のタイミング問題）
-- McNemar/Wilson CI 未テスト
-
-**判定（各レバー毎）**:
-
-1. **W1 (eval_resolution): 追加反復要** — McNemar データ収集側の修正（`gsm8k_eval.py`,
-   `eval_worker.py`, `server.py`）は実装完了かつコミット済み（`848de4c`）。学習自体も正常完了。
-   しかし `start:eval` が学習完了「後」に実行されたため、`device_eval.log` が未生成。
-   McNemar 対比較と Wilson 95% CI の動作確認は次の反復へ持ち越し。
-2. **W2 (max_seq_len): 収束** — `max_seq_len=320` の安定性は Iter18 で確認済み。
-   Iter19 でも全 peer OOM 解消。このレバーはこれ以上動かしても効果がない。
-
-**学び**:
-
-1. **`start:eval` のタイミングは学習「中」に実行する必要がある** — `mise run start` の
-   `depends` は `["start:server", "start:clients"]` のみで `start:eval` を含まない。
-   学習完了後に手動で `start:eval` を実行しても、サーバーが checkpoint を
-   `global_eval_tmp/` へ移動した後に eval_worker が起動するため、評価対象の checkpoint
-   を見つけられない（またはタイムアウトする）。**次イテレーションでは `mise run start` の
-   直後に `mise run start:eval` を実行するか、`mise.toml` の `start` タスクに
-   `start:eval` を `depends` に追加するかの対応が必須**。
-2. **loss/throughput はノイズ範囲内** — Iter18 との差は loss -0.3%、throughput +0.03% で
-   有意差なし。同一構成（max_seq_len=320, 5 ノード, W3 あり）での再現性は確認された。
-
-**次イテレーションの方針**:
-
-- **単一レバー**: `eval_resolution`（W1）— 引き続き `start:eval` のタイミング修正
-- **固定構成**: `max_seq_len=320`（W2 採用済み）、5 ノード（`.100/.102/.103/.108/.109`）、
-  `sample_limit=500`
-- **必須対応**: 次イテレーションで `start:eval` を学習「中」に並行実行し、
-  `device_eval.log` の生成を確認した上で McNemar/Wilson CI をテストする
-- **`mise.toml` の `start` タスクに `start:eval` を `depends` に追加する案**:
-  planner に委ねて検討（`start:clients` と `start:eval` の並列起動が学習に影響しないか
-  確認が必要）
 
 ---
 

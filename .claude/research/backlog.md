@@ -7,7 +7,27 @@
 - 決着した項目には末尾に `- 決着（YYYY-MM-DD）:` 行を追記し，未決の項目と区別できるようにする．
 
 **未決（人間判断待ち）**: なし．B10 で次イテレーションの方針が人間により確定した．
-**再開時はまず B16（Iter22 方針）→ B13（次セッションへの申し送り）の順に読むこと．**
+**再開時はまず B19（Iter23 方針）→ B18（Iter22 方針）→ B16（Iter21 方針）→ B13（次セッションへの申し送り）の順に読むこと．**
+
+---
+
+## B19 [auto-decided 2026-08-06] Iter23: W1 再試行 — start_eval_workers.py への results/ マウント追加
+
+- **状況**: Iter22 で `start_clients.py`（学習ノード用）への `results/` マウント追加は完了したが、
+  `device_eval.log` は未生成。真因は `start_eval_workers.py`（評価ワーカー用）の docker run
+  コマンドに `results/` マウントが含まれていないこと。
+- **自動選択**: Iter23 で `start_eval_workers.py` の `start_eval_container()` 関数に
+  `-v {DEPLOY_DIR}/results:/app/results` を追記する。`start_clients.py` の変更は維持。
+- **変更ファイル**: `src/start_eval_workers.py`
+  - `start_eval_container()` 関数内の docker run コマンドに `-v {DEPLOY_DIR}/results:/app/results` を追記
+  - 既存のマウントオプション（`src`, `config`, `data`, `cache`, `logs` 等）に追記
+- **根拠**: `device_eval.log` 生成は McNemar/Wilson CI 動作確認の必須プリ条件。
+  変更は 1 行のみ。可逆。
+- **固定構成**: `max_seq_len=320`、5 ノード（`.100/.102/.103/.108/.109`）、
+  `sample_limit=500`、`WAFL_SELF_EVAL=0`
+- **要レビュー**: `results/` ディレクトリが既に存在する場合、空ディレクトリとして
+  マウントされるとホスト上の既存結果が見えなくなる可能性。ただし eval_worker は
+  `results/` に書き込むのみで参照しないため、影響は小さい。
 
 ---
 

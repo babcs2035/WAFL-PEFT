@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
   "iteration": "Iter22",
-  "iteration_name": "W1 再試行: results/ コンテナマウント修正で device_eval.log 生成",
-  "phase": "investigate",
+  "iteration_name": "W1再試行: results/マウント追加 + device_eval.log未生成真因調査",
+  "phase": "reflect",
   "status": "running",
   "current_lever": "eval_resolution",
   "experiment_dir": null,
-  "experiment_deadline": null,
-  "updated_at": 1785971297,
+  "experiment_deadline": 1785977942,
+  "updated_at": 1785975703,
   "last_slack_ts": "1785960524.246589",
-  "iteration_thread_ts": "1785960917.701189",
+  "iteration_thread_ts": "1785972232.122009",
   "notion_toggle_created": true,
-  "last_commit": "a6fad5e"
+  "last_commit": "4608fee"
 }

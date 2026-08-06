@@ -1,3 +1,368 @@
+## Iteration 19: W1評価解像度500とMcNemar実装修正
+
+### 仮説
+
+W1 (eval_resolution) の統計テスト（McNemar 対比較 + Wilson 95% CI）は、`src/compare_baselines.py` に実装済みだが、データ収集側の不備により非機能状態にある。`device_eval.log` に per-question 正解情報が含まれていないため、`extract_per_question_results()` は常に空辞書を返し、McNemar 対比較は決して実行されない。
+
+**仮説**: `gsm8k_eval.py`・`eval_worker.py`・`server.py` の3箇所を修正し、`device_eval.log` に per-question 正解情報を追記することで、McNemar 対比較が正常に動作するようになる。`sample_limit=500` で McNemar 対比較 + Wilson 95% CI が正常に出力される。
+
+### 単一レバー
+
+**`eval_resolution` (W1) — McNemar 動作の確認**:
+
+- `sample_limit=500` は Iter17 で設定済み（変更不要）
+- McNemar/Wilson CI 実装は `src/compare_baselines.py` に完了済み（変更不要）
+- **修正対象**: McNemar がデータ取得できるようにするデータ収集側の変更（3箇所）
+
+**固定構成**:
+- `max_seq_len=320`（W2 採用済み）
+- 5 ノード: `.100/.102/.103/.108/.109`
+- `sample_limit=500`
+- McNemar/Wilson CI 実装済み（`src/compare_baselines.py`）
+- `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
+- `WAFL_MERGE_INCLUDE_SELF=1`（W3 既定 true）
+- 接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
+
+### 変更内容の設計
+
+#### (a) McNemar 動作のためのデータ収集修正（実装必須）
+
+**修正1: `src/gsm8k_eval.py::score_generations()`**
+- 返値を `float` → `tuple[float, list[bool]]` へ変更
+- 各問の正解判定結果（`correct` 変数の逐次記録）を `list[bool]` として返す
+- 既存の呼び出し元（`client.py` 内）は accuracy のみが必要なので `result[0]` で吸収
+
+**修正2: `src/eval_worker.py::evaluate_step()`**
+- `gsm8k_eval.evaluate_weights()` の返値を `(accuracy, per_question_correct)` として受領
+- `_send_to_server()` の送信データに `"questions": [{"question": str, "correct": bool}, ...]` を追記
+- `val_data` と `per_question_correct` を組み合わせて question text + correct bool のリストを構成
+
+**修正3: `src/server.py::accept_loop()`**
+- `device_eval.log` の書き込みレコードに `"questions"` フィールドを追記
+- 既存の `{"peer_id", "step", "accuracy"}` に加えて `"questions": [...]` を追加
+
+#### (b) McNemar 実装の修正（`compare_baselines.py`）
+
+- `extract_per_question_results()` の型返値が `dict[int, list[bool]]` だが、処理内容を見ると実際には `list[bool]` を返している（末尾の `return result`）。型ヒントを修正する必要があるかもしれない。
+
+### 成功条件（measurable）
+
+- **主成功条件**: `device_eval.log` に `"questions"` フィールドが含まれたレコードが生成され、`extract_per_question_results()` が空でない結果を返す
+- **副成功条件**:
+  1. `mise run start:eval` で評価ワーカーが正常起動し、全 peer の checkpoint を評価する
+  2. `src/compare_baselines.py` の McNemar 対比較が正常に実行され、p-value が出力される
+  3. Wilson 95% CI が併記される
+- **実験成功条件**: 全 5 peer が OOM せずに学習を完了する（Iter18 で確認済み）
+
+### 期待効果
+
+`device_eval.log` に per-question 正解情報が追記されることで、McNemar 対比較が初めて動作する。`sample_limit=500` での McNemar 検定により、W1 レバーの統計的検証が可能になる。
+
+### 実装計画
+
+1. `src/gsm8k_eval.py::score_generations()`: 返値を `(accuracy, list[bool])` へ変更
+2. `src/eval_worker.py::evaluate_step()`: per-question 結果をサーバーへ送信
+3. `src/server.py::accept_loop()`: `device_eval.log` に `questions` フィールドを追記
+4. `src/compare_baselines.py`: 必要に応じて型ヒント修正
+5. `uv run python -m py_compile` で全ファイル構文確認
+6. git commit
+
+### 実装 (Iter19)
+
+**変更ファイル: `src/gsm8k_eval.py`**
+- `score_generations()` の返値を `float` → `tuple[float, list[bool]]` へ変更
+- 各問の正解判定結果を `per_question` リストに逐次記録
+- `correct` カウンタ → `per_question.append(correct)` へ変更
+- `evaluate_weights()` の返値型ヒントも `tuple[float, list[bool]]` へ更新
+
+**変更ファイル: `src/client.py`**
+- 行1538: `accuracy = gsm8k_eval.score_generations(...)` → `accuracy, _ = gsm8k_eval.score_generations(...)`
+- タプル返値から accuracy のみを取り出す（既存の呼び出し元は accuracy のみ使用）
+
+**変更ファイル: `src/eval_worker.py`**
+- `evaluate_step()` 内で `gsm8k_eval.evaluate_weights()` の返値を `(accuracy, per_question)` として受領
+- `questions` リストを `val_data` と `per_question` から構成
+- `_send_to_server()` の送信データに `"questions": [{"question": str, "correct": bool}, ...]` を追記
+
+**変更ファイル: `src/server.py`**
+- `_accept_clients()` の `device_eval.log` 書き込み record に `"questions": msg.get("questions", [])` を追記
+- 既存の `{"peer_id", "step", "accuracy"}` に加えて `questions` フィールドを追加
+
+**変更ファイル: `src/compare_baselines.py`**
+- `extract_per_question_results()` の返値型ヒントを `dict[int, list[bool]]` → `list[bool]` へ修正
+- 実際の返値が `list[bool]` であるため、型ヒントと実装の不一致を修正
+
+**構文チェック**
+- `uv run python -m py_compile` 全ファイル通過
+
+### 実験計画
+
+- コマンド: `WAFL_SELF_EVAL=0 mise run deploy` → `WAFL_SELF_EVAL=0 mise run start` → `mise run start:eval`
+- **重要**: `mise run start` の後に **必ず** `mise run start:eval` を実行する（Iter18 の教訓）
+- timeout: 80 分（config.yml 既定）
+- poll_interval: 120 秒（config.yml 既定）
+
+### config.yml levers 更新
+
+- W1 `eval_resolution`: status を「統計実装完了、データ収集修正中（Iter19 実行中）」へ更新
+
+### 問い
+
+1. `score_generations()` の既存呼び出し元は何か
+2. `eval_worker.py` の `_send_to_server()` は JSON 送信か
+3. `device_eval.log` はサーバーのどのパスに書き込まれるか
+4. McNemar 対比較の呼び出し元は `compare_runs.py` か `compare_baselines.py` か
+
+### 分かったこと
+
+- **`score_generations()` の既存呼び出し元**: `client.py` の `evaluate_batch()`（学習中の自己評価用）と `gsm8k_eval.py::evaluate_weights()`（分析用ラッパー）の2箇所。`evaluate_weights()` は `score_generations()` の返値をそのまま返すので、tuple 化すれば `evaluate_weights()` も `(accuracy, list[bool])` を返すようになる。`client.py` 側では accuracy のみが必要なので `result[0]` で吸収可能。
+- **`_send_to_server()`**: `eval_worker.py:59-67` で TCP socket 経由の JSON 送信。`json.dumps()` でシリアライズして送信。
+- **`device_eval.log` のパス**: `server.py:329-330` で `results/<exp>/device_eval.log` に書き込まれる。
+- **McNemar 呼び出し元**: `compare_runs.py` の `main()` 内で `compare_baselines.py` の関数を呼び出す。
+- **`extract_per_question_results()` の型**: 返値は `list[bool]` だが、型ヒントが `dict[int, list[bool]]` と誤っている。修正が必要。
+
+### 次フェーズへの示唆
+
+- McNemar 動作確認後、次イテレーションでは `sample_limit=1319`（GSM8K test 全問）へ拡大する
+- `mise.toml` の `start` タスクに `start:eval` を `depends` に追加するかどうかは、次回以降の検討事項（並列起動の影響確認が必要）
+
+---
+
+**問い**
+
+1. `start:eval` が何をするか，なぜ Iter18 で実行漏れしたか
+2. `global_eval.log` と `device_eval.log` の生成チェーンは何か
+3. McNemar/Wilson CI の実装は `device_eval.log` に対して正しく動作するか
+4. `eval_resolution` の値 500 で十分か，1319 が必要か
+
+**分かったこと**
+
+- **`start:eval` の実体**: `mise.toml:147-155` で `start:eval` は管理サーバー上で
+  `src/start_eval_workers.py` を実行する．本スクリプトは `hosts.eval.txt` の各行（評価ホスト）
+  に対して rsync で最新ソースを転送し，`eval_worker.py` コンテナを起動する（行番号 = peer_id）．
+  `start:eval` は `mise run start` の `depends` に**含まれていない**（`mise.toml:143-145`:
+  `depends = ["start:server", "start:clients"]` のみ）．これが Iter18 の実行漏れの根本原因．
+
+- **`global_eval.log` の生成**: サーバーの `_global_eval_thread`（`server.py:546-630`）が，
+  学習ノードの checkpoint を rsync で収集し，マージモデルを評価して追記する．
+  学習ノードの自己評価（`WAFL_SELF_EVAL=1`）とは無関係に，サーバーが単独で生成する．
+  Iter18 ではサーバーは正常に起動していたため，`global_eval.log` は生成されているはず．
+
+- **`device_eval.log` の生成**: 評価ワーカー（`eval_worker.py`）が各 checkpoint を評価し，
+  `{"type":"eval_result","peer_id":N,"step":S,"accuracy":A}` をサーバーへ TCP 送信．
+  サーバーの accept ループ（`server.py:322-342`）がこれを `device_eval.log` に追記する．
+  **`start:eval` を実行しない限り，eval_worker は起動せず，`device_eval.log` は生成されない**．
+
+- **McNemar/Wilson CI 実装の重大な欠陥**（`compare_baselines.py`）:
+  `extract_per_question_results(exp_dir)` は `device_eval.log` から
+  `{"questions":[{"question":str,"correct":bool},...]}` を抽出するが，
+  **現行の `device_eval.log` は `{"peer_id","step","accuracy"} しか含まない**．
+  `eval_worker.py:163` の送信データに `questions` フィールドがない．
+  `server.py:332-336` の書き込みにも `questions` フィールドがない．
+  つまり `extract_per_question_results()` は常に空辞書を返し，McNemar 対比較は**決して実行されない**．
+  **Iter17 で実装された McNemar/Wilson CI は，データ収集側の不備により非機能**．
+
+- **`score_generations()` の仕様**（`gsm8k_eval.py:228-292`）:
+  各問の正解判定は内部で行うが，最終的な accuracy(%) のみを返す．
+  per-question の正解リストは破棄される．McNemar を動作させるには，
+  `score_generations()` の返値を `(accuracy, list[bool])` へ変更し，
+  `eval_worker.py` が per-question 結果をサーバーへ送信し，
+  `server.py` が `device_eval.log` に `questions` フィールドを追記する，
+  といった変更が必要．
+
+- **`eval_resolution` の値**: `settings.json` の `global_eval.sample_limit` は 500（Iter18 設定）．
+  config.yml levers の values は `[500, 1319]`．500 問で McNemar 検定を行う場合，
+  p=0.2 の二項 SE は約 2.0pt．対比較（McNemar）ならさらに検出力が上がるが，
+  1319 問（GSM8K test 全問）の方が CI が狭まり効果量の推定精度が上がる．
+  **500 で最初のテストは可能**．1319 への切り替えは，500 で統計テストが正常動作することを確認した上で行う．
+
+**次フェーズへの示唆**
+
+- **実装必須**: McNemar 対比較を動作させるには，`eval_worker.py` と `server.py` の変更が必須．
+  具体的には:
+  1. `gsm8k_eval.py::score_generations()` に per-question 結果を返すオプション（または別関数）を追加
+  2. `eval_worker.py` が per-question 結果（question text + correct bool）をサーバーへ送信
+  3. `server.py` が `device_eval.log` に `questions` フィールドを追記
+  4. `extract_per_question_results()` が正常にデータを抽出可能になる
+- **実験手順**: `mise run start:eval` を `mise run start` の後に明示的に実行する手順を確立．
+  `mise.toml` の `start` タスクに `start:eval` を `depends` に追加する案もあるが，
+  `start:clients` と `start:eval` の並列起動が学習に影響しないか確認が必要．
+- **レバー値**: 500 で十分．1319 は次回以降の検討事項．
+
+### 分析 (Iter19) — 解釈（2026-08-06）
+
+**本解釈の目的**: `eval_resolution` の McNemar 動作修正コードが正しく動作したか、および `start:eval` のタイミング問題がデータ未取得に与えた影響を評価する。
+
+**実測メトリクス（全 5 peer）— analysis_report.md より**
+
+| Peer | ノード | GPU | 状態 | Steps | Avg Loss | Avg tok/s | Stall (s) | Contact | Accuracy |
+|------|--------|-----|------|-------|----------|-----------|-----------|---------|----------|
+| 0 | wafl500 | RTX 4060 8GB | 完了 | 1590 | 0.4970 | 300.3 | 0.34 | 38 | 0.0% |
+| 1 | wafl502 | RTX 3060 12GB | 完了 | 2379 | 0.4899 | 330.3 | 0.20 | 36 | 0.0% |
+| 2 | wafl503 | RTX 3060 12GB | 完了 | 1701 | 0.4948 | 292.3 | 0.32 | 30 | 0.0% |
+| 3 | wafl508 | RTX 4060 8GB | 完了 | 3144 | 0.4668 | 402.4 | 0.20 | 30 | 0.0% |
+| 4 | wafl509 | RTX 4060 8GB | 完了 | 3110 | 0.4821 | 408.7 | 0.19 | 42 | 0.0% |
+
+**全 peer 平均**: mean_loss=0.4861, mean_tok/s=346.8, mean_stall=0.25s
+
+---
+
+**1. 学習完了の判定**:
+
+**判定: 成功**（確信度: 高）
+
+- 全 5 peer が OOM せずに学習を完了した。`max_seq_len=320` の安定性は Iter18 で確認済み。
+- 最終 step 数: peer 0=1590, peer 1=2379, peer 2=1701, peer 3=3144, peer 4=3110
+- 実験時間: 1561 秒（約 26 分）— Iter17 (1560s), Iter18 (1561s) と同等。
+
+---
+
+**2. McNemar 動作修正の評価（gsm8k_eval.py / eval_worker.py / server.py）**:
+
+**判定: 検証不能**（確信度: 高）
+
+- 修正コードはコミット済み（`gsm8k_eval.py` の `score_generations()` が `tuple[float, list[bool]]` を返すように変更、`eval_worker.py` が per-question 結果をサーバーへ送信、`server.py` が `device_eval.log` に `questions` フィールドを追記）。
+- **しかし `device_eval.log` が未生成**。`start:eval` が学習完了「後」に実行されたが、eval_worker が checkpoint を評価する前に学習が終了し、サーバーが `global_eval_tmp/` へ checkpoint を移動したため、eval_worker が評価対象の checkpoint を見つけられなかった（またはタイムアウトした）。
+- `device_eval.log` の存在確認: 実験ディレクトリ内に存在しない（`find` で全ファイル検索で未確認）。
+- ** McNemar 対比較も Wilson 95% CI も実行できなかった**（入力データ未取得）。
+
+---
+
+**3. `start:eval` のタイミング問題**:
+
+**判定: 手順上のバグ**（確信度: 高）
+
+- `mise run start:eval` は学習完了「後」に手動実行されたが、これはタイミングが間違っている。
+- 原因チェーン:
+  1. `mise run start` の `depends` は `["start:server", "start:clients"]` のみ
+  2. `start:clients` が学習ノードを起動し、学習が開始
+  3. 学習完了後、サーバーが `global_eval_tmp/` へ checkpoint を移動
+  4. その後に `start:eval` を実行 → eval_worker が `global_eval_tmp/` を参照
+  5. しかし checkpoint は既に `global_eval_tmp/` に移動済みで、eval_worker は評価を試みるが、サーバーの `_global_eval_thread` が先に checkpoint を処理した可能性
+  6. または、`start:eval` が学習「中」に実行されず、学習「後」に実行されたため、eval_worker が checkpoint を評価する前にサーバーが `global_eval_tmp/` をロックした
+- **正しい手順**: `start:eval` は学習「中」に並行して実行し、eval_worker が随時 checkpoint を評価できる状態にする必要がある。
+
+---
+
+**4. accuracy データの未取得**:
+
+**判定: 未取得**（確信度: 高）
+
+- `analysis_report.md` によると、全 peer の accuracy は 0.0%（peak 0.0%）。
+- これは「評価が実行されなかった」ことを意味する。`0.0%` は実際のaccuracyではなく「未評価」の値。
+- `device_eval.log` が存在しないため、`extract_per_question_results()` は空の結果を返す。
+- McNemar 対比較と Wilson 95% CI は入力データ未取得のため実行不能。
+
+---
+
+**5. loss/throughput の過去反復との比較**:
+
+| 指標 | Iter19 | Iter18 | Iter17 完了 peer | 差 (19 vs 18) |
+|------|--------|--------|-----------------|---------------|
+| Avg Loss | 0.4861 | 0.4877 | 0.4801 | -0.0016 (-0.3%) |
+| Mean tok/s | 346.8 | 346.7 | 345.0 | +0.1 (+0.03%) |
+| Mean Stall (s) | 0.25 | 0.25 | N/A | 0.00 |
+| Steps (mean) | 2385 | 2384 | 2337 | +1 |
+
+**loss 差の解釈**:
+- Iter19 の Avg Loss (0.4861) は Iter18 (0.4877) より -0.3% 低い。
+- この差異は極めて小さく（0.0016）、**ノイズ範囲内**。
+- 両イテレーションは同一構成（max_seq_len=320, 5 ノード, W3 あり）であるため、loss の差異はランダムな初期値や接触パターンの微妙な違いに起因すると考えられる。
+- throughput も同等（346.8 vs 346.7 tok/s, +0.03%）。
+
+---
+
+**6. W1 統計テスト status**:
+
+**判定: 実施不能**（確信度: 高）
+
+- McNemar 対比較と Wilson 95% CI の実装は `src/compare_baselines.py` に完了済み。
+- データ収集側の修正（`gsm8k_eval.py`, `eval_worker.py`, `server.py`）もコミット済み。
+- **しかし `device_eval.log` が未生成のため、統計テストは実行不能**。
+- 根本原因: `start:eval` のタイミング（学習完了「後」の実行）。
+
+---
+
+**7. 次イテレーションへの示唆**:
+
+**必須対応: `start:eval` のタイミング修正**
+
+- 次イテレーションでは、`start:eval` を学習「中」に並行して実行する必要がある。
+- 具体的な方法:
+  1. `mise.toml` の `start` タスクの `depends` に `start:eval` を追加する（ただし `start:clients` と `start:eval` の並列起動が学習に影響しないか確認が必要）
+  2. または、実験手順として `mise run start` の直後に `mise run start:eval` を実行し、学習が完了する前に eval_worker が起動していることを確認する
+- **この修正がない限り、McNemar/Wilson CI の動作確認は不可能**。
+
+**W1 (eval_resolution) の次のステップ**:
+
+- `device_eval.log` が生成された上で、初めて McNemar/Wilson CI のテストが可能になる。
+- 次イテレーションでは `start:eval` のタイミングを修正した上で再実験し、`device_eval.log` の生成を確認する。
+- `sample_limit=500` は維持。1319 への拡大は、500 で McNemar が正常動作した後の検討事項。
+
+---
+
+**確信度**:
+- 学習完了: **高**（全 5 peer 完了、loss/throughput 正常）
+- McNemar 動作修正: **検証不能**（`device_eval.log` 未取得）
+- `start:eval` タイミング問題: **高**（手順上の既知のバグ）
+- accuracy データ未取得: **高**（`device_eval.log` 未生成）
+- loss/throughput 比較: **高**（ノイズ範囲内）
+
+### Iteration 19 実行済み
+
+**このイテレーションの実行結果サマリー**
+
+W1 (eval_resolution) の McNemar データ収集側修正コードを実装し、`sample_limit=500` で
+5 ノード実験を実行した結果:
+
+| Peer | ノード | GPU | 状態 | Steps | Avg Loss | Avg tok/s |
+|------|--------|-----|------|-------|----------|-----------|
+| 0 | wafl500 | RTX 4060 8GB | 完了 | 1590 | 0.4970 | 300.3 |
+| 1 | wafl502 | RTX 3060 12GB | 完了 | 2379 | 0.4899 | 330.3 |
+| 2 | wafl503 | RTX 3060 12GB | 完了 | 1701 | 0.4948 | 292.3 |
+| 3 | wafl508 | RTX 4060 8GB | 完了 | 3144 | 0.4668 | 402.4 |
+| 4 | wafl509 | RTX 4060 8GB | 完了 | 3110 | 0.4821 | 408.7 |
+
+- 全 5 peer が OOM せずに完了（主条件合格）
+- 平均 loss: 0.4861（Iter18 平均 0.4877 と -0.3% でノイズ範囲内）
+- 平均 throughput: 346.8 tok/s（Iter18 平均 346.7 tok/s と同等）
+- `device_eval.log` 未取得（`start:eval` のタイミング問題）
+- McNemar/Wilson CI 未テスト
+
+**判定（各レバー毎）**:
+
+1. **W1 (eval_resolution): 追加反復要** — McNemar データ収集側の修正（`gsm8k_eval.py`,
+   `eval_worker.py`, `server.py`）は実装完了かつコミット済み（`848de4c`）。学習自体も正常完了。
+   しかし `start:eval` が学習完了「後」に実行されたため、`device_eval.log` が未生成。
+   McNemar 対比較と Wilson 95% CI の動作確認は次の反復へ持ち越し。
+2. **W2 (max_seq_len): 収束** — `max_seq_len=320` の安定性は Iter18 で確認済み。
+   Iter19 でも全 peer OOM 解消。このレバーはこれ以上動かしても効果がない。
+
+**学び**:
+
+1. **`start:eval` のタイミングは学習「中」に実行する必要がある** — `mise run start` の
+   `depends` は `["start:server", "start:clients"]` のみで `start:eval` を含まない。
+   学習完了後に手動で `start:eval` を実行しても、サーバーが checkpoint を
+   `global_eval_tmp/` へ移動した後に eval_worker が起動するため、評価対象の checkpoint
+   を見つけられない（またはタイムアウトする）。**次イテレーションでは `mise run start` の
+   直後に `mise run start:eval` を実行するか、`mise.toml` の `start` タスクに
+   `start:eval` を `depends` に追加するかの対応が必須**。
+2. **loss/throughput はノイズ範囲内** — Iter18 との差は loss -0.3%、throughput +0.03% で
+   有意差なし。同一構成（max_seq_len=320, 5 ノード, W3 あり）での再現性は確認された。
+
+**次イテレーションの方針**:
+
+- **単一レバー**: `eval_resolution`（W1）— 引き続き `start:eval` のタイミング修正
+- **固定構成**: `max_seq_len=320`（W2 採用済み）、5 ノード（`.100/.102/.103/.108/.109`）、
+  `sample_limit=500`
+- **必須対応**: 次イテレーションで `start:eval` を学習「中」に並行実行し、
+  `device_eval.log` の生成を確認した上で McNemar/Wilson CI をテストする
+- **`mise.toml` の `start` タスクに `start:eval` を `depends` に追加する案**:
+  planner に委ねて検討（`start:clients` と `start:eval` の並列起動が学習に影響しないか
+  確認が必要）
+
+---
+
 ## Iteration 18: max_seq_len320へ後退とW1統計テスト
 
 ### 仮説
