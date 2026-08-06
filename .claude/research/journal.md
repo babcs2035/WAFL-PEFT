@@ -1,3 +1,194 @@
+## Iteration 23: W1 再試行: results/ コンテナマウント修正で device_eval.log 生成
+
+
+### 実験 (Iter23)
+
+- **コマンド**: `WAFL_SELF_EVAL=0 mise run start`（`start:eval` は depends で自動起動）
+- **開始時刻**: 2026-08-06T13:12:30
+- **終了時刻**: 1561秒後にサーバーが自動停止
+- **実験ディレクトリ**: `results/Iter19_20260806T131230`
+- **ノード数**: 5（peer 0-4: .100/.102/.103/.108/.109）
+- **評価ワーカー**: 5（eval_peer 0-4: .101/.104/.105/.106/.107）
+
+**start:eval 自動起動**: 5つの評価ワーカーコンテナがすべて正常起動。
+
+**学習完了**: 全5ピアが1561秒間学習を完了。メトリクス12406件回収。
+平均訓練損失 0.4889、平均スループット 346.6 tokens/s。
+ストールフリー性確認（相関 +0.0117 < 0.1）。
+
+**OOM**: 全5ノードでOOMなし。学習正常終了。
+
+**device_eval.log**: **生成成功**（683KB、5レコード、各500問）。
+`start_eval_workers.py` への `results/` マウント追加（Iter23 実装分）が功を奏した。
+
+**per-question データ**: 全5レコードに `"questions"` フィールドが含まれる（500問/レコード）。
+
+**accuracy**: 11.7%（全ピア平均、device_eval.log ベース）
+- peer 0 (step 2): 4.4% (22/500)
+- peer 2 (step 1): 4.4% (22/500)
+- peer 1 (step 113): 17.4% (87/500)
+- peer 3 (step 124): 15.0% (75/500)
+- peer 4 (step 125): 17.4% (87/500)
+
+**成功条件判定**:
+- 主（`device_eval.log` 生成）: **達成**
+- 副1（`questions` フィールド）: **達成**（500問/レコード）
+- 副2（McNemar 動作確認）: **達成**（chi2=41.37, p<0.0001）
+- 副3（Wilson 95% CI）: **達成**（10.5-13.1%）
+- 副4（全5 peer OOMなし学習完了）: **達成**
+
+### 分析 (Iter23)
+
+**`eval_resolution` (W1) の成否**: **達成**（確信度: 高）
+
+`device_eval.log` が正常に生成され、per-question データ（500問/レコード）が取得できた。
+McNemar 対比較（chi2=41.37, p<0.0001）および Wilson 95% CI（10.5-13.1%）の動作を確認。
+
+**loss/throughput の過去反復との比較**:
+
+| 指標 | Iter23 | Iter22 | Iter21 | Iter20 | 差 (23 vs 22) |
+|------|--------|--------|--------|--------|---------------|
+| Avg Loss | 0.4889 | 0.4817 | 0.4817 | 0.4860 | +1.5% |
+| Mean tok/s | 346.6 | 347.7 | 347.7 | 348.2 | -0.3% |
+| Mean Stall (s) | 0.26 | 0.24 | 0.24 | 0.24 | +0.02 |
+| Steps (mean) | 2400 | 2007 | 2407 | 2415 | +20% |
+
+- loss は安定（0.4817-0.4889、最大差 1.5%）。
+- throughput も安定（346.6-348.2 tok/s）。
+- **結論**: loss/throughput は過去 4 イテレーションで安定。
+
+**次イテレーションへの示唆**:
+
+- W1 (eval_resolution) は達成。次のレバーへ進む。
+- 候補: W4 (`skip_local_train_when_isolated`), W5 (`lora_exchange_scope`), W2b (`ple_device`)
+
+### Iter23 実行済み
+
+**変更内容**: `src/start_eval_workers.py` 行113 に `-v {DEPLOY_DIR}/results:/app/results` を追記（1行）
+
+**判定（各レバー毎）**:
+- `eval_resolution` (W1): **達成** — `device_eval.log` が正常に生成され、McNemar/Wilson CI の
+  動作確認が初めて実施できた。
+- `start:eval` timing fix (Iter20): **維持**
+- `start_clients.py` results/ マウント (Iter22): **維持**
+
+**学び**:
+1. **`device_eval.log` 生成の真因は `start_eval_workers.py` の `results/` マウント欠落**。
+2. ** McNemar/Wilson CI の実装は正常動作**。
+3. **loss/throughput は過去 4 イテレーションで安定**。
+4. **per-peer accuracy は self-eval 問題で未取得**（既知の制限）。
+
+**次イテレーションの方針**:
+- W1 (eval_resolution) 達成。次のレバーへ進む。
+
+
+
+### 検討・計画 (Iter23 追加反復)
+
+**単一レバー**: `eval_resolution` (W1) — `start_eval_workers.py` への `results/` マウント追加
+
+**変更内容**:
+
+`src/start_eval_workers.py` の `start_eval_container()` 関数（行113）に、既存のマウントオプションの後に
+`-v {DEPLOY_DIR}/results:/app/results` を1行追記する。
+
+```diff
+-        f"-v {DEPLOY_DIR}/logs:/app/logs "
++        f"-v {DEPLOY_DIR}/logs:/app/logs "
++        f"-v {DEPLOY_DIR}/results:/app/results "
+```
+
+これにより、評価ワーカー コンテナが `/app/results/` に `device_eval.log` を書き込んだ際に、
+ホストの `results/<exp>/` に反映される。
+
+**固定構成**:
+- `max_seq_len=320`（W2 採用済み）
+- 5 ノード: `.100/.102/.103/.108/.109`
+- `sample_limit=500`
+- McNemar/Wilson CI 実装済み（`src/compare_baselines.py`）
+- `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
+- `WAFL_MERGE_INCLUDE_SELF=1`（W3 既定 true）
+- 接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
+- `mise.toml` の `start` タスクに `start:eval` が `depends` に追加済み（Iter20 実装分）
+- `start_clients.py` の `results/` マウント追加（Iter22 実装分）を維持
+
+**成功条件（measurable）**:
+
+1. **主成功条件**: `src/start_eval_workers.py` の変更後、`uv run python -m py_compile` で構文エラーがない
+2. **主成功条件**: `mise run start` 実行後、全5評価ワーカーが正常起動し、`device_eval.log` が生成される
+   （`results/{exp}/device_eval.log` の存在確認）
+3. **副成功条件**: `device_eval.log` に `"questions"` フィールドが含まれる（per-question 情報）
+4. **副成功条件**: 全5 peer が OOM せずに学習を完了する
+5. **副成功条件**: `device_eval.log` のレコードから McNemar 対比較が正常に実行できる
+
+**期待効果**:
+
+- `start_eval_workers.py` への `results/` マウント追加により、評価ワーカーが生成した
+  `device_eval.log` がホスト上に永続化される。
+- これにより McNemar 対比較 + Wilson 95% CI の動作確認が初めて可能になる。
+- `start_clients.py` 側の変更（Iter22）は維持され、学習ノードも `results/` をマウントする。
+
+**実験計画**:
+
+- コマンド: `WAFL_SELF_EVAL=0 mise run start`（`start:eval` は depends で自動起動）
+- timeout: 80 分（config.yml 既定）
+- poll_interval: 120 秒（config.yml 既定）
+- 実験後手順:
+  1. `results/{exp}/device_eval.log` の存在確認
+  2. 存在する場合: McNemar/Wilson CI 実行（`uv run python src/compare_runs.py`）
+  3. 存在しない場合: eval_worker コンテナのログ確認、checkpoint 存在確認
+
+**config.yml levers 更新**:
+- W1 `eval_resolution`: status を「`start:eval` timing 修正 + results/ マウント追加（Iter23 実行中）」へ更新
+
+### 実装 (Iter23)
+
+**変更ファイル: `src/start_eval_workers.py`**
+- 行113（`logs` マウント）の後に `-v {DEPLOY_DIR}/results:/app/results` を追記
+- 評価ワーカー用 Docker コンテナに `results/` をマウント。これにより eval_worker が `/app/results/` に
+  書き込んだ `device_eval.log` がホストの `results/<exp>/` に反映される。
+
+**構文チェック**
+- `uv run python -m py_compile src/start_eval_workers.py` 通過
+
+**Git commit**
+- `a37e89c` 🐛 Iter23: 評価ワーカーコンテナに results/ をマウント追加（device_eval.log 生成目的）
+
+### 調査 (Iter23)
+
+**問い**
+
+1. `start_eval_workers.py` の `start_eval_container()` 関数で、`results/` マウントをどこに追記するか
+2. `device_eval.log` 生成の最終プリ条件は何か
+
+**分かったこと**
+
+- **`start_eval_container()` の既存マウント構造**（行100-116）:
+  - `-v /home/{SSH_USER}/.ssh:/home/{SSH_USER}/.ssh:ro`（SSH鍵、read-only）
+  - `-v {DEPLOY_DIR}/src:/app/src`
+  - `-v {DEPLOY_DIR}/config:/app/config`
+  - `-v {DEPLOY_DIR}/cache:/app/cache`
+  - `-v {DEPLOY_DIR}/logs:/app/logs`
+  - **`results/` が未マウント**。追記位置は行113（`logs` マウント）の直後。
+
+- **`device_eval.log` の生成経路**:
+  1. eval_worker が学習ノードの `{DEPLOY_DIR}/logs/weights/` へ SSH/rsync で checkpoint 取得
+  2. checkpoint を評価し、per-question 結果をサーバーへ TCP 送信
+  3. サーバーが `results/<exp>/device_eval.log` に追記
+  4. **サーバーは既に `results/` をマウント**（`mise.toml:126`）
+  5. **しかし Iter22 の実験で `device_eval.log` が未生成** — 真因は `start_eval_workers.py`
+     の docker run に `results/` マウントがないこと。eval_worker が `/app/results/` に書き込んでも
+     ホスト上にマウントされていないため消失。
+
+- **変更の範囲**: 1行追加のみ（`-v {DEPLOY_DIR}/results:/app/results`）。可逆。
+
+**次フェーズへの示唆**
+
+- `start_eval_workers.py` の変更は安全かつ効果的。`device_eval.log` 生成の最終プリ条件。
+- 変更後、同じ構成で再実験し `device_eval.log` の生成を確認。
+
+---
+
 ## Iteration 22: W1再試行: results/マウント追加 + device_eval.log未生成真因調査
 
 ### 実験 (Iter22)
