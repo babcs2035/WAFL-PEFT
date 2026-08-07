@@ -216,7 +216,7 @@ class SharedState:
 
         self.merge_queue: queue.Queue[dict[str, torch.Tensor]] = queue.Queue(maxsize=32)
 
-        self.metrics_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8192)
+        self.metrics_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=65536)
 
         self.checkpoint_elapsed: dict[int, float] = {}
 
