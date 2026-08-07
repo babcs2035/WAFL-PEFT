@@ -40,7 +40,7 @@ journal_retention: 3
 #                               server → device_eval.log に questions 追記）を実施
 #   W2 max_seq_len            : 512 で OOM 確認（RTX 4060 8GB）．320 を採用（Iter18 完了．収束）
 #   W3 merge_include_self     : **採用済み**（Iter16）．既定 WAFL_MERGE_INCLUDE_SELF=1 で固定．レバーとして振らない
-#   W4 skip_local_train_when_isolated : 未着手
+#   W4 skip_local_train_when_isolated : 部分的達成（Iter24）— 実装動作確認済み。メトリクスバグにより loss/throughput 比較不能。次イテレーションでバグ修正後、W4 なしとの対比実験を実施
 #   W5 lora_exchange_scope    : 未着手（前提の F3 = lora_A のノード毎初期値差 は未修正）
 #   W6 alternating_merge_interval : 未着手
 #   W2b ple_device            : 未着手（W2 が OOM したときの前提条件）
