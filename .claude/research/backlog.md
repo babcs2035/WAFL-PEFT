@@ -7,7 +7,48 @@
 - 決着した項目には末尾に `- 決着（YYYY-MM-DD）:` 行を追記し，未決の項目と区別できるようにする．
 
 **未決（人間判断待ち）**: なし．B10 で次イテレーションの方針が人間により確定した．
-**再開時はまず B19（Iter23 方針）→ B18（Iter22 方針）→ B16（Iter21 方針）→ B13（次セッションへの申し送り）の順に読むこと．**
+**再開時はまず B20（Iter25 方針）→ B19（Iter23 方針）→ B18（Iter22 方針）→ B16（Iter21 方針）→ B13（次セッションへの申し送り）の順に読むこと．**
+
+---
+
+## B20 [auto-decided 2026-08-07] Iter25: W4 継続 — メトリクスバグ修正 + baseline 対比実験
+
+- **状況**: Iter24 で W4（`skip_local_train_when_isolated`）を実装・実験した。実装動作は確認
+  された（OOM なし、accuracy 27.8%）が、`metrics_peer_X_final.log` が全 peer で未生成。
+  loss/throughput/stall_duration/contact_events が全て未取得のため、W4 の独自効果を判定不能。
+
+- **自動選択**: Iter25 で以下の 2 点を行う。
+  (1) **メトリクスバグ修正**: `src/client.py` の `async_logging_thread` が正しくファイルに
+      書き出しているか、`collect_logs.py` の rsync 経路が正しいかを確認・修正。
+      修正後、同じ W4 構成で再実験し、`metrics_peer_X_final.log` の生成を確認。
+  (2) **baseline 対比実験**: メトリクスバグ修正後、`WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=0`
+      （W4 なし）で control 実験を実施。W4 あり/なしの loss/throughput/accuracy を比較。
+
+- **変更ファイル**: `src/client.py`（`async_logging_thread` のファイルパス確認）、
+  `src/collect_logs.py`（rsync 経路確認）。必要に応じて `src/start_clients.py`（マウント確認）。
+
+- **根拠**: メトリクス欠落は W4 起因ではない（`continue` の配置は正しい）。
+  Iter20〜24 の全イテレーションで同様の現象。既存の不具合を先に修正しないと、
+  W4 の効果測定そのものが不能。
+
+- **固定構成**: `max_seq_len=320`、5 ノード（`.100/.102/.103/.108/.109`）、
+  `sample_limit=500`、`WAFL_SELF_EVAL=0`、`WAFL_MERGE_INCLUDE_SELF=1`、
+  接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
+
+- **対比実験設計**:
+  - control: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=0`（孤立時も学習継続）
+  - treatment: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1`（孤立時学習スキップ）
+  - 同一接触パターン、同一ノード構成で実施
+  - 比較指標: loss 曲線、throughput、accuracy（device_eval.log 由来）
+
+- **要レビュー**: メトリクスバグの真因は未特定。planner が実験前に以下の経路を確認すること:
+  (a) コンテナ内の `Path.cwd()` が `/app` であるか
+  (b) `async_logging_thread` が `/app/logs/metrics_peer_X.log` を書き出しているか
+  (c) `collect_logs.py` の rsync が `{DEPLOY_DIR}/logs/` から正しく回収しているか
+  (d) コンテナ起動時の `-v {DEPLOY_DIR}/logs:/app/logs` が有効か
+
+- **決着（2026-08-07）**: reflector が W4 を「部分的達成」と判定。メトリクスバグは W4 起因
+  ではなく既存不備。次イテレーションで修正後、対比実験へ。
 
 ---
 
