@@ -33,7 +33,7 @@
   },
   "experiment": {
     "experiment_name": "Iter19",
-    "contact_pattern_file": "rwp_n05_a0500_r100_p10_s42.json"
+    "contact_pattern_file": "rwp_n03_a0500_r100_p10_s42.json"
   },
   "global_eval": {
     "interval_seconds": 120,

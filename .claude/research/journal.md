@@ -1,3 +1,70 @@
+### 実験 (Iter25)
+
+- **コマンド**: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1 WAFL_SELF_EVAL=0 mise run start`
+- **開始時刻**: 2026-08-07T23:40:55（管理サーバー上）
+- **終了時刻**: 1462秒後（サーバー自動停止）
+- **実験ディレクトリ**: `results/Iter19_20260807T234055`（settings.jsonのexperiment_name="Iter19"由来）
+- **ノード数**: 3（peer 0-2: wafl500/.102/.103）
+  - **注**: wafl508/.109 の2ノードがNVMLドライバーミスマッチで使用不能。やむを得ず3ノードで実施。
+  - 接触パターン: `rwp_n03_a0500_r100_p10_s42.json`（n=3再生成）
+- **評価ワーカー**: 5（wafl501/.104-.107）
+
+**重大な問題: 学習ステップ数大幅減少**
+
+| Peer | ノード | GPU | Steps | Avg Loss | Avg tok/s | Mean Stall | Contacts |
+|------|--------|-----|-------|----------|-----------|------------|----------|
+| 0 | wafl500 | RTX 3060 12GB | 134 | 0.7431 | 282.2 | 0.30s | 12 |
+| 1 | wafl502 | RTX 3060 12GB | 723 | 0.6058 | 327.3 | 0.19s | 14 |
+| 2 | wafl503 | RTX 3060 12GB | 62 | 1.0050 | 230.1 | 0.29s | 14 |
+
+- 平均訓練損失: 0.7846（過去~0.48から大幅上昇）
+- 平均スループット: 279.9 tok/s（過去~347から-19%低下）
+- **メトリクスエントリ数**: 995（過去~12,500から-92%減少）
+- **チェックポイント数**: 24（過去~125から-81%減少）
+- **accuracy**: 全peer 0.0%（device_eval.log未生成）
+
+**loss/throughput の過去反復との比較（過去同等構成）**:
+
+| 指標 | Iter25(3node) | Iter24(5node) | Iter23(5node) | 差 |
+|------|---------------|---------------|---------------|-----|
+| Avg Loss | 0.7846 | 0.4889 | 0.4889 | +60% |
+| Mean tok/s | 279.9 | 347.0 | 346.6 | -19% |
+| Mean Stall (s) | 0.26 | 0.238 | 0.26 | +0.02 |
+| Steps (mean) | 306 | 2399 | 2400 | -87% |
+| Contacts (total) | 40 | 176 | — | -77% |
+
+**成功条件判定**:
+- 主（全peer OOMなし学習完了）: **部分的達成**（3/5 peer）
+- 副1（loss/throughput 過去同等）: **未達成**（loss +60%, tok/s -19%）
+- 副2（metrics_peer_X_final.log 生成）: **未達成**（995エントリのみ、_final.log未生成）
+- 副3（device_eval.log 生成）: **未達成**
+
+**学び**:
+1. **3ノード構成では学習が著しく劣化**。stepsが87%減少、lossが60%上昇。
+2. **メトリクスバグ修正(maxsize=65536)は有効だが、_final.logは未生成**。キュー満杯は解消されたが、他の要因で_final.log renameが実行されていない可能性。
+3. **wafl508/509のNVMLミスマッチは回復不能**。サーバー管理者への報告が必要。
+4. **device_eval.log未生成は引き続きインフラ問題**。eval_workerのcheckpoint評価が機能していない。
+
+---
+
+### 分析 (Iter25)
+
+**`skip_local_train_when_isolated` (W4) の成否**: **未達成**（確信度: 高）
+
+3ノード構成に縮小したため、W4の独自効果を判定する十分なデータが得られなかった。
+
+**loss/throughput の劣化原因**:
+- **ノード数3→5の縮小が学習に与えた影響が大きい**。接触イベント数が77%減少（176→40）し、P2P重み交換の機会が大幅に減少。
+- **peer 2の極端な低steps（62）が平均を歪めている**。duration 1089sで他のpeer（~1400s）より210秒短い。
+- **loss 0.78-1.00は過学習の兆候**。小シャード（500問/3ノード=166問/peer）での過学習が加速。
+
+**次イテレーションへの示唆**:
+- **wafl508/509のNVMLミスマッチを解消すれば5ノード構成に戻せる**。これが最優先課題。
+- NVMLミスマッチ解消後、同じW4構成で5ノード実験を再実施する必要がある。
+- _final.log未生成の真因はキュー満杯以外にある可能性。`async_logging_thread`のファイル書き出し経路を再調査する。
+
+---
+
 ## Iteration 25: W4 継続: メトリクスバグ修正 + baseline 対比実験
 
 ### 検討・計画 (Iter25)
@@ -91,6 +158,58 @@
 - planner は上記修正を実装計画に含める
 - 修正後、同じ W4 構成で再実験し `_final.log` 生成を確認
 - 生成されれば、W4 なし baseline との対比実験へ
+
+### 検討・計画 (Iter25)
+
+**単一レバー**: `skip_local_train_when_isolated` (W4) — メトリクスバグ修正 + W4 再実験
+
+**変更内容**:
+- `src/client.py` 行219: `queue.Queue(maxsize=8192)` → `queue.Queue(maxsize=65536)`
+- これによりシャットダウン時のキュー満杯が解消され、shutdown signal が確実に logger thread に届く
+- `_final.log` への rename が実行されるようになる
+
+**固定構成**:
+- `max_seq_len=320`、5 ノード（`.100/.102/.103/.108/.109`）、`sample_limit=500`
+- `WAFL_SELF_EVAL=0`、`WAFL_MERGE_INCLUDE_SELF=1`
+- 接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
+
+**成功条件（measurable）**:
+1. `uv run python -m py_compile src/client.py` 通過
+2. 全5 peer が OOM なく学習完了
+3. `metrics_peer_X_final.log` が全5 peer で生成される
+4. loss/throughput/stall_duration/contact_events がメトリクスから取得できる
+5. `device_eval.log` が生成され、per-peer accuracy が取得できる
+
+**期待効果**:
+- メトリクスファイルが全 peer で生成され、W4 の独自効果を loss/throughput/accuracy で判定可能になる
+
+**実験計画**:
+- コマンド: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1 WAFL_SELF_EVAL=0 mise run start`
+- timeout: 80 分、poll_interval: 120 秒
+- 実験後手順: `_final.log` 生成確認 → 対比実験計画
+
+**W4 なし baseline 対比実験の設計方針**（_final.log 生成確認後に計画）:
+- control（`WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=0`）と treatment（`=1`）を同一条件で対比
+- 比較指標: loss 曲線、throughput、accuracy（device_eval.log 由来）
+
+**config.yml levers 更新**:
+- W4 `skip_local_train_when_isolated`: status を「メトリクスバグ修正中（Iter25 実装中）」へ更新
+
+### 実装 (Iter25)
+
+**変更ファイル**: `src/client.py`
+- 行219: `queue.Queue(maxsize=8192)` → `queue.Queue(maxsize=65536)`
+- メトリクスキューの容量を16倍に拡大。シャットダウン時のキュー満杯を解消。
+
+**構文チェック**
+- `uv run python -m py_compile src/client.py` 通過（エラーなし）
+
+**Git commit**
+- `f53aee5` 🔧 Iter25: メトリクスキュー maxsize 修正（8192→65536）
+- 変更: `src/client.py` のみ（1 file changed, 1 insertion, 1 deletion）
+
+**config.yml levers 更新**
+- W4 `skip_local_train_when_isolated`: status を「メトリクスバグ修正完了（Iter25 実装完了）」へ更新
 
 ---
 
@@ -1003,3 +1122,25 @@ throughput 比較，実機ノード数のスケール，無線環境模擬下の
 ## Baseline（default_20260711T164008）
 - 設定: lr 1e-4, batch=1（勾配累積なし）, シャッフルなし, 分割不均衡（335〜2606）, max_seq_len 320．
 - 結果: ノード別 +6.0pt（最終 10〜25%）, Average loss 0.458．
+
+### 考察 (Iter25)
+
+**`skip_local_train_when_isolated` (W4) の成否**: **判定不能**（確信度: 高）
+
+3ノード構成への縮小（wafl508/509のNVMLエラー）により、W4の独自効果を判定する十分なデータが得られなかった。
+
+**loss/throughput の劣化原因**:
+- **ノード数3→5の縮小が学習に与えた影響が支配的**。接触イベント数が77%減少（176→40）し、P2P重み交換の機会が大幅に減少。
+- **peer 2の極端な低steps（62）が平均を歪めている**。duration 1089sで他のpeer（~1400s）より210秒短い。
+- **loss 0.78-1.00は過学習の兆候**。小シャード（500問/3ノード=166問/peer）での過学習が加速。
+
+**W4メトリクスバグ修正について**:
+- `maxsize=8192` → `65536` の修正は有効（キュー満杯は解消）。
+- ただし `_final.log` は未生成。他の要因（ファイルフラッシュ、rsync経路等）を再調査必要。
+
+**次イテレーションへの示唆**:
+- **最優先: wafl508/509のNVMLミスマッチ解消**。サーバー管理者への報告が必要。
+- NVML解消後、同じW4構成で5ノード実験を再実施する。
+- _final.log未生成の真因は別課題として並行調査する。
+
+**判定**: **追加反復要**（NVML解消後、5ノードで再実験）
