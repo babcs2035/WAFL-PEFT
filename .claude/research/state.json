@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
   "iteration": "Iter25",
-  "iteration_name": "W4 継続: メトリクスバグ修正 + baseline 対比実験",
+  "iteration_name": "W4 \u7d99\u7d9a: \u30e1\u30c8\u30ea\u30af\u30b9\u30d0\u30b0\u4fee\u6b63 + baseline \u5bfe\u6bd4\u5b9f\u9a13",
   "phase": "reflect",
   "status": "running",
   "current_lever": "skip_local_train_when_isolated",
   "experiment_dir": "results/Iter19_20260806T142628",
   "experiment_deadline": 1785999000,
-  "updated_at": 1754539200,
+  "updated_at": 1786071357,
   "last_slack_ts": null,
   "iteration_thread_ts": "1785992566.442939",
   "notion_toggle_created": true,
-  "last_commit": "f560c46"
+  "last_commit": "35eb0f1"
 }

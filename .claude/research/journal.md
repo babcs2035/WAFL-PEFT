@@ -1,3 +1,5 @@
+## Iteration 25: W4 継続: メトリクスバグ修正 + baseline 対比実験
+
 ## Iteration 24: W4: skip_local_train_when_isolated 着手
 
 ### 分析 (Iter24) — 実行（2026-08-07）
