@@ -1,5 +1,99 @@
 ## Iteration 25: W4 継続: メトリクスバグ修正 + baseline 対比実験
 
+### 検討・計画 (Iter25)
+
+**単一レバー**: `skip_local_train_when_isolated` (W4) — メトリクスバグ修正 + W4 再実験
+
+**変更内容**:
+
+`src/client.py` 行219: `queue.Queue(maxsize=8192)` → `queue.Queue(maxsize=65536)`
+
+- **根拠**: investigator が根本原因を特定（Iter25 調査セクション参照）
+  - 実験中に生成されるメトリクスの総数: ~12,900+（訓練 ~12,500 + チェックポイント ~125 + 接触 ~176 + マージ ~17 + 評価 ~124）
+  - キュー容量(8,192) < 総メトリクス数(12,900+) → 実験終盤でキュー満杯
+  - シャットダウン時、`put(None, timeout=30.0)` がキュー満杯時に30秒ブロック → `queue.Full` 例外 → logger thread への shutdown signal が届かず、`_final.log` への rename が実行されない
+- **修正値の選定理由**: 65536 は現在の総メトリクス数(12,900+)の約5倍。将来メトリクスが増加しても余裕がある。`maxsize=0`（無制限）も候補だが、メモリリークのリスクを避けるため有限値を採用。
+- **変更箇所**: 1行のみ（行219）。可逆。
+
+**固定構成**:
+- `max_seq_len=320`（W2 採用済み）
+- 5 ノード: `.100/.102/.103/.108/.109`
+- `sample_limit=500`
+- `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
+- `WAFL_MERGE_INCLUDE_SELF=1`（W3 既定 true）
+- 接触パターン n=5（`rwp_n05_a0500_r100_p10_s42.json`）
+- `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1`（W4 treatment）
+
+**成功条件（measurable）**:
+
+1. **主成功条件**: `src/client.py` の変更後、`uv run python -m py_compile src/client.py` で構文エラーがない
+2. **主成功条件**: `mise run start` 実行後、全5 peer が OOM せずに学習を完了する
+3. **主成功条件**: `metrics_peer_X_final.log` が全5 peer で生成される（`results/{exp}/metrics_peer_0_final.log` 〜 `metrics_peer_4_final.log` の存在確認）
+4. **副成功条件**: メトリクスから loss/throughput/stall_duration/contact_events が取得できる
+5. **副成功条件**: device_eval.log が生成される（per-peer accuracy 取得）
+
+**期待効果**:
+
+- キュー容量の修正により、シャットダウン時に shutdown signal が確実に logger thread に届く
+- `_final.log` が生成され、loss/throughput の定量評価が可能になる
+- W4 treatment（孤立時学習スキップ）の効果を loss/throughput/accuracy の全指標で測定可能になる
+
+**実験計画**:
+
+- コマンド: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1 WAFL_SELF_EVAL=0 mise run start`
+- timeout: 80 分（config.yml 既定）
+- poll_interval: 120 秒（config.yml 既定）
+- 実験後手順:
+  1. `results/{exp}/metrics_peer_0_final.log` 〜 `metrics_peer_4_final.log` の存在確認
+  2. 生成されていれば: loss/throughput/stall_duration/contact_events を抽出
+  3. device_eval.log の存在確認と per-peer accuracy の抽出
+  4. 生成されていない場合: client.py の変更箇所を再確認、キュー満杯の再発可能性を調査
+
+**W4 なし baseline 対比実験の設計方針（_final.log 生成確認後に計画）**:
+
+- control: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=0`（孤立時も学習継続）
+- treatment: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1`（孤立時学習スキップ）
+- 同一接触パターン、同一ノード構成で実施
+- 比較指標: loss 曲線、throughput、accuracy（device_eval.log 由来）
+- 成功条件: treatment の loss が control より低く、throughput が同等以上、accuracy が +2pt 以上改善（W1 完了前の暫定基準）
+
+**config.yml levers 更新**:
+- W4 `skip_local_train_when_isolated`: status を「メトリクスバグ修正中（Iter25）」へ更新
+
+### 調査 (Iter25)
+
+**問い**
+1. `async_logging_thread` は実際にファイルに書き出しているか
+2. `collect_logs.py` の rsync 経路は正しいか
+3. コンテナ起動時の `-v {DEPLOY_DIR}/logs:/app/logs` は有効か
+4. W4 の `continue` がメトリクス出力に与える影響は
+
+**分かったこと**
+
+- **(a) コンテナ内の `Path.cwd()` は `/app` である**（Dockerfile 行20: `WORKDIR /app`、client.py 行106: `BASE_DIR = Path("/app")`）
+- **(b) `async_logging_thread` の書き出し処理は正しいが、`_final.log` への rename が実行されない**（client.py 行1430: metric_log_path 生成、行1459-1463: shutdown 時に rename。ただし rename 対象の `.log` ファイル自体がホスト上に存在しない）
+- **(c) `collect_logs.py` の rsync 経路は正しいが、ソースディレクトリが空**（全 peer `logs/peer_X/` が 0 ファイル）
+- **(d) コンテナ起動時の `-v {DEPLOY_DIR}/logs:/app/logs` は有効**（チェックポイントが `{DEPLOY_DIR}/logs/weights/` に保存・rsync 回収されている）
+
+**根本原因の特定**:
+
+- **`queue.Queue(maxsize=8192)` が小さすぎる**（client.py 行219）
+- 実験中に生成されるメトリクスの総数: ~12,900+（訓練 ~12,500 + チェックポイント ~125 + 接触 ~176 + マージ ~17 + 評価 ~124）
+- キュー容量(8,192) < 総メトリクス数(12,900+) → 実験終盤でキュー満杯
+- シャットダウン時、キュー満杯で shutdown signal が logger に届かず、`_final.log` rename が実行されない
+- 検証: 行1750 `state.metrics_queue.put(None, timeout=30.0)` がキュー満杯時に30秒ブロック→タイムアウト→`queue.Full` 例外 → logger が rename する前に main() が異常終了
+
+**修正提案**:
+- `client.py` 行219: `queue.Queue(maxsize=8192)` → `queue.Queue(maxsize=65536)` （または `maxsize=0` で無制限）
+- これによりシャットダウン時のキュー満杯が解消され、shutdown signal が確実に logger に届く
+
+**次フェーズへの示唆**:
+- planner は上記修正を実装計画に含める
+- 修正後、同じ W4 構成で再実験し `_final.log` 生成を確認
+- 生成されれば、W4 なし baseline との対比実験へ
+
+---
+
 ## Iteration 24: W4: skip_local_train_when_isolated 着手
 
 ### 分析 (Iter24) — 実行（2026-08-07）
