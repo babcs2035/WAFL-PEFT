@@ -96,7 +96,7 @@ levers:
             process should be skipped because it causes over-fitting to the local dataset』と明記されている．
             現行実装が孤立時も局所学習を続けているなら，『小シャード由来の過学習』という既存の判定は
             この未実装に起因する可能性がある．接触窓 1500s→3000s の悪化とも整合する",
-     status: "部分的達成（Iter24） — 実装動作確認（OOMなし、accuracy 27.8%）。ただしメトリクスファイル未生成により loss/throughput 比較不能。メトリクスバグ修正後、W4 なし baseline との対比実験を実施予定"}
+     status: "メトリクスバグ修正完了（Iter25 実装完了）"}
 
   # --- W5/W6: LoRA 集約の改良．W1 完了後に着手する ---
   - {name: lora_exchange_scope, values: [lora_A_only],
