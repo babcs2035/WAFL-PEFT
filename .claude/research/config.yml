@@ -40,7 +40,9 @@ journal_retention: 3
 #                               server → device_eval.log に questions 追記）を実施
 #   W2 max_seq_len            : 512 で OOM 確認（RTX 4060 8GB）．320 を採用（Iter18 完了．収束）
 #   W3 merge_include_self     : **採用済み**（Iter16）．既定 WAFL_MERGE_INCLUDE_SELF=1 で固定．レバーとして振らない
-#   W4 skip_local_train_when_isolated : 部分的達成（Iter24）— 実装動作確認済み。メトリクスバグにより loss/throughput 比較不能。次イテレーションでバグ修正後、W4 なしとの対比実験を実施
+#   W4 skip_local_train_when_isolated : 実装済み・メトリクスバグ修正済み（Iter24/25）．baseline 対比実験を
+#                               5ノード（.100/.101/.102/.103/.104．評価専用ホスト .101/.104 を転用）で
+#                               投入準備完了（Iter26）．未投入（mise deploy 未実行）
 #   W5 lora_exchange_scope    : 未着手（前提の F3 = lora_A のノード毎初期値差 は未修正）
 #   W6 alternating_merge_interval : 未着手
 #   W2b ple_device            : 未着手（W2 が OOM したときの前提条件）
@@ -96,7 +98,9 @@ levers:
             process should be skipped because it causes over-fitting to the local dataset』と明記されている．
             現行実装が孤立時も局所学習を続けているなら，『小シャード由来の過学習』という既存の判定は
             この未実装に起因する可能性がある．接触窓 1500s→3000s の悪化とも整合する",
-     status: "メトリクスバグ修正完了（Iter25 実装完了）"}
+     status: "baseline 対比実験投入準備完了（Iter26）．評価専用ホスト .101/.104 を学習ノードへ転用し
+            5ノード（.100/.101/.102/.103/.104）へ復帰．接触パターン n=5 に復帰済み．
+            実験はまだ未投入（mise deploy 未実行）"}
 
   # --- W5/W6: LoRA 集約の改良．W1 完了後に着手する ---
   - {name: lora_exchange_scope, values: [lora_A_only],

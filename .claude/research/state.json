@@ -1,15 +1,15 @@
 {
   "repo": "WAFL-PEFT",
   "iteration": "Iter26",
-  "iteration_name": null,
-  "phase": "investigate",
-  "status": "running",
-  "current_lever": null,
+  "iteration_name": "W4 skip_local_train baseline\u5bfe\u6bd4: control vs treatment",
+  "phase": "experiment",
+  "status": "waiting_experiment",
+  "current_lever": "skip_local_train_when_isolated",
   "experiment_dir": null,
-  "experiment_deadline": null,
-  "updated_at": 1786155236,
+  "experiment_deadline": 1786205207,
+  "updated_at": 1786160921,
   "last_slack_ts": null,
-  "iteration_thread_ts": null,
+  "iteration_thread_ts": "1786156527.720059",
   "notion_toggle_created": false,
   "last_commit": "15e7f64"
 }

@@ -1,4 +1,166 @@
-### 実験 (Iter25)
+## Iteration 26: W4 skip_local_train baseline対比: control vs treatment
+
+### 環境修正: 5ノード復帰（2026-08-08）
+
+- **方針転換**: 「調査 (Iter26)」時点では wafl508/.109 の NVML ドライバーミスマッチが未解消のため
+  3ノード継続（`.100/.102/.103`）と判断していたが，NVML 修復を待たずに 5ノードへ復帰する代替案を
+  採用した。**評価専用ホストだった `.101`/`.104` を学習ノードに転用**する。この2台は NVML 障害の
+  対象ではなく健全に動作するため，学習ノードとして使用できる。
+- **hosts.txt 修正**: `.100/.102/.103`（3ノード） → `.100/.101/.102/.103/.104`（5ノード，`.101`/`.104` を追加）
+- **hosts.eval.txt 修正**: `.101/.104/.105/.106/.107` → `.105/.106/.107/.108/.109`（学習ノードに転用した
+  `.101`/`.104` を外し，代わりに空いた `.108`/`.109`（NVML 障害中で学習には使えないが評価専用の
+  4-bit 推論であれば影響が小さいと想定）を評価ホストに追加）
+- **接触パターン再生成**: `rwp_n05_a0500_r100_p10_s42.json`（88接触区間、5peer）
+- **settings.json 更新**: `contact_pattern_file` を n=5 用へ変更
+- **固定構成**: `max_seq_len=320`、`sample_limit=500`、`WAFL_SELF_EVAL=0`、`WAFL_MERGE_INCLUDE_SELF=1`
+- **注意（未実施）**: 上記の config 変更はこの整理作業の時点ではまだ実験投入されていない
+  （`docker ps` 空、`results/` に Iter26 用ディレクトリなし）。サーバー（wafl-ctrl5）には旧方針の
+  `.100/.102/.103/.108/.109`（3ノードから wafl508/.109 の NVML 修復を前提に復帰する版）が
+  deploy 済みで，ローカルの現行版とは異なる。**次イテレーションの実験投入前に必ず
+  `mise setup && mise deploy` でローカルの `.101`/`.104` 転用版をサーバーへ反映してから
+  `mise start` すること**。
+
+### 実装 (Iter26)
+
+- **変更ファイル**: `config/settings.json`
+  - `experiment_name`: `"Iter19"` → `"Iter26_ctrl"`（control実験用）
+- **接触パターン**: `data/contact_pattern/rwp_n03_a0500_r100_p10_s42.json` 存在確認済み（1958 bytes）
+- **構文チェック**: `uv run python -m py_compile src/client.py` 通過
+- **Git commit**: `1ae99a9`
+- **固定構成確認**: `max_seq_len=320`、`sample_limit=500`、`contact_pattern_file=rwp_n03_a0500_r100_p10_s42.json`
+
+### 検討・計画 (Iter26)
+
+**単一レバー**: `skip_local_train_when_isolated` (W4) — baseline 対比実験（control vs treatment）
+
+**ノード数判断: 3ノード継続**
+
+- **5ノードの判断**: wafl508/509 が NVML ドライバーミスマッチで未使用。修復時期は不確定。
+  5ノード構成 (.100/.102/.103/.108/.109) への復帰はサーバー管理者への修正依頼が必須。
+  戻り値の目処が立っていないため、現状では着手不可。
+- **3ノードの判断**: 即着手可能。n=3 接触パターンでは過去実験との accuracy 比較は不可だが、
+  **同一構成内での control vs treatment 対比は可能**。W4 の独自効果を loss/throughput/stall
+  で測定できる。n=3 の接触パターン自体は原典 n=10 と異なるが、W4 効果の内部比較には有効。
+- **結論**: 3ノードで W4 baseline 対比実験を実施。5ノードへの復帰が確認できたら、
+  その時点で 5ノードでの再測定へ切り替える。
+
+**変更内容**:
+
+なし（コード変更は Iter24/25 で完了）。`settings.json` の `experiment_name` のみ変更。
+control と treatment で別々の experiment_name を使い、結果を区別する。
+
+**固定構成**:
+- `max_seq_len=320`（W2 採用済み）
+- 3 ノード: `.100/.102/.103`（peer 0-2）
+- `sample_limit=500`
+- `WAFL_SELF_EVAL=0`（評価専用ホスト委譲）
+- `WAFL_MERGE_INCLUDE_SELF=1`（W3 既定 true）
+- `maxsize=65536`（Iter25 実装分。メトリクスキュー修正済み）
+- 接触パターン n=3（`rwp_n03_a0500_r100_p10_s42.json`）
+
+**対比実験設計**:
+
+- **Control 実験**: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=0`（孤立時も学習継続）
+  - experiment_name: `Iter26_ctrl`
+  - W4 なしベースライン。現行実装の動作を測定。
+- **Treatment 実験**: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1`（孤立時学習スキップ）
+  - experiment_name: `Iter26_treat`
+  - W4 あり。WAFL 原典 Eq.(4) 準拠。
+- 同一接触パターン、同一ノード構成、同一固定構成で実施。
+- 比較指標: loss 曲線、throughput、stall_duration、contact_events。
+
+**成功条件（measurable）**:
+
+1. **主成功条件**: `mise run start` 実行後、全3 peer が OOM せずに学習を完了する
+2. **主成功条件**: `metrics_peer_X_final.log` が全3 peer で生成される（maxsize=65536 修正の効果確認）
+3. **主成功条件**: control と treatment の両実験が完了し、結果ディレクトリが区別できる
+4. **副成功条件**: メトリクスから loss/throughput/stall_duration/contact_events が取得できる
+5. **副成功条件**: treatment の loss が control より低い（過学習抑制効果）
+   または同等以上（W4 が悪影響を及ぼさない）
+6. **副成功条件**: throughput の低下が 10% 以内（W4 の `continue` によるオーバーヘッドが小さい）
+
+**期待効果**:
+
+- W4 なし control と W4 あり treatment の loss 曲線を比較し、孤立時の学習スキップが
+  過学習抑制に寄与するかを測定する。
+- 3ノード構成では contact 数が少ないため、孤立時間が長くなり、W4 の効果が顕著に出る可能性がある。
+- throughput が同等なら、W4 の採用（既定 `true` 化）が正当化される。
+
+**実験計画**:
+
+- 実験1（control）: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=0 WAFL_SELF_EVAL=0 mise run start`
+- 実験2（treatment）: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1 WAFL_SELF_EVAL=0 mise run start`
+- timeout: 80 分（config.yml 既定）
+- poll_interval: 120 秒（config.yml 既定）
+- 実験後手順:
+  1. 各実験ディレクトリの `metrics_peer_X_final.log` 存在確認
+  2. loss/throughput/stall_duration/contact_events を抽出
+  3. control vs treatment の loss 曲線を比較
+  4. throughput 低下率を測定（10% 以内を合格とする）
+
+**config.yml levers 更新**:
+- W4 `skip_local_train_when_isolated`: status を「baseline 対比実験中（Iter26 実行中）」へ更新
+
+### 調査 (Iter26)
+
+**問い**
+1. `async_logging_thread` は実際にファイルに書き出しているか
+2. `collect_logs.py` の rsync 経路は正しいか
+3. コンテナ起動時の `-v {DEPLOY_DIR}/logs:/app/logs` は有効か
+4. `_final.log` rename が実行されない根本原因は何か
+5. W4 なし baseline 対比実験に必要なインフラ準備は何か
+
+**分かったこと**
+
+- **(a) `async_logging_thread` は正しくファイルに書き出している**（確信度: 高）
+  - Iter25 の `metrics_peer_0_final.log` (156行, 47563bytes), `metrics_peer_1_final.log` (749行, 242488bytes), `metrics_peer_2_final.log` (90行, 25290bytes) を実確認。
+  - 内容: JSONL 形式。`type: metric` (loss, tokens_per_sec, stall_duration 等), `type: checkpoint`, `type: contact_event`, `type: merge` の各フィールドが正しく記録されている。
+  - 書き出し経路: `LOG_DIR = get_log_dir() = Path.cwd() / "logs" = /app/logs/`。`metric_log_path = /app/logs/metrics_peer_{PEER_ID}.log`。`f.flush()` + `os.fsync()` によりディスクへの即時書き込みが保証されている。
+  - シャットダウン時: `metric_log_path.rename(final_log_path)` で `metrics_peer_X.log` → `metrics_peer_X_final.log` にリネーム。
+
+- **(b) `collect_logs.py` の rsync 経路は正しい**（確信度: 高）
+  - 回収コマンド: `rsync -az -e 'ssh ...' {SSH_USER}@{ip}:{DEPLOY_DIR}/logs/ {COLLECT_DIR}/logs/peer_{peer_id}/`
+  - Iter25 の収集結果: `results/Iter19_20260807T234055/logs/peer_{0,1,2}/metrics_peer_{X}_final.log` が正しく配置されている。
+  - settings.json も正常に回収されている（peer_0: 912bytes, peer_1: 912bytes, peer_2: 912bytes）。
+
+- **(c) コンテナマウント `-v {DEPLOY_DIR}/logs:/app/logs` は有効**（確信度: 高）
+  - `start_clients.py:127` で `-v {DEPLOY_DIR}/logs:/app/logs` が指定されている。
+  - コンテナ内の `/app/logs/` に書き込まれたファイルが、ホストの `{DEPLOY_DIR}/logs/` に反映されていることを `_final.log` の回収で確認。
+  - チェックポイントも `{DEPLOY_DIR}/logs/weights/` に保存・rsync 回収されている（peer_0: 6ckpt, peer_1: 10ckpt, peer_2: 9ckpt）。
+
+- **(d) `_final.log` rename が実行されない根本原因: メトリクスキューの maxsize 不足**（確信度: 中高）
+  - Iter24 (5ノード, maxsize=8192, W4あり): `_final.log` **未生成**。peer ディレクトリ空。
+  - Iter25 (3ノード, maxsize=65536, W4あり): `_final.log` **全peer生成**。995行のメトリクスを含む。
+  - 経路: キューが満杯 → `state.metrics_queue.put(None, timeout=30.0)` (main:1750) が30秒ブロック → シャットダウン信号が logger thread に届かず → rename が実行されない → コンテナ終了。
+  - maxsize=65536 に拡大した Iter25 で解消。キューが満杯にならず、shutdown signal が確実に logger に届く。
+  - **補足**: Iter23 (5ノード, maxsize=8192, W4なし) で `_final.log` が生成されていたのは未解決。おそらく timing の違い（キューが実験終了直前に満杯にならなかった）または実験時間がわずかに短かった（1561s vs 1560s）ためと推測されるが、maxsize=8192 が常に安全とは限らない。
+
+- **(e) W4 なし baseline 対比実験のインフラ状況**
+  - **wafl508/509 が NVML ドライバーミスマッチで未使用可能**（Iter25 実験時確認）。
+  - 5ノード構成 (.100/.102/.103/.108/.109) を復活するには、サーバー管理者への NVML 修正依頼が必須。
+  - 3ノード (.100/.102/.103) での対比実験は可能だが、接触パターンが n=3 に変化し、過去実験との比較性が損なわれる。
+  - **device_eval.log 未生成は引き続きインフラ問題**（eval_worker の checkpoint 評価失敗）。W4 とは無関係。
+
+**根本原因の経路**:
+```
+client.py main():
+  1. training_thread.join() 完了
+  2. run_post_experiment_evaluation() (WAFL_SELF_EVAL=0 時はスキップ)
+  3. state.metrics_queue.put(None, timeout=30.0) ← キュー満杯でブロック
+  4. logger_thread.join() ← 到達しない
+  5. async_logging_thread: None 受信 → rename → 終了
+  6. main() 終了
+
+キュー満杯の場合: 3 で30秒ブロック → サーバーが1560sでコンテナ kill → 4-6 実行されない
+キュー余裕の場合: 3 が即座に完了 → 4-6 正常実行 → _final.log 生成
+```
+
+**次フェーズへの示唆**:
+- planner は Iter26 で W4 なし baseline 実験を計画する場合、5ノード復活がプリ条件であることを明記すること。
+- 3ノードでの実験は W4 効果の検証には不十分（接触パターン n=3 は原典 n=10 と大きく異なる）。
+- `_final.log` の生成バグは maxsize 修正で解消済み。次イテレーションで再発しないよう注意。
+
+---
 
 - **コマンド**: `WAFL_SKIP_LOCAL_TRAIN_WHEN_ISOLATED=1 WAFL_SELF_EVAL=0 mise run start`
 - **開始時刻**: 2026-08-07T23:40:55（管理サーバー上）
@@ -1122,6 +1284,26 @@ throughput 比較，実機ノード数のスケール，無線環境模擬下の
 ## Baseline（default_20260711T164008）
 - 設定: lr 1e-4, batch=1（勾配累積なし）, シャッフルなし, 分割不均衡（335〜2606）, max_seq_len 320．
 - 結果: ノード別 +6.0pt（最終 10〜25%）, Average loss 0.458．
+
+### 調査 (Iter26)
+
+**`_final.log` 未生成の根本原因**: **メトリクスキューの maxsize 不足**（確信度: 高）
+
+- `async_logging_thread` のファイル書き出し自体は正常（JSONL 形式で正しく記録）
+- `collect_logs.py` の rsync 経路も正常
+- コンテナ `-v {DEPLOY_DIR}/logs:/app/logs` マウントも有効
+- **経路**: キュー満杯 → `put(None, timeout=30.0)` が30秒ブロック → shutdown signal が logger thread に届かず → rename 実行されず → コンテナ終了
+
+**検証結果**:
+- Iter24 (maxsize=8192, W4あり, 5ノード): `_final.log` **未生成**（peer dir 空）
+- Iter25 (maxsize=65536, W4あり, 3ノード): `_final.log` **全peer生成**（995行）
+- maxsize=65536 への修正（Iter25 commit f53aee5）は有効
+
+**W4 なし baseline 対比実験のインフラ状況**:
+- wafl508/509 が NVML ドライバーミスマッチで未使用（5ノード構成にはサーバー管理者への修正依頼が必要）
+- 3ノードでの対比実験は可能だが n=3 接触パターンとなり過去実験との比較性は損なわれる
+
+---
 
 ### 考察 (Iter25)
 
